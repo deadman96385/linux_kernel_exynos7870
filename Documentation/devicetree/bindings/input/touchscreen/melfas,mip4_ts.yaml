@@ -25,6 +25,10 @@ properties:
       GPIO connected to the CE (chip enable) pin of the chip (active high)
     maxItems: 1
 
+  vdd-supply:
+    description:
+      Regulator supplying the touchscreen analogue power rail
+
 required:
   - compatible
   - reg
