@@ -17,6 +17,7 @@
 #include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/regulator/consumer.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
 
@@ -148,6 +149,7 @@ struct mip4_ts {
 	struct i2c_client *client;
 	struct input_dev *input;
 	struct gpio_desc *gpio_ce;
+	struct regulator *vdd;
 
 	char phys[32];
 	char product_name[16];
@@ -365,11 +367,23 @@ static int mip4_query_device(struct mip4_ts *ts)
 
 static int mip4_power_on(struct mip4_ts *ts)
 {
+	int error;
+
+	if (ts->vdd) {
+		error = regulator_enable(ts->vdd);
+		if (error)
+			return dev_err_probe(&ts->client->dev, error,
+					     "Failed to enable VDD regulator\n");
+	}
+
 	if (ts->gpio_ce) {
 		gpiod_set_value_cansleep(ts->gpio_ce, 1);
 
 		/* Booting delay : 200~300ms */
 		usleep_range(200 * 1000, 300 * 1000);
+	} else if (ts->vdd) {
+		/* Regulator-only MMS438 designs need at least 50ms. */
+		usleep_range(50 * 1000, 60 * 1000);
 	}
 
 	return 0;
@@ -377,8 +391,20 @@ static int mip4_power_on(struct mip4_ts *ts)
 
 static void mip4_power_off(struct mip4_ts *ts)
 {
+	int error;
+
 	if (ts->gpio_ce)
 		gpiod_set_value_cansleep(ts->gpio_ce, 0);
+
+	if (ts->vdd) {
+		error = regulator_disable(ts->vdd);
+		if (error)
+			dev_warn(&ts->client->dev,
+				 "Failed to disable VDD regulator: %d\n", error);
+	}
+
+	if (ts->vdd && !ts->gpio_ce)
+		usleep_range(10 * 1000, 11 * 1000);
 }
 
 /*
@@ -1416,6 +1442,16 @@ static int mip4_probe(struct i2c_client *client)
 
 	snprintf(ts->phys, sizeof(ts->phys),
 		 "%s/input0", dev_name(&client->dev));
+
+	ts->vdd = devm_regulator_get_optional(&client->dev, "vdd");
+	if (IS_ERR(ts->vdd)) {
+		error = PTR_ERR(ts->vdd);
+		if (error == -ENODEV)
+			ts->vdd = NULL;
+		else
+			return dev_err_probe(&client->dev, error,
+					     "Failed to get VDD regulator\n");
+	}
 
 	ts->gpio_ce = devm_gpiod_get_optional(&client->dev,
 					      "ce", GPIOD_OUT_LOW);
