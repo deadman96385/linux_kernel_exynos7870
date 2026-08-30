@@ -845,11 +845,15 @@ static int s3c24xx_i2c_calcdivisor(unsigned long clkin, unsigned int wanted,
 static int s3c24xx_i2c_clockrate(struct s3c24xx_i2c *i2c, unsigned int *got)
 {
 	struct s3c2410_platform_i2c *pdata = i2c->pdata;
-	unsigned long clkin = clk_get_rate(i2c->clk);
+	unsigned long clkin;
 	unsigned int divs, div1;
 	unsigned long target_frequency;
 	u32 iiccon;
 	int freq;
+
+	dev_info(i2c->dev, "checkpoint before clk_get_rate\n");
+	clkin = clk_get_rate(i2c->clk);
+	dev_info(i2c->dev, "checkpoint clock rate %lu Hz\n", clkin);
 
 	i2c->clkrate = clkin;
 	clkin /= 1000;	/* clkin now in KHz */
@@ -861,6 +865,8 @@ static int s3c24xx_i2c_clockrate(struct s3c24xx_i2c *i2c, unsigned int *got)
 	target_frequency /= 1000; /* Target frequency now in KHz */
 
 	freq = s3c24xx_i2c_calcdivisor(clkin, target_frequency, &div1, &divs);
+	dev_info(i2c->dev, "checkpoint divisor %u x %u gives %d KHz\n",
+		 div1, divs, freq);
 
 	if (freq > target_frequency) {
 		dev_err(i2c->dev,
@@ -872,6 +878,7 @@ static int s3c24xx_i2c_clockrate(struct s3c24xx_i2c *i2c, unsigned int *got)
 	*got = freq;
 
 	iiccon = readl(i2c->regs + S3C2410_IICCON);
+	dev_info(i2c->dev, "checkpoint read IICCON 0x%08x\n", iiccon);
 	iiccon &= ~(S3C2410_IICCON_SCALEMASK | S3C2410_IICCON_TXDIV_512);
 	iiccon |= (divs-1);
 
@@ -882,6 +889,7 @@ static int s3c24xx_i2c_clockrate(struct s3c24xx_i2c *i2c, unsigned int *got)
 		iiccon |= S3C2410_IICCON_SCALE(2);
 
 	writel(iiccon, i2c->regs + S3C2410_IICCON);
+	dev_info(i2c->dev, "checkpoint programmed IICCON\n");
 
 	if (i2c->quirks & QUIRK_S3C2440) {
 		unsigned long sda_delay;
@@ -898,6 +906,7 @@ static int s3c24xx_i2c_clockrate(struct s3c24xx_i2c *i2c, unsigned int *got)
 
 		dev_dbg(i2c->dev, "IICLC=%08lx\n", sda_delay);
 		writel(sda_delay, i2c->regs + S3C2440_IICLC);
+		dev_info(i2c->dev, "checkpoint programmed IICLC\n");
 	}
 
 	return 0;
@@ -946,12 +955,17 @@ static int s3c24xx_i2c_init(struct s3c24xx_i2c *i2c)
 	writeb(pdata->slave_addr, i2c->regs + S3C2410_IICADD);
 
 	dev_info(i2c->dev, "slave address 0x%02x\n", pdata->slave_addr);
+	dev_info(i2c->dev, "checkpoint before clearing IICCON\n");
 
 	writel(0, i2c->regs + S3C2410_IICCON);
+	dev_info(i2c->dev, "checkpoint cleared IICCON\n");
+	dev_info(i2c->dev, "checkpoint before clearing IICSTAT\n");
 	writel(0, i2c->regs + S3C2410_IICSTAT);
+	dev_info(i2c->dev, "checkpoint cleared IICSTAT\n");
 
 	/* we need to work out the divisors for the clock... */
 
+	dev_info(i2c->dev, "checkpoint before clockrate setup\n");
 	if (s3c24xx_i2c_clockrate(i2c, &freq) != 0) {
 		dev_err(i2c->dev, "cannot meet bus frequency required\n");
 		return -EINVAL;
@@ -1081,7 +1095,10 @@ static int s3c24xx_i2c_probe(struct platform_device *pdev)
 	}
 
 	ret = s3c24xx_i2c_init(i2c);
+	dev_info(&pdev->dev, "checkpoint controller init returned %d\n", ret);
+	dev_info(&pdev->dev, "checkpoint before clk_disable\n");
 	clk_disable(i2c->clk);
+	dev_info(&pdev->dev, "checkpoint after clk_disable\n");
 	if (ret != 0) {
 		dev_err(&pdev->dev, "I2C controller init failed\n");
 		clk_unprepare(i2c->clk);
@@ -1093,14 +1110,19 @@ static int s3c24xx_i2c_probe(struct platform_device *pdev)
 	 * ensure no current IRQs pending
 	 */
 	if (!(i2c->quirks & QUIRK_POLL)) {
+		dev_info(&pdev->dev, "checkpoint before platform_get_irq\n");
 		i2c->irq = ret = platform_get_irq(pdev, 0);
+		dev_info(&pdev->dev, "checkpoint platform IRQ %d\n", ret);
 		if (ret < 0) {
 			clk_unprepare(i2c->clk);
 			return ret;
 		}
 
+		dev_info(&pdev->dev, "checkpoint before request_irq %d\n",
+			 i2c->irq);
 		ret = devm_request_irq(&pdev->dev, i2c->irq, s3c24xx_i2c_irq,
 				       0, dev_name(&pdev->dev), i2c);
+		dev_info(&pdev->dev, "checkpoint request_irq returned %d\n", ret);
 		if (ret != 0) {
 			dev_err(&pdev->dev, "cannot claim IRQ %d\n", i2c->irq);
 			clk_unprepare(i2c->clk);
@@ -1119,9 +1141,13 @@ static int s3c24xx_i2c_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, i2c);
 
+	dev_info(&pdev->dev, "checkpoint before pm_runtime_enable\n");
 	pm_runtime_enable(&pdev->dev);
+	dev_info(&pdev->dev, "checkpoint before i2c_add_numbered_adapter\n");
 
 	ret = i2c_add_numbered_adapter(&i2c->adap);
+	dev_info(&pdev->dev,
+		 "checkpoint i2c_add_numbered_adapter returned %d\n", ret);
 	if (ret < 0) {
 		pm_runtime_disable(&pdev->dev);
 		clk_unprepare(i2c->clk);
