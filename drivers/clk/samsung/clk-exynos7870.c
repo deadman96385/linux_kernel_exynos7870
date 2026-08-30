@@ -1671,7 +1671,7 @@ static const struct samsung_gate_clock peri_gate_clks[] __initconst = {
 	     CLK_SET_RATE_PARENT, 0),
 	GATE(CLK_GOUT_PERI_I2C6_PCLK, "gout_peri_i2c6_pclk",
 	     "gout_peri_busp1_peric0_hclk", CLK_CON_GAT_PERI_I2C6_PCLK, 19,
-	     CLK_SET_RATE_PARENT, 0),
+	     CLK_IS_CRITICAL | CLK_SET_RATE_PARENT, 0),
 	GATE(CLK_GOUT_PERI_I2C7_PCLK, "gout_peri_i2c7_pclk",
 	     "gout_peri_busp1_peric0_hclk", CLK_CON_GAT_PERI_I2C7_PCLK, 24,
 	     CLK_SET_RATE_PARENT, 0),
