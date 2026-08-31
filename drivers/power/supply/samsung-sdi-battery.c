@@ -893,6 +893,30 @@ static struct samsung_sdi_battery samsung_sdi_batteries[] = {
 			.bti_resistance_tolerance = 40,
 		},
 	},
+	{
+		/*
+		 * Used in Samsung SM-J730 "j7y17lte". Charging limits and
+		 * temperature thresholds come from the vendor device tree.
+		 */
+		.compatible = "samsung,eb-bj730abe",
+		.name = "EB-BJ730ABE",
+		.info = {
+			.energy_full_design_uwh = 13860000,
+			.charge_full_design_uah = 3600000,
+			.technology = POWER_SUPPLY_TECHNOLOGY_LION,
+			.voltage_min_design_uv = 3000000,
+			.voltage_max_design_uv = 4400000,
+			.overvoltage_limit_uv = 4400000,
+			.constant_charge_current_max_ua = 1775000,
+			.constant_charge_voltage_max_uv = 4350000,
+			.charge_term_current_ua = 360000,
+			.charge_restart_voltage_uv = 4250000,
+			.temp_min = 0,
+			.temp_alert_min = 5,
+			.temp_alert_max = 45,
+			.temp_max = 50,
+		},
+	},
 };
 
 int samsung_sdi_battery_get_info(struct device *dev,
