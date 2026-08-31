@@ -111,8 +111,19 @@ static const struct resource s2mu005_muic_resources[] = {
 	DEFINE_RES_IRQ_NAMED(S2MU005_IRQ_MUIC_DETACH, "detach"),
 };
 
+static const struct resource s2mu005_charger_resources[] = {
+	DEFINE_RES_IRQ_NAMED(S2MU005_IRQ_CHGR_DETBAT, "det-bat"),
+	DEFINE_RES_IRQ_NAMED(S2MU005_IRQ_CHGR_BAT, "bat"),
+	DEFINE_RES_IRQ_NAMED(S2MU005_IRQ_CHGR_IVR, "ivr"),
+	DEFINE_RES_IRQ_NAMED(S2MU005_IRQ_CHGR_EVENT, "event"),
+	DEFINE_RES_IRQ_NAMED(S2MU005_IRQ_CHGR_CHG, "chg"),
+	DEFINE_RES_IRQ_NAMED(S2MU005_IRQ_CHGR_VMID, "vmid"),
+	DEFINE_RES_IRQ_NAMED(S2MU005_IRQ_CHGR_WCIN, "wcin"),
+	DEFINE_RES_IRQ_NAMED(S2MU005_IRQ_CHGR_VBUS, "vbus"),
+};
+
 static const struct mfd_cell s2mu005_devs[] = {
-	MFD_CELL_NAME("s2mu005-charger"),
+	MFD_CELL_RES("s2mu005-charger", s2mu005_charger_resources),
 	MFD_CELL_OF("s2mu005-flash", NULL, NULL, 0, 0, "samsung,s2mu005-flash"),
 	MFD_CELL_OF("s2mu005-muic", s2mu005_muic_resources, NULL, 0, 0, "samsung,s2mu005-muic"),
 	MFD_CELL_OF("s2mu005-rgb", NULL, NULL, 0, 0, "samsung,s2mu005-rgb"),
