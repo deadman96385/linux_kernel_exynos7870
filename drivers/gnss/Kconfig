@@ -29,6 +29,18 @@ config GNSS_MTK_SERIAL
 
 	  If unsure, say N.
 
+config GNSS_EXYNOS7870
+	tristate "Samsung Exynos7870 KEPLER GNSS support"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on OF && MAILBOX && REMOTEPROC
+	select MFD_SYSCON
+	help
+	  Say y or m here to support the KEPLER GNSS shared-memory transport
+	  integrated in Exynos7870 SoCs. The device exposes the proprietary
+	  KEPLER protocol through the GNSS character-device interface.
+
+	  A userspace protocol service is required to produce NMEA data.
+
 config GNSS_SIRF_SERIAL
 	tristate "SiRFstar GNSS receiver support"
 	depends on SERIAL_DEV_BUS

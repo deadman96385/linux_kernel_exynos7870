@@ -12,6 +12,9 @@ gnss-serial-y := serial.o
 obj-$(CONFIG_GNSS_MTK_SERIAL)		+= gnss-mtk.o
 gnss-mtk-y := mtk.o
 
+obj-$(CONFIG_GNSS_EXYNOS7870)		+= gnss-exynos7870.o
+gnss-exynos7870-y := exynos7870.o
+
 obj-$(CONFIG_GNSS_SIRF_SERIAL)		+= gnss-sirf.o
 gnss-sirf-y := sirf.o
 
