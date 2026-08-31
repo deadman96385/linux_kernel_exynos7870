@@ -890,11 +890,20 @@ static int sco_sock_sendmsg(struct socket *sock, struct msghdr *msg,
 	return err;
 }
 
-static void sco_conn_defer_accept(struct hci_conn *conn, u16 setting)
+static int sco_conn_defer_accept(struct hci_conn *conn, u16 setting,
+				 const struct bt_codec *codec)
 {
 	struct hci_dev *hdev = conn->hdev;
+	int err;
 
 	BT_DBG("conn %p", conn);
+
+	conn->codec = *codec;
+	if (hdev->prepare_sco) {
+		err = hdev->prepare_sco(hdev, &conn->codec, setting);
+		if (err)
+			return err;
+	}
 
 	conn->state = BT_CONFIG;
 
@@ -904,7 +913,8 @@ static void sco_conn_defer_accept(struct hci_conn *conn, u16 setting)
 		bacpy(&cp.bdaddr, &conn->dst);
 		cp.role = 0x00; /* Ignored */
 
-		hci_send_cmd(hdev, HCI_OP_ACCEPT_CONN_REQ, sizeof(cp), &cp);
+		return hci_send_cmd(hdev, HCI_OP_ACCEPT_CONN_REQ, sizeof(cp),
+				    &cp);
 	} else {
 		struct hci_cp_accept_sync_conn_req cp;
 
@@ -934,8 +944,8 @@ static void sco_conn_defer_accept(struct hci_conn *conn, u16 setting)
 			break;
 		}
 
-		hci_send_cmd(hdev, HCI_OP_ACCEPT_SYNC_CONN_REQ,
-			     sizeof(cp), &cp);
+		return hci_send_cmd(hdev, HCI_OP_ACCEPT_SYNC_CONN_REQ,
+				    sizeof(cp), &cp);
 	}
 }
 
@@ -953,7 +963,14 @@ static int sco_sock_recvmsg(struct socket *sock, struct msghdr *msg,
 
 	if (sk->sk_state == BT_CONNECT2 &&
 	    test_bit(BT_SK_DEFER_SETUP, &bt_sk(sk)->flags)) {
-		sco_conn_defer_accept(pi->conn->hcon, pi->setting);
+		int err;
+
+		err = sco_conn_defer_accept(pi->conn->hcon, pi->setting,
+					    &pi->codec);
+		if (err) {
+			release_sock(sk);
+			return err;
+		}
 		sk->sk_state = BT_CONFIG;
 
 		release_sock(sk);

@@ -3076,6 +3076,7 @@ int hci_send_cmd(struct hci_dev *hdev, __u16 opcode, __u32 plen,
 
 	return 0;
 }
+EXPORT_SYMBOL(hci_send_cmd);
 
 int __hci_cmd_send(struct hci_dev *hdev, u16 opcode, u32 plen,
 		   const void *param)
