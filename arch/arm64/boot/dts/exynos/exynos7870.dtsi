@@ -264,6 +264,15 @@
 			status = "disabled";
 		};
 
+		mailbox_gnss: mailbox@10570000 {
+			compatible = "samsung,exynos7870-mbox", "syscon";
+			reg = <0x10570000 0x180>;
+			interrupts = <GIC_SPI 373 IRQ_TYPE_NONE>;
+			#mbox-cells = <1>;
+
+			status = "disabled";
+		};
+
 		gpu: gpu@11400000 {
 			compatible = "samsung,exynos7870-mali", "arm,mali-t830";
 			reg = <0x11400000 0x5000>;

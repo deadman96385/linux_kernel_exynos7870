@@ -100,6 +100,8 @@
 
 	pwrseq_mmc1: pwrseq-mmc1 {
 		compatible = "mmc-pwrseq-simple";
+		pinctrl-names = "default";
+		pinctrl-0 = <&wlan_enable>;
 		reset-gpios = <&gpd3 6 GPIO_ACTIVE_LOW>;
 	};
 
@@ -123,6 +125,11 @@
 			reg = <0x0 0x46e00000 0x8000>;
 			console-size = <0x4000>;
 			pmsg-size = <0x4000>;
+		};
+
+		gnss_mem: gnss@f7c00000 {
+			reg = <0x0 0xf7c00000 0x400000>;
+			no-map;
 		};
 
 		framebuffer@67000000 {
@@ -173,6 +180,33 @@
 		min-microvolt = <3300000>;
 		max-microvolt = <3300000>;
 	};
+
+	kepler: remoteproc {
+		compatible = "samsung,exynos7870-kepler";
+		firmware-name = "samsung/exynos7870/gnss_firmware.bin";
+		interrupts = <GIC_SPI 19 IRQ_TYPE_NONE>,
+			     <GIC_SPI 478 IRQ_TYPE_NONE>,
+			     <GIC_SPI 477 IRQ_TYPE_NONE>;
+		interrupt-names = "active", "watchdog", "wakeup";
+		mbox-names = "bcmd";
+		mboxes = <&mailbox_gnss 0>;
+		memory-region = <&gnss_mem>;
+		samsung,mailbox-syscon = <&mailbox_gnss>;
+		samsung,pmu-syscon = <&pmu_system_controller>;
+	};
+
+	gnss {
+		compatible = "samsung,exynos7870-kepler-gnss";
+		mbox-names = "ipc";
+		mboxes = <&mailbox_gnss 2>;
+		memory-region = <&gnss_mem>;
+		remoteproc = <&kepler>;
+		samsung,mailbox-syscon = <&mailbox_gnss>;
+	};
+};
+
+&mailbox_gnss {
+	status = "okay";
 };
 
 &adc {
@@ -182,6 +216,7 @@
 &adma {
 	status = "okay";
 };
+
 &cmu_g3d {
 	assigned-clocks = <&cmu_g3d CLK_MOUT_G3D_SWITCH_USER>,
 			  <&cmu_g3d CLK_MOUT_G3D>;
@@ -593,18 +628,21 @@
 	non-removable;
 	cap-sd-highspeed;
 	cap-sdio-irq;
+	keep-power-in-suspend;
+	sd-uhs-sdr104;
 
 	status = "okay";
 
-	wifi@0 {
+	wifi@1 {
 		compatible = "brcm,bcm43455-fmac", "brcm,bcm4329-fmac";
-		reg = <0x0>;
+		reg = <1>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&wlan_hostwake>;
 
 		interrupt-names = "host-wake";
 		interrupt-parent = <&gpa2>;
-		interrupts = <2 IRQ_TYPE_LEVEL_LOW>;
-
-		reset-gpios = <&gpd3 6 GPIO_ACTIVE_LOW>;
+		interrupts = <2 IRQ_TYPE_LEVEL_HIGH>;
 	};
 };
 
@@ -719,12 +757,20 @@
 
 	wlan_hostwake: wlan-hostwake-pins {
 		samsung,pins = "gpa2-2";
-		samsung,pin-function = <EXYNOS_PIN_FUNC_OUTPUT>;
-		samsung,pin-pud = <EXYNOS_PIN_PULL_UP>;
+		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
+		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
 	};
 };
 
 &pinctrl_top {
+	bt_enable: bt-enable-pins {
+		samsung,pins = "gpd4-0";
+		samsung,pin-function = <EXYNOS_PIN_FUNC_OUTPUT>;
+		samsung,pin-con-pdn = <EXYNOS_PIN_PDN_PREV>;
+		samsung,pin-pud-pdn = <EXYNOS_PIN_PULL_NONE>;
+		samsung,pin-pud = <EXYNOS_PIN_PULL_DOWN>;
+	};
+
 	wlan_enable: wlan-enable-pins {
 		samsung,pins = "gpd3-6";
 		samsung,pin-function = <EXYNOS_PIN_FUNC_OUTPUT>;
@@ -746,6 +792,31 @@
 	samsung,bt-fm-combo;
 
 	status = "okay";
+};
+
+&bt_hostwake {
+	samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
+};
+
+&serial1 {
+	uart-has-rtscts;
+	status = "okay";
+
+	bluetooth {
+		compatible = "brcm,bcm4345c5";
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&bt_btwake &bt_hostwake &bt_enable>;
+
+		device-wakeup-gpios = <&gpa1 2 GPIO_ACTIVE_HIGH>;
+		shutdown-gpios = <&gpd4 0 GPIO_ACTIVE_HIGH>;
+
+		interrupt-parent = <&gpa1>;
+		interrupts = <6 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "host-wakeup";
+
+		max-speed = <921600>;
+	};
 };
 
 &serial2 {
