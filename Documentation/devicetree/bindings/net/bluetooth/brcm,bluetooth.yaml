@@ -102,6 +102,18 @@ properties:
        pcm-sync-mode: slave, master
        pcm-clock-mode: slave, master
 
+  brcm,bt-i2spcm-int-params:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 4
+    maxItems: 4
+    description: |-
+      configure the I2S/PCM interface via a 4-byte array:
+       enable: 0 = disable, 1 = enable
+       role: 0 = slave, 1 = master
+       sample-rate: 0 = 8KHz, 1 = 16KHz, 2 = 4KHz
+       clock-rate: 0 = 128KHz, 1 = 256KHz, 2 = 512KHz,
+         3 = 1024KHz, 4 = 2048KHz
+
   brcm,requires-autobaud-mode:
     type: boolean
     description:
@@ -127,6 +139,10 @@ dependencies:
 
 allOf:
   - $ref: /schemas/serial/serial-peripheral-props.yaml#
+  - not:
+      required:
+        - brcm,bt-pcm-int-params
+        - brcm,bt-i2spcm-int-params
   - if:
       not:
         properties:
