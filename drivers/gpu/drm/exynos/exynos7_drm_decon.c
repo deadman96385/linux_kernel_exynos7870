@@ -72,6 +72,8 @@ struct decon_context {
 	bool				i80_if;
 	wait_queue_head_t		wait_vsync_queue;
 	atomic_t			wait_vsync_event;
+	atomic_t			win_updated;
+	atomic_t			triggering;
 
 	const struct decon_data *data;
 	struct drm_encoder *encoder;
@@ -277,6 +279,8 @@ static int decon_enable_vblank(struct exynos_drm_crtc *crtc)
 			val |= VIDINTCON0_INT_FRAME;
 			val &= ~VIDINTCON0_FRAMESEL0_MASK;
 			val |= VIDINTCON0_FRAMESEL0_VSYNC;
+		} else {
+			val |= VIDINTCON0_INT_I80_EN;
 		}
 
 		writel(val, ctx->regs + VIDINTCON0);
@@ -296,6 +300,8 @@ static void decon_disable_vblank(struct exynos_drm_crtc *crtc)
 		val &= ~VIDINTCON0_INT_ENABLE;
 		if (!ctx->i80_if)
 			val &= ~VIDINTCON0_INT_FRAME;
+		else
+			val &= ~VIDINTCON0_INT_I80_EN;
 
 		writel(val, ctx->regs + VIDINTCON0);
 	}
@@ -490,6 +496,9 @@ static void decon_update_plane(struct exynos_drm_crtc *crtc,
 	val = readl(ctx->regs + DECON_UPDATE);
 	val |= DECON_UPDATE_STANDALONE_F;
 	writel(val, ctx->regs + DECON_UPDATE);
+
+	if (ctx->i80_if)
+		atomic_set(&ctx->win_updated, 1);
 }
 
 static void decon_disable_plane(struct exynos_drm_crtc *crtc,
@@ -510,6 +519,9 @@ static void decon_disable_plane(struct exynos_drm_crtc *crtc,
 	val = readl(ctx->regs + DECON_UPDATE);
 	val |= DECON_UPDATE_STANDALONE_F;
 	writel(val, ctx->regs + DECON_UPDATE);
+
+	if (ctx->i80_if)
+		atomic_set(&ctx->win_updated, 1);
 }
 
 static void decon_atomic_flush(struct exynos_drm_crtc *crtc)
@@ -531,12 +543,16 @@ static void decon_init(struct decon_context *ctx)
 	val = VIDOUTCON0_DISP_IF_0_ON;
 	if (!ctx->i80_if)
 		val |= VIDOUTCON0_RGBIF;
+	else
+		val |= VIDOUTCON0_I80IF;
 	writel(val, ctx->regs + VIDOUTCON0);
 
 	writel(VCLKCON0_CLKVALUP | VCLKCON0_VCLKFREE, ctx->regs + VCLKCON0);
 
 	if (!ctx->i80_if)
 		writel(VIDCON1_VCLK_HOLD, ctx->regs + VIDCON1(0));
+	else
+		writel(TRIGCON_SWTRIGEN_I80_RGB, ctx->regs + TRIGCON);
 }
 
 static void decon_atomic_enable(struct exynos_drm_crtc *crtc)
@@ -575,6 +591,42 @@ static void decon_atomic_disable(struct exynos_drm_crtc *crtc)
 	pm_runtime_put_sync(ctx->dev);
 }
 
+static void decon_trigger(struct decon_context *ctx)
+{
+	u32 val;
+
+	if (atomic_read(&ctx->triggering))
+		return;
+
+	atomic_set(&ctx->triggering, 1);
+
+	val = readl(ctx->regs + TRIGCON);
+	val |= TRIGCON_SWTRIGCMD_I80_RGB;
+	writel(val, ctx->regs + TRIGCON);
+
+	if (!test_bit(0, &ctx->irq_flags))
+		atomic_set(&ctx->triggering, 0);
+}
+
+static void decon_te_handler(struct exynos_drm_crtc *crtc)
+{
+	struct decon_context *ctx = crtc->ctx;
+
+	if (!ctx->drm_dev)
+		return;
+
+	if (atomic_add_unless(&ctx->win_updated, -1, 0))
+		decon_trigger(ctx);
+
+	if (atomic_read(&ctx->wait_vsync_event)) {
+		atomic_set(&ctx->wait_vsync_event, 0);
+		wake_up(&ctx->wait_vsync_queue);
+	}
+
+	if (test_bit(0, &ctx->irq_flags))
+		drm_crtc_handle_vblank(&ctx->crtc->base);
+}
+
 static const struct exynos_drm_crtc_ops decon_crtc_ops = {
 	.atomic_enable = decon_atomic_enable,
 	.atomic_disable = decon_atomic_disable,
@@ -584,6 +636,7 @@ static const struct exynos_drm_crtc_ops decon_crtc_ops = {
 	.update_plane = decon_update_plane,
 	.disable_plane = decon_disable_plane,
 	.atomic_flush = decon_atomic_flush,
+	.te_handler = decon_te_handler,
 };
 
 
@@ -606,7 +659,9 @@ static irqreturn_t decon_irq_handler(int irq, void *dev_id)
 	if (!drm_dev_has_vblank(ctx->drm_dev))
 		goto out;
 
-	if (!ctx->i80_if) {
+	if (ctx->i80_if) {
+		atomic_set(&ctx->triggering, 0);
+	} else {
 		drm_crtc_handle_vblank(&ctx->crtc->base);
 
 		/* set wait vsync event to zero and wake up queue. */
@@ -744,6 +799,8 @@ static int decon_probe(struct platform_device *pdev)
 
 	init_waitqueue_head(&ctx->wait_vsync_queue);
 	atomic_set(&ctx->wait_vsync_event, 0);
+	atomic_set(&ctx->win_updated, 0);
+	atomic_set(&ctx->triggering, 0);
 
 	platform_set_drvdata(pdev, ctx);
 
