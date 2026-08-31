@@ -15,6 +15,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/pm_runtime.h>
+#include <linux/reset.h>
 
 #include <sound/soc.h>
 #include <sound/pcm_params.h>
@@ -101,6 +102,7 @@ struct samsung_i2s_priv {
 
 	/* The I2S controller's core clock */
 	struct clk *clk;
+	struct reset_control *rstc;
 
 	/* Clock for generating I2S signals */
 	struct clk *op_clk;
@@ -1467,6 +1469,22 @@ static int samsung_i2s_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "failed to enable clock: %d\n", ret);
 		return ret;
 	}
+
+	priv->rstc = devm_reset_control_get_optional_exclusive(&pdev->dev,
+							       "i2s");
+	if (IS_ERR(priv->rstc)) {
+		ret = dev_err_probe(&pdev->dev, PTR_ERR(priv->rstc),
+				    "Failed to get reset\n");
+		goto err_disable_clk;
+	}
+
+	if (priv->rstc) {
+		ret = reset_control_reset(priv->rstc);
+		if (ret) {
+			dev_err(&pdev->dev, "Failed to reset I2S: %d\n", ret);
+			goto err_disable_clk;
+		}
+	}
 	pri_dai->dma_playback.addr = regs_base + I2STXD;
 	pri_dai->dma_capture.addr = regs_base + I2SRXD;
 	pri_dai->dma_playback.chan_name = "tx";
@@ -1677,6 +1695,18 @@ static const struct samsung_i2s_dai_data i2sv5_dai_type_i2s1 __maybe_unused = {
 	.i2s_variant_regs = &i2sv5_i2s1_regs,
 };
 
+static const struct samsung_i2s_dai_data exynos7870_i2s_dai_type = {
+	.quirks = QUIRK_PRI_6CHAN | QUIRK_SEC_DAI | QUIRK_NEED_RSTCLR,
+	.pcm_rates = SNDRV_PCM_RATE_8000_192000,
+	.i2s_variant_regs = &i2sv5_i2s1_regs,
+};
+
+static const struct samsung_i2s_dai_data exynos7870_i2s1_dai_type = {
+	.quirks = QUIRK_PRI_6CHAN | QUIRK_NEED_RSTCLR,
+	.pcm_rates = SNDRV_PCM_RATE_8000_192000,
+	.i2s_variant_regs = &i2sv5_i2s1_regs,
+};
+
 static const struct samsung_i2s_dai_data fsd_dai_type __maybe_unused = {
 	.quirks = QUIRK_SEC_DAI | QUIRK_NEED_RSTCLR | QUIRK_SUPPORTS_TDM,
 	.pcm_rates = SNDRV_PCM_RATE_8000_192000,
@@ -1711,6 +1741,12 @@ static const struct of_device_id exynos_i2s_match[] = {
 	}, {
 		.compatible = "samsung,exynos7-i2s1",
 		.data = &i2sv5_dai_type_i2s1,
+	}, {
+		.compatible = "samsung,exynos7870-i2s",
+		.data = &exynos7870_i2s_dai_type,
+	}, {
+		.compatible = "samsung,exynos7870-i2s1",
+		.data = &exynos7870_i2s1_dai_type,
 	}, {
 		.compatible = "tesla,fsd-i2s",
 		.data = &fsd_dai_type,
