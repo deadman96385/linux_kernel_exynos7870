@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/panel/samsung,s6e3fa3-ams549ku15.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Samsung AMS549KU15 AMOLED panel with S6E3FA3 controller
+
+maintainers:
+  - Samsung SoC maintainers <linux-samsung-soc@vger.kernel.org>
+
+description:
+  The AMS549KU15 is a 5.5-inch 1080x1920 command-mode AMOLED panel made by
+  Samsung Mobile Display. It uses an S6E3FA3 display controller and a four-lane
+  MIPI DSI link.
+
+allOf:
+  - $ref: panel-common.yaml#
+
+properties:
+  compatible:
+    const: samsung,s6e3fa3-ams549ku15
+
+  reg:
+    maxItems: 1
+
+  vci-supply:
+    description: 3.0 V analog supply
+
+  vdd3-supply:
+    description: 1.8 V I/O supply
+
+required:
+  - compatible
+  - reg
+  - reset-gpios
+  - te-gpios
+  - vci-supply
+  - vdd3-supply
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    dsi {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        panel@0 {
+            compatible = "samsung,s6e3fa3-ams549ku15";
+            reg = <0>;
+            reset-gpios = <&gpd3 4 GPIO_ACTIVE_LOW>;
+            te-gpios = <&gpe0 2 GPIO_ACTIVE_HIGH>;
+            vci-supply = <&ldo29_reg>;
+            vdd3-supply = <&ldo30_reg>;
+        };
+    };
