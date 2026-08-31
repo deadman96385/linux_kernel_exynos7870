@@ -22,6 +22,7 @@
 #include <linux/scatterlist.h>
 #include <linux/of.h>
 #include <linux/of_dma.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/err.h>
 #include <linux/pm_runtime.h>
 #include <linux/bug.h>
@@ -3022,6 +3023,13 @@ pl330_probe(struct amba_device *adev, const struct amba_id *id)
 	ret = dma_set_mask_and_coherent(&adev->dev, DMA_BIT_MASK(32));
 	if (ret)
 		return ret;
+
+	if (np && of_property_present(np, "memory-region")) {
+		ret = devm_of_reserved_mem_device_init(&adev->dev);
+		if (ret)
+			return dev_err_probe(&adev->dev, ret,
+					     "failed to initialize reserved memory\n");
+	}
 
 	/* Allocate a new DMAC and its Channels */
 	pl330 = devm_kzalloc(&adev->dev, sizeof(*pl330), GFP_KERNEL);
