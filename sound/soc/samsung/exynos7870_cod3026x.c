@@ -9,16 +9,27 @@
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
 
+#include <dt-bindings/sound/samsung,s1402x.h>
+
 #include "i2s.h"
 
 #define EXYNOS7870_CODEC_INDEX	1
 
+enum exynos7870_link_id {
+	EXYNOS7870_LINK_PRIMARY,
+	EXYNOS7870_LINK_SECONDARY,
+	EXYNOS7870_LINK_AMP,
+	EXYNOS7870_NUM_LINKS,
+};
+
 struct exynos7870_audio {
 	struct snd_soc_card card;
-	struct snd_soc_dai_link link;
-	struct snd_soc_dai_link_component cpus[1];
-	struct snd_soc_dai_link_component platforms[1];
-	struct snd_soc_dai_link_component codecs[2];
+	struct snd_soc_dai_link links[EXYNOS7870_NUM_LINKS];
+	struct snd_soc_dai_link_component cpus[EXYNOS7870_NUM_LINKS];
+	struct snd_soc_dai_link_component platforms[EXYNOS7870_NUM_LINKS];
+	struct snd_soc_dai_link_component primary_codecs[2];
+	struct snd_soc_dai_link_component secondary_codecs[2];
+	struct snd_soc_dai_link_component amp_codecs[1];
 	struct snd_soc_jack headset_jack;
 };
 
@@ -158,17 +169,39 @@ static void exynos7870_put_dai_nodes(void *data)
 {
 	struct exynos7870_audio *audio = data;
 
-	of_node_put(audio->cpus[0].of_node);
-	of_node_put(audio->codecs[0].of_node);
-	of_node_put(audio->codecs[1].of_node);
+	of_node_put(audio->cpus[EXYNOS7870_LINK_PRIMARY].of_node);
+	of_node_put(audio->cpus[EXYNOS7870_LINK_SECONDARY].of_node);
+	of_node_put(audio->cpus[EXYNOS7870_LINK_AMP].of_node);
+	of_node_put(audio->primary_codecs[0].of_node);
+	of_node_put(audio->primary_codecs[1].of_node);
+}
+
+static void exynos7870_init_link(struct snd_soc_dai_link *link,
+				 const char *name,
+				 struct snd_soc_dai_link_component *cpu,
+				 struct snd_soc_dai_link_component *platform,
+				 struct snd_soc_dai_link_component *codecs,
+				 unsigned int num_codecs)
+{
+	link->name = name;
+	link->stream_name = name;
+	link->cpus = cpu;
+	link->num_cpus = 1;
+	link->platforms = platform;
+	link->num_platforms = 1;
+	link->codecs = codecs;
+	link->num_codecs = num_codecs;
+	link->dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
+			SND_SOC_DAIFMT_CBC_CFC;
+	link->ops = &exynos7870_ops;
 }
 
 static int exynos7870_audio_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct exynos7870_audio *audio;
+	struct of_phandle_args args = { };
 	struct snd_soc_card *card;
-	struct snd_soc_dai_link *link;
 	int ret;
 
 	audio = devm_kzalloc(dev, sizeof(*audio), GFP_KERNEL);
@@ -176,44 +209,80 @@ static int exynos7870_audio_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	card = &audio->card;
-	link = &audio->link;
 
-	ret = exynos7870_parse_dai(dev, "cpu", &audio->cpus[0]);
+	ret = exynos7870_parse_dai(dev, "cpu",
+				   &audio->cpus[EXYNOS7870_LINK_PRIMARY]);
 	if (ret)
 		return ret;
 
-	ret = exynos7870_parse_dai(dev, "mixer", &audio->codecs[0]);
+	ret = exynos7870_parse_dai(dev, "cpu-secondary",
+				   &audio->cpus[EXYNOS7870_LINK_SECONDARY]);
 	if (ret)
 		goto err_put_cpu;
 
-	ret = exynos7870_parse_dai(dev, "codec", &audio->codecs[1]);
+	ret = exynos7870_parse_dai(dev, "cpu-amp",
+				   &audio->cpus[EXYNOS7870_LINK_AMP]);
+	if (ret)
+		goto err_put_secondary;
+
+	ret = exynos7870_parse_dai(dev, "mixer",
+				   &audio->primary_codecs[0]);
+	if (ret)
+		goto err_put_amp;
+
+	ret = exynos7870_parse_dai(dev, "codec",
+				   &audio->primary_codecs[1]);
 	if (ret)
 		goto err_put_mixer;
+
+	audio->secondary_codecs[0] = audio->primary_codecs[0];
+	audio->secondary_codecs[1] = audio->primary_codecs[1];
+
+	args.np = audio->primary_codecs[0].of_node;
+	args.args_count = 1;
+	args.args[0] = S1402X_DAI_AP1;
+	ret = snd_soc_get_dlc(&args, &audio->amp_codecs[0]);
+	if (ret) {
+		ret = dev_err_probe(dev, ret, "failed to resolve mixer AP1 DAI\n");
+		goto err_put_codec;
+	}
 
 	ret = devm_add_action_or_reset(dev, exynos7870_put_dai_nodes, audio);
 	if (ret)
 		return ret;
 
-	audio->platforms[0].of_node = audio->cpus[0].of_node;
+	audio->platforms[EXYNOS7870_LINK_PRIMARY].of_node =
+		audio->cpus[EXYNOS7870_LINK_PRIMARY].of_node;
+	audio->platforms[EXYNOS7870_LINK_SECONDARY].of_node =
+		audio->cpus[EXYNOS7870_LINK_SECONDARY].of_node;
+	audio->platforms[EXYNOS7870_LINK_AMP].of_node =
+		audio->cpus[EXYNOS7870_LINK_AMP].of_node;
 
-	link->name = "Primary";
-	link->stream_name = "Primary";
-	link->cpus = audio->cpus;
-	link->num_cpus = ARRAY_SIZE(audio->cpus);
-	link->platforms = audio->platforms;
-	link->num_platforms = ARRAY_SIZE(audio->platforms);
-	link->codecs = audio->codecs;
-	link->num_codecs = ARRAY_SIZE(audio->codecs);
-	link->dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
-			SND_SOC_DAIFMT_CBC_CFC;
-	link->ops = &exynos7870_ops;
-	link->init = exynos7870_link_init;
-	link->exit = exynos7870_link_exit;
+	exynos7870_init_link(&audio->links[EXYNOS7870_LINK_PRIMARY],
+			     "Primary",
+			     &audio->cpus[EXYNOS7870_LINK_PRIMARY],
+			     &audio->platforms[EXYNOS7870_LINK_PRIMARY],
+			     audio->primary_codecs,
+			     ARRAY_SIZE(audio->primary_codecs));
+	audio->links[EXYNOS7870_LINK_PRIMARY].init = exynos7870_link_init;
+	audio->links[EXYNOS7870_LINK_PRIMARY].exit = exynos7870_link_exit;
+
+	exynos7870_init_link(&audio->links[EXYNOS7870_LINK_SECONDARY],
+			     "Secondary",
+			     &audio->cpus[EXYNOS7870_LINK_SECONDARY],
+			     &audio->platforms[EXYNOS7870_LINK_SECONDARY],
+			     audio->secondary_codecs,
+			     ARRAY_SIZE(audio->secondary_codecs));
+	exynos7870_init_link(&audio->links[EXYNOS7870_LINK_AMP], "Amplifier",
+			     &audio->cpus[EXYNOS7870_LINK_AMP],
+			     &audio->platforms[EXYNOS7870_LINK_AMP],
+			     audio->amp_codecs,
+			     ARRAY_SIZE(audio->amp_codecs));
 
 	card->owner = THIS_MODULE;
 	card->dev = dev;
-	card->dai_link = link;
-	card->num_links = 1;
+	card->dai_link = audio->links;
+	card->num_links = ARRAY_SIZE(audio->links);
 	card->controls = exynos7870_controls;
 	card->num_controls = ARRAY_SIZE(exynos7870_controls);
 	card->dapm_widgets = exynos7870_widgets;
@@ -231,11 +300,16 @@ static int exynos7870_audio_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, card);
 
 	return devm_snd_soc_register_card(dev, card);
-
+err_put_codec:
+	of_node_put(audio->primary_codecs[1].of_node);
 err_put_mixer:
-	of_node_put(audio->codecs[0].of_node);
+	of_node_put(audio->primary_codecs[0].of_node);
+err_put_amp:
+	of_node_put(audio->cpus[EXYNOS7870_LINK_AMP].of_node);
+err_put_secondary:
+	of_node_put(audio->cpus[EXYNOS7870_LINK_SECONDARY].of_node);
 err_put_cpu:
-	of_node_put(audio->cpus[0].of_node);
+	of_node_put(audio->cpus[EXYNOS7870_LINK_PRIMARY].of_node);
 	return ret;
 }
 
