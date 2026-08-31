@@ -27,20 +27,7 @@
 	};
 
 	chosen {
-		#address-cells = <2>;
-		#size-cells = <1>;
-		ranges;
-
 		stdout-path = &serial2;
-
-		framebuffer@67000000 {
-			compatible = "simple-framebuffer";
-			reg = <0x0 0x67000000 (1080 * 1920 * 4)>;
-			width = <1080>;
-			height = <1920>;
-			stride = <(1080 * 4)>;
-			format = "a8r8g8b8";
-		};
 	};
 
 	gpio-keys {
@@ -119,8 +106,9 @@
 			pmsg-size = <0x4000>;
 		};
 
-		framebuffer@67000000 {
+		cont_splash_mem: framebuffer@67000000 {
 			reg = <0x0 0x67000000 (1080 * 1920 * 4)>;
+			iommu-addresses = <&decon 0x67000000 (1080 * 1920 * 4)>;
 			no-map;
 		};
 	};
@@ -130,6 +118,38 @@
 		haptic-supply = <&vdd_ldo32>;
 		min-microvolt = <3300000>;
 		max-microvolt = <3300000>;
+	};
+};
+
+&decon {
+	memory-region = <&cont_splash_mem>;
+
+	status = "okay";
+
+	i80-if-timings { };
+};
+
+&dsi {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	samsung,burst-clock-frequency = <850000000>;
+	samsung,esc-clock-frequency = <16000000>;
+	samsung,pll-clock-frequency = <26000000>;
+
+	status = "okay";
+
+	panel@0 {
+		compatible = "samsung,s6e3fa3-ams549ku15";
+		reg = <0>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&decon_te_off>;
+
+		reset-gpios = <&gpd3 4 GPIO_ACTIVE_LOW>;
+		te-gpios = <&gpe0 2 GPIO_ACTIVE_HIGH>;
+		vci-supply = <&vdd_ldo29>;
+		vdd3-supply = <&vdd_ldo30>;
 	};
 };
 
