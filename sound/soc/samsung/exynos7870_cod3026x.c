@@ -19,6 +19,10 @@ enum exynos7870_link_id {
 	EXYNOS7870_LINK_PRIMARY,
 	EXYNOS7870_LINK_SECONDARY,
 	EXYNOS7870_LINK_AMP,
+	EXYNOS7870_LINK_VOICE,
+	EXYNOS7870_LINK_BLUETOOTH,
+	EXYNOS7870_LINK_FM,
+	EXYNOS7870_LINK_CP_AMP,
 	EXYNOS7870_NUM_LINKS,
 };
 
@@ -30,6 +34,10 @@ struct exynos7870_audio {
 	struct snd_soc_dai_link_component primary_codecs[2];
 	struct snd_soc_dai_link_component secondary_codecs[2];
 	struct snd_soc_dai_link_component amp_codecs[1];
+	struct snd_soc_dai_link_component voice_codecs[2];
+	struct snd_soc_dai_link_component bluetooth_codecs[1];
+	struct snd_soc_dai_link_component fm_codecs[2];
+	struct snd_soc_dai_link_component cp_amp_codecs[1];
 	struct snd_soc_jack headset_jack;
 };
 
@@ -52,6 +60,30 @@ static const struct snd_soc_dapm_widget exynos7870_widgets[] = {
 	SND_SOC_DAPM_MIC("Headset Mic", NULL),
 };
 
+static const struct snd_soc_dapm_widget exynos7870_ext_widgets[] = {
+	SND_SOC_DAPM_INPUT("Modem Downlink"),
+	SND_SOC_DAPM_OUTPUT("Modem Uplink"),
+	SND_SOC_DAPM_INPUT("Bluetooth RX"),
+	SND_SOC_DAPM_OUTPUT("Bluetooth TX"),
+	SND_SOC_DAPM_INPUT("FM Radio"),
+};
+
+static const struct snd_soc_dapm_route exynos7870_ext_routes[] = {
+	{ "Voice Call Playback", NULL, "Modem Downlink" },
+	{ "Modem Uplink", NULL, "Voice Call Capture" },
+	{ "Bluetooth Playback", NULL, "Bluetooth RX" },
+	{ "Bluetooth TX", NULL, "Bluetooth Capture" },
+	{ "FM Playback", NULL, "FM Radio" },
+};
+
+static const struct snd_soc_component_driver exynos7870_component = {
+	.name = "exynos7870-audio",
+	.dapm_widgets = exynos7870_ext_widgets,
+	.num_dapm_widgets = ARRAY_SIZE(exynos7870_ext_widgets),
+	.dapm_routes = exynos7870_ext_routes,
+	.num_dapm_routes = ARRAY_SIZE(exynos7870_ext_routes),
+};
+
 static const struct snd_kcontrol_new exynos7870_controls[] = {
 	SOC_DAPM_PIN_SWITCH("Headphone"),
 	SOC_DAPM_PIN_SWITCH("Earpiece"),
@@ -59,6 +91,89 @@ static const struct snd_kcontrol_new exynos7870_controls[] = {
 	SOC_DAPM_PIN_SWITCH("Main Mic"),
 	SOC_DAPM_PIN_SWITCH("Sub Mic"),
 	SOC_DAPM_PIN_SWITCH("Headset Mic"),
+	SOC_DAPM_PIN_SWITCH("Modem Downlink"),
+	SOC_DAPM_PIN_SWITCH("Modem Uplink"),
+	SOC_DAPM_PIN_SWITCH("Bluetooth RX"),
+	SOC_DAPM_PIN_SWITCH("Bluetooth TX"),
+	SOC_DAPM_PIN_SWITCH("FM Radio"),
+};
+
+#define EXYNOS7870_C2C_PARAMS(_name, _format, _rate_min, _rate_max) { \
+	.stream_name = (_name), \
+	.formats = (_format), \
+	.rate_min = (_rate_min), \
+	.rate_max = (_rate_max), \
+	.channels_min = 2, \
+	.channels_max = 2, \
+}
+
+static const struct snd_soc_pcm_stream exynos7870_voice_params[] = {
+	EXYNOS7870_C2C_PARAMS("8 kHz S16", SNDRV_PCM_FMTBIT_S16_LE,
+			      8000, 8000),
+	EXYNOS7870_C2C_PARAMS("8 kHz S24", SNDRV_PCM_FMTBIT_S24_LE,
+			      8000, 8000),
+	EXYNOS7870_C2C_PARAMS("16 kHz S16", SNDRV_PCM_FMTBIT_S16_LE,
+			      16000, 16000),
+	EXYNOS7870_C2C_PARAMS("16 kHz S24", SNDRV_PCM_FMTBIT_S24_LE,
+			      16000, 16000),
+	EXYNOS7870_C2C_PARAMS("48 kHz S16", SNDRV_PCM_FMTBIT_S16_LE,
+			      48000, 48000),
+	EXYNOS7870_C2C_PARAMS("48 kHz S24", SNDRV_PCM_FMTBIT_S24_LE,
+			      48000, 48000),
+};
+
+static const struct snd_soc_pcm_stream exynos7870_bluetooth_params[] = {
+	EXYNOS7870_C2C_PARAMS("8 kHz S16", SNDRV_PCM_FMTBIT_S16_LE,
+			      8000, 8000),
+	EXYNOS7870_C2C_PARAMS("8 kHz S24", SNDRV_PCM_FMTBIT_S24_LE,
+			      8000, 8000),
+	EXYNOS7870_C2C_PARAMS("16 kHz S16", SNDRV_PCM_FMTBIT_S16_LE,
+			      16000, 16000),
+	EXYNOS7870_C2C_PARAMS("16 kHz S24", SNDRV_PCM_FMTBIT_S24_LE,
+			      16000, 16000),
+};
+
+static const struct snd_soc_pcm_stream exynos7870_fm_params[] = {
+	EXYNOS7870_C2C_PARAMS("48 kHz S16", SNDRV_PCM_FMTBIT_S16_LE,
+			      48000, 48000),
+	EXYNOS7870_C2C_PARAMS("48 kHz S24", SNDRV_PCM_FMTBIT_S24_LE,
+			      48000, 48000),
+};
+
+#define EXYNOS7870_EXT_STREAM(_name, _rates) { \
+	.stream_name = (_name), \
+	.channels_min = 2, \
+	.channels_max = 2, \
+	.rates = (_rates), \
+	.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE, \
+}
+
+static struct snd_soc_dai_driver exynos7870_ext_dais[] = {
+	{
+		.name = "Voice Call",
+		.playback = EXYNOS7870_EXT_STREAM("Voice Call Playback",
+			SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000 |
+			SNDRV_PCM_RATE_48000),
+		.capture = EXYNOS7870_EXT_STREAM("Voice Call Capture",
+			SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000 |
+			SNDRV_PCM_RATE_48000),
+		.symmetric_rate = 1,
+		.symmetric_channels = 1,
+		.symmetric_sample_bits = 1,
+	}, {
+		.name = "Bluetooth",
+		.playback = EXYNOS7870_EXT_STREAM("Bluetooth Playback",
+			SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000),
+		.capture = EXYNOS7870_EXT_STREAM("Bluetooth Capture",
+			SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000),
+		.symmetric_rate = 1,
+		.symmetric_channels = 1,
+		.symmetric_sample_bits = 1,
+	}, {
+		.name = "FM",
+		.playback = EXYNOS7870_EXT_STREAM("FM Playback",
+			SNDRV_PCM_RATE_48000),
+	},
 };
 
 static int exynos7870_hw_params(struct snd_pcm_substream *substream,
@@ -165,6 +280,26 @@ static int exynos7870_parse_dai(struct device *dev, const char *name,
 	return 0;
 }
 
+static int exynos7870_derive_dai(struct device *dev,
+				 const struct snd_soc_dai_link_component *parent,
+		unsigned int id, struct snd_soc_dai_link_component *dlc,
+		const char *name)
+{
+	struct of_phandle_args args = {
+		.np = parent->of_node,
+		.args_count = 1,
+		.args[0] = id,
+	};
+	int ret;
+
+	ret = snd_soc_get_dlc(&args, dlc);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to resolve %s DAI\n",
+				     name);
+
+	return 0;
+}
+
 static void exynos7870_put_dai_nodes(void *data)
 {
 	struct exynos7870_audio *audio = data;
@@ -196,11 +331,31 @@ static void exynos7870_init_link(struct snd_soc_dai_link *link,
 	link->ops = &exynos7870_ops;
 }
 
+static void exynos7870_init_c2c_link(struct snd_soc_dai_link *link,
+				     const char *name,
+		struct snd_soc_dai_link_component *cpu,
+		struct snd_soc_dai_link_component *codecs,
+		unsigned int num_codecs,
+		const struct snd_soc_pcm_stream *params,
+		unsigned int num_params)
+{
+	link->name = name;
+	link->stream_name = name;
+	link->cpus = cpu;
+	link->num_cpus = 1;
+	link->codecs = codecs;
+	link->num_codecs = num_codecs;
+	link->dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
+			SND_SOC_DAIFMT_CBC_CFC;
+	link->c2c_params = params;
+	link->num_c2c_params = num_params;
+	link->ignore_suspend = 1;
+}
+
 static int exynos7870_audio_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct exynos7870_audio *audio;
-	struct of_phandle_args args = { };
 	struct snd_soc_card *card;
 	int ret;
 
@@ -238,14 +393,41 @@ static int exynos7870_audio_probe(struct platform_device *pdev)
 	audio->secondary_codecs[0] = audio->primary_codecs[0];
 	audio->secondary_codecs[1] = audio->primary_codecs[1];
 
-	args.np = audio->primary_codecs[0].of_node;
-	args.args_count = 1;
-	args.args[0] = S1402X_DAI_AP1;
-	ret = snd_soc_get_dlc(&args, &audio->amp_codecs[0]);
-	if (ret) {
-		ret = dev_err_probe(dev, ret, "failed to resolve mixer AP1 DAI\n");
+	ret = exynos7870_derive_dai(dev, &audio->primary_codecs[0],
+				    S1402X_DAI_AP1,
+				    &audio->amp_codecs[0], "mixer AP1");
+	if (ret)
 		goto err_put_codec;
-	}
+
+	ret = exynos7870_derive_dai(dev, &audio->primary_codecs[0],
+				    S1402X_DAI_CP0,
+				    &audio->voice_codecs[0], "mixer CP0");
+	if (ret)
+		goto err_put_codec;
+
+	ret = exynos7870_derive_dai(dev, &audio->primary_codecs[1], 1,
+				    &audio->voice_codecs[1], "codec AIF2");
+	if (ret)
+		goto err_put_codec;
+
+	ret = exynos7870_derive_dai(dev, &audio->primary_codecs[0],
+				    S1402X_DAI_BT,
+				    &audio->bluetooth_codecs[0], "mixer BT");
+	if (ret)
+		goto err_put_codec;
+
+	ret = exynos7870_derive_dai(dev, &audio->primary_codecs[0],
+				    S1402X_DAI_FM,
+				    &audio->fm_codecs[0], "mixer FM");
+	if (ret)
+		goto err_put_codec;
+	audio->fm_codecs[1] = audio->primary_codecs[1];
+
+	ret = exynos7870_derive_dai(dev, &audio->primary_codecs[0],
+				    S1402X_DAI_CP1,
+				    &audio->cp_amp_codecs[0], "mixer CP1");
+	if (ret)
+		goto err_put_codec;
 
 	ret = devm_add_action_or_reset(dev, exynos7870_put_dai_nodes, audio);
 	if (ret)
@@ -257,6 +439,14 @@ static int exynos7870_audio_probe(struct platform_device *pdev)
 		audio->cpus[EXYNOS7870_LINK_SECONDARY].of_node;
 	audio->platforms[EXYNOS7870_LINK_AMP].of_node =
 		audio->cpus[EXYNOS7870_LINK_AMP].of_node;
+	audio->cpus[EXYNOS7870_LINK_VOICE].of_node = dev->of_node;
+	audio->cpus[EXYNOS7870_LINK_VOICE].dai_name = "Voice Call";
+	audio->cpus[EXYNOS7870_LINK_BLUETOOTH].of_node = dev->of_node;
+	audio->cpus[EXYNOS7870_LINK_BLUETOOTH].dai_name = "Bluetooth";
+	audio->cpus[EXYNOS7870_LINK_FM].of_node = dev->of_node;
+	audio->cpus[EXYNOS7870_LINK_FM].dai_name = "FM";
+	audio->cpus[EXYNOS7870_LINK_CP_AMP] =
+		audio->cpus[EXYNOS7870_LINK_VOICE];
 
 	exynos7870_init_link(&audio->links[EXYNOS7870_LINK_PRIMARY],
 			     "Primary",
@@ -279,6 +469,34 @@ static int exynos7870_audio_probe(struct platform_device *pdev)
 			     audio->amp_codecs,
 			     ARRAY_SIZE(audio->amp_codecs));
 
+	exynos7870_init_c2c_link(&audio->links[EXYNOS7870_LINK_VOICE],
+				 "Voice Call",
+				 &audio->cpus[EXYNOS7870_LINK_VOICE],
+				 audio->voice_codecs,
+				 ARRAY_SIZE(audio->voice_codecs),
+				 exynos7870_voice_params,
+				 ARRAY_SIZE(exynos7870_voice_params));
+	exynos7870_init_c2c_link(&audio->links[EXYNOS7870_LINK_BLUETOOTH],
+				 "Bluetooth",
+				 &audio->cpus[EXYNOS7870_LINK_BLUETOOTH],
+				 audio->bluetooth_codecs,
+				 ARRAY_SIZE(audio->bluetooth_codecs),
+				 exynos7870_bluetooth_params,
+				 ARRAY_SIZE(exynos7870_bluetooth_params));
+	exynos7870_init_c2c_link(&audio->links[EXYNOS7870_LINK_FM], "FM",
+				 &audio->cpus[EXYNOS7870_LINK_FM],
+				 audio->fm_codecs,
+				 ARRAY_SIZE(audio->fm_codecs),
+				 exynos7870_fm_params,
+				 ARRAY_SIZE(exynos7870_fm_params));
+	exynos7870_init_c2c_link(&audio->links[EXYNOS7870_LINK_CP_AMP],
+				 "Voice Amplifier",
+				 &audio->cpus[EXYNOS7870_LINK_CP_AMP],
+				 audio->cp_amp_codecs,
+				 ARRAY_SIZE(audio->cp_amp_codecs),
+				 exynos7870_voice_params,
+				 ARRAY_SIZE(exynos7870_voice_params));
+
 	card->owner = THIS_MODULE;
 	card->dev = dev;
 	card->dai_link = audio->links;
@@ -298,6 +516,12 @@ static int exynos7870_audio_probe(struct platform_device *pdev)
 
 	snd_soc_card_set_drvdata(card, audio);
 	platform_set_drvdata(pdev, card);
+
+	ret = devm_snd_soc_register_component(dev, &exynos7870_component,
+					      exynos7870_ext_dais,
+					      ARRAY_SIZE(exynos7870_ext_dais));
+	if (ret)
+		return ret;
 
 	return devm_snd_soc_register_card(dev, card);
 err_put_codec:
