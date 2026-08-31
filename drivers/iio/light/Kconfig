@@ -649,6 +649,17 @@ config TSL2591
           To compile this driver as a module, select M: the
           module will be called tsl2591.
 
+config TMD3725
+	tristate "ams TMD3725 ambient light, color, and proximity sensor"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Say Y here to build support for the ams TMD3725 combined clear,
+	  red, green, and blue ambient-light and proximity sensor.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called tmd3725.
+
 config TSL2772
 	tristate "TAOS TSL/TMD2x71 and TSL/TMD2x72 Family of light and proximity sensors"
 	depends on I2C

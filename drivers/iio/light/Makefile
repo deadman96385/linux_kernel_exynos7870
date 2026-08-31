@@ -60,6 +60,7 @@ obj-$(CONFIG_TCS3472)		+= tcs3472.o
 obj-$(CONFIG_SENSORS_TSL2563)	+= tsl2563.o
 obj-$(CONFIG_TSL2583)		+= tsl2583.o
 obj-$(CONFIG_TSL2591)		+= tsl2591.o
+obj-$(CONFIG_TMD3725)		+= tmd3725.o
 obj-$(CONFIG_TSL2772)		+= tsl2772.o
 obj-$(CONFIG_TSL4531)		+= tsl4531.o
 obj-$(CONFIG_US5182D)		+= us5182d.o
