@@ -817,6 +817,7 @@
 
 		max-speed = <921600>;
 		brcm,bt-i2spcm-int-params = [01 00 00 01];
+		brcm,bt-i2spcm-wbs-params = [01 00 01 02];
 	};
 };
 
