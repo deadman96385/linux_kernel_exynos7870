@@ -58,7 +58,7 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     description:
       Raw ADC threshold separating three-pole headphones from four-pole
-      headsets. Values below the threshold indicate a microphone.
+      headsets. Values above the threshold indicate a microphone.
     default: 1120
 
   samsung,mic-detect-delay-ms:
