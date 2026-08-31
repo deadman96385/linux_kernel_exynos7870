@@ -231,7 +231,7 @@ config BATTERY_SAMSUNG_SDI
 
 config BATTERY_S2MU005
 	tristate "Samsung S2MU005 PMIC fuel gauge driver"
-	depends on I2C
+	depends on I2C && IIO
 	select REGMAP_I2C
 	help
 	  Say Y to enable support for the Samsung S2MU005 PMIC integrated
