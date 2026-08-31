@@ -133,13 +133,16 @@ struct exynos_adc_data {
 	bool vdd_optional;
 	int phy_offset;
 	u32 mask;
-	u32 data_reg;
+	irqreturn_t (*isr)(int irq, void *dev_id);
 
 	void (*init_hw)(struct exynos_adc *info);
 	void (*exit_hw)(struct exynos_adc *info);
 	void (*clear_irq)(struct exynos_adc *info);
 	void (*start_conv)(struct exynos_adc *info, unsigned long addr);
 };
+
+static irqreturn_t exynos_adc_isr(int irq, void *dev_id);
+static irqreturn_t exynos7870_adc_isr(int irq, void *dev_id);
 
 static void exynos_adc_unprepare_clk(struct exynos_adc *info)
 {
@@ -211,7 +214,7 @@ static void exynos_adc_v1_start_conv(struct exynos_adc *info,
 static const struct exynos_adc_data exynos4212_adc_data = {
 	.num_channels	= MAX_EXYNOS4212_ADC_CHANNELS,
 	.mask		= ADC_DATX_MASK,	/* 12 bit ADC resolution */
-	.data_reg	= ADC_V1_DATX(0),
+	.isr		= exynos_adc_isr,
 	.needs_adc_phy	= true,
 	.phy_offset	= EXYNOS_ADCV1_PHY_OFFSET,
 
@@ -224,7 +227,7 @@ static const struct exynos_adc_data exynos4212_adc_data = {
 static const struct exynos_adc_data exynos_adc_v1_data = {
 	.num_channels	= MAX_ADC_V1_CHANNELS,
 	.mask		= ADC_DATX_MASK,	/* 12 bit ADC resolution */
-	.data_reg	= ADC_V1_DATX(0),
+	.isr		= exynos_adc_isr,
 	.needs_adc_phy	= true,
 	.phy_offset	= EXYNOS_ADCV1_PHY_OFFSET,
 
@@ -237,7 +240,7 @@ static const struct exynos_adc_data exynos_adc_v1_data = {
 static const struct exynos_adc_data exynos_adc_s5pv210_data = {
 	.num_channels	= MAX_S5PV210_ADC_CHANNELS,
 	.mask		= ADC_DATX_MASK,	/* 12 bit ADC resolution */
-	.data_reg	= ADC_V1_DATX(0),
+	.isr		= exynos_adc_isr,
 
 	.init_hw	= exynos_adc_v1_init_hw,
 	.exit_hw	= exynos_adc_v1_exit_hw,
@@ -259,7 +262,7 @@ static void exynos_adc_s3c64xx_start_conv(struct exynos_adc *info,
 static struct exynos_adc_data const exynos_adc_s3c64xx_data = {
 	.num_channels	= MAX_ADC_V1_CHANNELS,
 	.mask		= ADC_DATX_MASK,	/* 12 bit ADC resolution */
-	.data_reg	= ADC_V1_DATX(0),
+	.isr		= exynos_adc_isr,
 
 	.init_hw	= exynos_adc_v1_init_hw,
 	.exit_hw	= exynos_adc_v1_exit_hw,
@@ -319,7 +322,7 @@ static void exynos_adc_v2_start_conv(struct exynos_adc *info,
 static const struct exynos_adc_data exynos_adc_v2_data = {
 	.num_channels	= MAX_ADC_V2_CHANNELS,
 	.mask		= ADC_DATX_MASK, /* 12 bit ADC resolution */
-	.data_reg	= ADC_V1_DATX(0),
+	.isr		= exynos_adc_isr,
 	.needs_adc_phy	= true,
 	.phy_offset	= EXYNOS_ADCV2_PHY_OFFSET,
 
@@ -332,7 +335,7 @@ static const struct exynos_adc_data exynos_adc_v2_data = {
 static const struct exynos_adc_data exynos3250_adc_data = {
 	.num_channels	= MAX_EXYNOS3250_ADC_CHANNELS,
 	.mask		= ADC_DATX_MASK, /* 12 bit ADC resolution */
-	.data_reg	= ADC_V1_DATX(0),
+	.isr		= exynos_adc_isr,
 	.needs_adc_phy	= true,
 	.phy_offset	= EXYNOS_ADCV1_PHY_OFFSET,
 
@@ -380,10 +383,10 @@ static void exynos_adc_v3_exit_hw(struct exynos_adc *info)
 	writel(0, ADC_V2_INT_EN(info->regs));
 }
 
-static const struct exynos_adc_data exynos_adc_v3_data = {
+static const struct exynos_adc_data exynos7870_adc_data = {
 	.num_channels	= MAX_ADC_V3_CHANNELS,
 	.mask		= ADC_DATX_MASK, /* 12 bit ADC resolution */
-	.data_reg	= ADC_V3_DAT(0),
+	.isr		= exynos7870_adc_isr,
 	.vdd_optional	= true,
 
 	.init_hw	= exynos_adc_v3_init_hw,
@@ -395,7 +398,7 @@ static const struct exynos_adc_data exynos_adc_v3_data = {
 static const struct exynos_adc_data exynos7_adc_data = {
 	.num_channels	= MAX_ADC_V1_CHANNELS,
 	.mask		= ADC_DATX_MASK, /* 12 bit ADC resolution */
-	.data_reg	= ADC_V1_DATX(0),
+	.isr		= exynos_adc_isr,
 
 	.init_hw	= exynos_adc_exynos7_init_hw,
 	.exit_hw	= exynos_adc_v2_exit_hw,
@@ -420,8 +423,8 @@ static const struct of_device_id exynos_adc_match[] = {
 		.compatible = "samsung,exynos-adc-v2",
 		.data = &exynos_adc_v2_data,
 	}, {
-		.compatible = "samsung,exynos-adc-v3",
-		.data = &exynos_adc_v3_data,
+		.compatible = "samsung,exynos7870-adc",
+		.data = &exynos7870_adc_data,
 	}, {
 		.compatible = "samsung,exynos3250-adc",
 		.data = &exynos3250_adc_data,
@@ -499,9 +502,24 @@ static irqreturn_t exynos_adc_isr(int irq, void *dev_id)
 	u32 mask = info->data->mask;
 
 	/* Read value */
-	info->value = readl(info->regs + info->data->data_reg) & mask;
+	info->value = readl(ADC_V1_DATX(info->regs)) & mask;
 
 	/* clear irq */
+	if (info->data->clear_irq)
+		info->data->clear_irq(info);
+
+	complete(&info->completion);
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t exynos7870_adc_isr(int irq, void *dev_id)
+{
+	struct exynos_adc *info = dev_id;
+	u32 mask = info->data->mask;
+
+	info->value = readl(ADC_V3_DAT(info->regs)) & mask;
+
 	if (info->data->clear_irq)
 		info->data->clear_irq(info);
 
@@ -633,7 +651,7 @@ static int exynos_adc_probe(struct platform_device *pdev)
 
 	mutex_init(&info->lock);
 
-	ret = request_irq(info->irq, exynos_adc_isr, 0, dev_name(dev), info);
+	ret = request_irq(info->irq, info->data->isr, 0, dev_name(dev), info);
 	if (ret < 0) {
 		dev_err(dev, "failed requesting irq, irq = %d\n", info->irq);
 		goto err_disable_clk;
