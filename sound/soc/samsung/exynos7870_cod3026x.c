@@ -364,6 +364,7 @@ static int exynos7870_audio_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	card = &audio->card;
+	card->driver_name = "exynos7870";
 
 	ret = exynos7870_parse_dai(dev, "cpu",
 				   &audio->cpus[EXYNOS7870_LINK_PRIMARY]);
