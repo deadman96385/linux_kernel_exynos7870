@@ -21,6 +21,16 @@ config SND_SOC_S1402X
 	  processor, modem, Bluetooth, FM, and amplifier serial audio paths
 	  and provides digital mixing and automatic level control.
 
+config SND_SOC_COD3026X
+	tristate "Samsung COD3026X audio codec"
+	depends on I2C && IIO
+	select REGMAP_I2C
+	help
+	  Enable support for the Samsung COD3026X low-power audio codec.  The
+	  codec provides stereo playback and capture, three microphone inputs,
+	  headphone, earpiece and speaker outputs, and ADC-assisted headset and
+	  button detection.
+
 config SND_SOC_ALL_CODECS
 	tristate "Build all ASoC CODEC drivers"
 	depends on COMPILE_TEST
