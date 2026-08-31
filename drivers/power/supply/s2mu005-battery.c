@@ -714,7 +714,8 @@ static int s2mu005_fg_i2c_probe(struct i2c_client *client)
 				     "failed to initialize fuel gauge\n");
 
 	psy_desc = device_get_match_data(dev);
-	if (priv->battery_temp && priv->profile && priv->profile->temp_table)
+	if (priv->battery_temp && priv->profile && priv->profile->temp_table &&
+	    priv->profile->temp_table_size)
 		psy_desc = &s2mu005_fg_temp_desc;
 
 	psy_cfg.drv_data = priv;
