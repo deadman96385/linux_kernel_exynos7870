@@ -606,6 +606,60 @@ static int cod3026x_vmid_event(struct snd_soc_dapm_widget *widget,
 	return 0;
 }
 
+enum cod3026x_micbias {
+	COD3026X_MICBIAS_1,
+	COD3026X_MICBIAS_2,
+};
+
+static int cod3026x_micbias_event(struct snd_soc_dapm_widget *widget,
+				  struct snd_kcontrol *control, int event)
+{
+	struct snd_soc_component *component =
+		snd_soc_dapm_to_component(widget->dapm);
+	struct cod3026x_priv *cod3026x =
+		snd_soc_component_get_drvdata(component);
+	unsigned int other_bias, bias, mask, value;
+	int ret;
+
+	if (widget->shift == COD3026X_MICBIAS_1) {
+		bias = COD3026X_PDB_MCB1;
+		other_bias = COD3026X_PDB_MCB2;
+	} else {
+		bias = COD3026X_PDB_MCB2;
+		other_bias = COD3026X_PDB_MCB1;
+	}
+
+	ret = regmap_read(cod3026x->regmap, COD3026X_PD_REF, &value);
+	if (ret)
+		return ret;
+
+	mask = bias;
+	if (!(value & other_bias))
+		mask |= COD3026X_PDB_MCB_LDO;
+
+	switch (event) {
+	case SND_SOC_DAPM_PRE_PMU:
+		ret = regmap_update_bits(cod3026x->regmap, COD3026X_PD_REF,
+					 mask, mask);
+		if (!ret && widget->shift == COD3026X_MICBIAS_2)
+			ret = regmap_update_bits(cod3026x->regmap,
+						 COD3026X_CTRL_REF,
+						 COD3026X_MCB2_MANUAL,
+						 COD3026X_MCB2_MANUAL);
+		return ret;
+	case SND_SOC_DAPM_POST_PMD:
+		ret = regmap_update_bits(cod3026x->regmap, COD3026X_PD_REF,
+					 mask, 0);
+		if (!ret && widget->shift == COD3026X_MICBIAS_2)
+			ret = regmap_update_bits(cod3026x->regmap,
+						 COD3026X_CTRL_REF,
+						 COD3026X_MCB2_MANUAL, 0);
+		return ret;
+	default:
+		return 0;
+	}
+}
+
 static int cod3026x_adc_event(struct snd_soc_dapm_widget *widget,
 			      struct snd_kcontrol *control, int event)
 {
@@ -976,6 +1030,14 @@ static const struct snd_kcontrol_new cod3026x_linein_on[] = {
 };
 
 static const struct snd_soc_dapm_widget cod3026x_widgets[] = {
+	SND_SOC_DAPM_SUPPLY("MICBIAS1", SND_SOC_NOPM,
+			    COD3026X_MICBIAS_1, 0,
+			    cod3026x_micbias_event,
+			    SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
+	SND_SOC_DAPM_SUPPLY("MICBIAS2", SND_SOC_NOPM,
+			    COD3026X_MICBIAS_2, 0,
+			    cod3026x_micbias_event,
+			    SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
 	SND_SOC_DAPM_SUPPLY("VMID", SND_SOC_NOPM, 0, 0,
 			    cod3026x_vmid_event,
 			    SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_PRE_PMD),
