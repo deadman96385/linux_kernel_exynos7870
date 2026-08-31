@@ -97,6 +97,14 @@ static int s2mu005_chgr_get_usb_type(struct s2m_chgr *priv, int *value)
 {
 	int state;
 
+	state = extcon_get_state(priv->extcon, EXTCON_CHG_USB_SLOW);
+	if (state < 0)
+		return state;
+	if (state) {
+		*value = POWER_SUPPLY_USB_TYPE_SDP;
+		return 0;
+	}
+
 	state = extcon_get_state(priv->extcon, EXTCON_CHG_USB_CDP);
 	if (state < 0)
 		return state;

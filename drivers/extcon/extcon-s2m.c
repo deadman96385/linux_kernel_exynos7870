@@ -27,6 +27,31 @@ struct s2m_muic_irq_data {
 	int irq;
 };
 
+enum s2mu005_muic_type {
+	S2MU005_TYPE_OPEN,
+	S2MU005_TYPE_OTG,
+	S2MU005_TYPE_SDP,
+	S2MU005_TYPE_CDP,
+	S2MU005_TYPE_DCP,
+	S2MU005_TYPE_SLOW_CHARGER,
+	S2MU005_TYPE_UART,
+	S2MU005_TYPE_UART_DCP,
+	S2MU005_TYPE_JIG_USB_OFF,
+	S2MU005_TYPE_JIG_USB_ON,
+	S2MU005_TYPE_DOCK,
+	S2MU005_TYPE_DOCK_DCP,
+	S2MU005_TYPE_UNKNOWN,
+};
+
+struct s2mu005_muic_state {
+	unsigned int adc;
+	unsigned int dev1;
+	unsigned int dev2;
+	unsigned int dev3;
+	unsigned int chgtype;
+	unsigned int apple;
+};
+
 struct s2m_muic {
 	struct device *dev;
 	struct regmap *regmap;
@@ -139,6 +164,20 @@ static int s2mu005_muic_set_data_path(struct s2m_muic *priv)
 	return ret;
 }
 
+static int s2mu005_muic_set_uart_path(struct s2m_muic *priv)
+{
+	int ret;
+
+	ret = regmap_update_bits(priv->regmap, S2MU005_REG_MUIC_SWCTRL,
+				 S2MU005_MUIC_DM_DP,
+				 FIELD_PREP(S2MU005_MUIC_DM_DP,
+					    S2MU005_MUIC_DM_DP_UART));
+	if (ret)
+		dev_err(priv->dev, "failed to configure UART pins\n");
+
+	return ret;
+}
+
 static int s2mu005_muic_set_otg_detection(struct s2m_muic *priv)
 {
 	int ret;
@@ -170,79 +209,294 @@ static int s2mu005_muic_set_cable(struct s2m_muic *priv, unsigned int cable,
 	return s2m_muic_set_role(priv, role);
 }
 
+static int s2mu005_muic_read_state(struct s2m_muic *priv,
+				   struct s2mu005_muic_state *state)
+{
+	int ret;
+
+	ret = regmap_read(priv->regmap, S2MU005_REG_MUIC_ADC, &state->adc);
+	if (ret)
+		return ret;
+	ret = regmap_read(priv->regmap, S2MU005_REG_MUIC_DEV1, &state->dev1);
+	if (ret)
+		return ret;
+	ret = regmap_read(priv->regmap, S2MU005_REG_MUIC_DEV2, &state->dev2);
+	if (ret)
+		return ret;
+	ret = regmap_read(priv->regmap, S2MU005_REG_MUIC_DEV3, &state->dev3);
+	if (ret)
+		return ret;
+	ret = regmap_read(priv->regmap, S2MU005_REG_MUIC_CHGTYPE,
+			  &state->chgtype);
+	if (ret)
+		return ret;
+
+	return regmap_read(priv->regmap, S2MU005_REG_MUIC_DEVAPPLE,
+			   &state->apple);
+}
+
+static enum s2mu005_muic_type
+s2mu005_muic_classify(const struct s2mu005_muic_state *state)
+{
+	enum s2mu005_muic_type type = S2MU005_TYPE_UNKNOWN;
+	unsigned int adc = FIELD_GET(S2MU005_MUIC_ADC_VALUE, state->adc);
+	bool vbus = state->apple & S2MU005_MUIC_VBUS_WAKEUP;
+
+	switch (state->dev1) {
+	case S2MU005_MUIC_CDP:
+		if (vbus)
+			type = S2MU005_TYPE_CDP;
+		break;
+	case S2MU005_MUIC_SDP:
+		if (vbus)
+			type = S2MU005_TYPE_SDP;
+		break;
+	case S2MU005_MUIC_DCP:
+		if (vbus)
+			type = S2MU005_TYPE_DCP;
+		break;
+	case S2MU005_MUIC_OTG:
+		type = S2MU005_TYPE_OTG;
+		break;
+	case S2MU005_MUIC_T1_T2_CHG:
+		if (vbus)
+			type = adc == S2MU005_MUIC_ADC_TYPE2_CHG ?
+				S2MU005_TYPE_DCP : S2MU005_TYPE_SDP;
+		else
+			type = S2MU005_TYPE_UART;
+		break;
+	case S2MU005_MUIC_UART:
+		type = S2MU005_TYPE_UART;
+		break;
+	default:
+		break;
+	}
+
+	switch (state->dev2) {
+	case S2MU005_MUIC_SDP_1P8S:
+		if (vbus && adc == S2MU005_MUIC_ADC_OPEN)
+			type = S2MU005_TYPE_SDP;
+		break;
+	case S2MU005_MUIC_JIG_UART_OFF:
+		type = vbus ? S2MU005_TYPE_UART_DCP : S2MU005_TYPE_UART;
+		break;
+	case S2MU005_MUIC_JIG_UART_ON:
+		type = S2MU005_TYPE_UART;
+		break;
+	case S2MU005_MUIC_JIG_USB_OFF:
+		if (vbus)
+			type = S2MU005_TYPE_JIG_USB_OFF;
+		break;
+	case S2MU005_MUIC_JIG_USB_ON:
+		if (vbus)
+			type = S2MU005_TYPE_JIG_USB_ON;
+		break;
+	default:
+		break;
+	}
+
+	if (vbus && (state->apple & (S2MU005_MUIC_APPLE_CHG_2P4A |
+					     S2MU005_MUIC_APPLE_CHG_2P0A |
+					     S2MU005_MUIC_APPLE_CHG_1P0A)))
+		type = S2MU005_TYPE_DCP;
+	else if (vbus && (state->apple & S2MU005_MUIC_APPLE_CHG_0P5A))
+		type = S2MU005_TYPE_SLOW_CHARGER;
+
+	if (vbus && type == S2MU005_TYPE_UNKNOWN) {
+		if (state->chgtype & S2MU005_MUIC_CHGTYPE_DCP)
+			type = S2MU005_TYPE_DCP;
+		else if (state->chgtype & S2MU005_MUIC_CHGTYPE_CDP)
+			type = S2MU005_TYPE_CDP;
+		else if (state->chgtype & S2MU005_MUIC_CHGTYPE_USB)
+			type = S2MU005_TYPE_SDP;
+		else if (state->dev3 & (S2MU005_MUIC_U200_CHG |
+					S2MU005_MUIC_VBUS_R255))
+			type = S2MU005_TYPE_DCP;
+	}
+
+	if (vbus && type == S2MU005_TYPE_UNKNOWN &&
+	    (state->chgtype & S2MU005_MUIC_CHGTYPE_FALLBACK)) {
+		if (adc == S2MU005_MUIC_ADC_TYPE1_CHG ||
+		    adc == S2MU005_MUIC_ADC_JIG_USB_OFF)
+			type = S2MU005_TYPE_SDP;
+		else
+			type = S2MU005_TYPE_DCP;
+	}
+
+	if ((state->dev2 & S2MU005_MUIC_AV) ||
+	    (state->dev3 & S2MU005_MUIC_VBUS_AV))
+		type = vbus ? S2MU005_TYPE_DOCK_DCP : S2MU005_TYPE_DOCK;
+
+	if (type != S2MU005_TYPE_UNKNOWN)
+		return type;
+
+	switch (adc) {
+	case S2MU005_MUIC_ADC_TYPE1_CHG:
+		if (vbus)
+			type = S2MU005_TYPE_SDP;
+		break;
+	case S2MU005_MUIC_ADC_TYPE2_CHG:
+		if (vbus)
+			type = S2MU005_TYPE_DCP;
+		break;
+	case S2MU005_MUIC_ADC_JIG_USB_OFF:
+		if (vbus)
+			type = S2MU005_TYPE_JIG_USB_OFF;
+		break;
+	case S2MU005_MUIC_ADC_JIG_USB_ON:
+		if (vbus)
+			type = S2MU005_TYPE_JIG_USB_ON;
+		break;
+	case S2MU005_MUIC_ADC_JIG_UART_OFF:
+		type = vbus ? S2MU005_TYPE_UART_DCP : S2MU005_TYPE_UART;
+		break;
+	case S2MU005_MUIC_ADC_JIG_UART_ON:
+		type = S2MU005_TYPE_UART;
+		break;
+	case S2MU005_MUIC_ADC_DESKDOCK:
+		type = vbus ? S2MU005_TYPE_DOCK_DCP : S2MU005_TYPE_DOCK;
+		break;
+	case S2MU005_MUIC_ADC_OPEN:
+		type = S2MU005_TYPE_OPEN;
+		break;
+	default:
+		if (vbus)
+			type = S2MU005_TYPE_SLOW_CHARGER;
+		break;
+	}
+
+	return type;
+}
+
+static int s2mu005_muic_set_jig(struct s2m_muic *priv)
+{
+	return extcon_set_state_sync(priv->extcon, EXTCON_JIG, true);
+}
+
+static int s2mu005_muic_apply_state(struct s2m_muic *priv,
+				    const struct s2mu005_muic_state *state,
+				    enum s2mu005_muic_type type)
+{
+	int ret;
+
+	switch (type) {
+	case S2MU005_TYPE_OPEN:
+		return 0;
+	case S2MU005_TYPE_OTG:
+		ret = s2mu005_muic_set_data_path(priv);
+		if (!ret)
+			ret = s2mu005_muic_set_otg_detection(priv);
+		if (!ret)
+			ret = s2mu005_muic_set_cable(priv, EXTCON_USB_HOST,
+						     USB_ROLE_HOST);
+		return ret;
+	case S2MU005_TYPE_SDP:
+		ret = s2mu005_muic_set_data_path(priv);
+		if (!ret)
+			ret = extcon_set_state_sync(priv->extcon,
+						    EXTCON_CHG_USB_SDP, true);
+		if (!ret)
+			ret = s2mu005_muic_set_cable(priv, EXTCON_USB,
+						     USB_ROLE_DEVICE);
+		return ret;
+	case S2MU005_TYPE_CDP:
+		ret = s2mu005_muic_set_data_path(priv);
+		if (!ret)
+			ret = extcon_set_state_sync(priv->extcon,
+						    EXTCON_CHG_USB_CDP, true);
+		if (!ret)
+			ret = s2mu005_muic_set_cable(priv, EXTCON_USB,
+						     USB_ROLE_DEVICE);
+		return ret;
+	case S2MU005_TYPE_DCP:
+		return extcon_set_state_sync(priv->extcon, EXTCON_CHG_USB_DCP,
+						   true);
+	case S2MU005_TYPE_SLOW_CHARGER:
+		return extcon_set_state_sync(priv->extcon,
+						   EXTCON_CHG_USB_SLOW, true);
+	case S2MU005_TYPE_UART:
+		ret = s2mu005_muic_set_uart_path(priv);
+		if (!ret)
+			ret = s2mu005_muic_set_jig(priv);
+		return ret;
+	case S2MU005_TYPE_UART_DCP:
+		ret = s2mu005_muic_set_uart_path(priv);
+		if (!ret)
+			ret = s2mu005_muic_set_jig(priv);
+		if (!ret)
+			ret = extcon_set_state_sync(priv->extcon,
+						    EXTCON_CHG_USB_DCP, true);
+		return ret;
+	case S2MU005_TYPE_JIG_USB_OFF:
+		ret = s2mu005_muic_set_data_path(priv);
+		if (!ret)
+			ret = s2mu005_muic_set_jig(priv);
+		if (!ret)
+			ret = extcon_set_state_sync(priv->extcon,
+						    EXTCON_CHG_USB_SDP, true);
+		if (!ret)
+			ret = s2mu005_muic_set_cable(priv, EXTCON_USB,
+						     USB_ROLE_DEVICE);
+		return ret;
+	case S2MU005_TYPE_JIG_USB_ON:
+		ret = s2mu005_muic_set_data_path(priv);
+		if (!ret)
+			ret = s2mu005_muic_set_jig(priv);
+		if (!ret)
+			ret = s2mu005_muic_set_cable(priv, EXTCON_USB,
+						     USB_ROLE_DEVICE);
+		return ret;
+	case S2MU005_TYPE_DOCK:
+		return extcon_set_state_sync(priv->extcon, EXTCON_DOCK, true);
+	case S2MU005_TYPE_DOCK_DCP:
+		ret = extcon_set_state_sync(priv->extcon, EXTCON_DOCK, true);
+		if (!ret)
+			ret = extcon_set_state_sync(priv->extcon,
+						    EXTCON_CHG_USB_DCP, true);
+		return ret;
+	case S2MU005_TYPE_UNKNOWN:
+		dev_warn(priv->dev,
+			 "unrecognized cable: ADC=%#x DEV1=%#x DEV2=%#x DEV3=%#x APPLE=%#x CHGTYPE=%#x\n",
+			 state->adc, state->dev1, state->dev2, state->dev3,
+			 state->apple, state->chgtype);
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
 static int s2mu005_muic_attach(struct s2m_muic *priv)
 {
-	unsigned int type;
+	struct s2mu005_muic_state state;
+	enum s2mu005_muic_type type;
+	bool state_reset = false;
 	int cleanup_ret;
 	int ret;
 
 	mutex_lock(&priv->lock);
 
-	ret = regmap_read(priv->regmap, S2MU005_REG_MUIC_DEV1, &type);
+	ret = s2mu005_muic_read_state(priv, &state);
 	if (ret) {
-		dev_err(priv->dev, "failed to read DEV1 register\n");
+		dev_err(priv->dev, "failed to read cable classification registers\n");
 		goto out;
 	}
+	if (state.adc & S2MU005_MUIC_ADC_CONVERSION) {
+		dev_warn_ratelimited(priv->dev, "MUIC ADC conversion is incomplete\n");
+		ret = -EAGAIN;
+		goto out;
+	}
+	type = s2mu005_muic_classify(&state);
 
 	/* Reset the old path before applying an attach-to-attach reclassification. */
 	ret = s2mu005_muic_detach_locked(priv);
 	if (ret)
 		goto out;
+	state_reset = true;
 
-	if (type & (S2MU005_MUIC_OTG | S2MU005_MUIC_CDP | S2MU005_MUIC_SDP)) {
-		ret = s2mu005_muic_set_data_path(priv);
-		if (ret)
-			goto out;
-	}
-
-	if (type & S2MU005_MUIC_OTG) {
-		ret = s2mu005_muic_set_otg_detection(priv);
-		if (ret)
-			goto out;
-	}
-
-	switch (type) {
-	case S2MU005_MUIC_OTG:
-		dev_dbg(priv->dev, "USB OTG connection detected\n");
-		ret = s2mu005_muic_set_cable(priv, EXTCON_USB_HOST,
-					     USB_ROLE_HOST);
-		break;
-	case S2MU005_MUIC_CDP:
-		dev_dbg(priv->dev, "USB CDP connection detected\n");
-		ret = extcon_set_state_sync(priv->extcon, EXTCON_CHG_USB_CDP,
-					    true);
-		if (!ret)
-			ret = s2mu005_muic_set_cable(priv, EXTCON_USB,
-						     USB_ROLE_DEVICE);
-		break;
-	case S2MU005_MUIC_SDP:
-		dev_dbg(priv->dev, "USB SDP connection detected\n");
-		ret = extcon_set_state_sync(priv->extcon, EXTCON_CHG_USB_SDP,
-					    true);
-		if (!ret)
-			ret = s2mu005_muic_set_cable(priv, EXTCON_USB,
-						     USB_ROLE_DEVICE);
-		break;
-	case S2MU005_MUIC_DCP:
-		dev_dbg(priv->dev, "USB DCP connection detected\n");
-		ret = extcon_set_state_sync(priv->extcon, EXTCON_CHG_USB_DCP,
-					    true);
-		break;
-	case S2MU005_MUIC_UART:
-		dev_dbg(priv->dev, "UART connection detected\n");
-		ret = extcon_set_state_sync(priv->extcon, EXTCON_JIG, true);
-		break;
-	case 0: /* OPEN */
-		ret = 0;
-		break;
-	default:
-		dev_warn(priv->dev,
-			 "failed to recognize attached device (DEV1=0x%x)\n", type);
-		ret = 0;
-	}
+	ret = s2mu005_muic_apply_state(priv, &state, type);
 
 out:
-	if (ret) {
+	if (ret && state_reset) {
 		cleanup_ret = s2mu005_muic_detach_locked(priv);
 		if (cleanup_ret)
 			dev_err(priv->dev,
@@ -321,6 +575,8 @@ static const unsigned int s2mu005_muic_extcon_cable[] = {
 	EXTCON_CHG_USB_SDP,
 	EXTCON_CHG_USB_DCP,
 	EXTCON_CHG_USB_CDP,
+	EXTCON_CHG_USB_SLOW,
+	EXTCON_DOCK,
 	EXTCON_JIG,
 	EXTCON_NONE,
 };
@@ -334,6 +590,15 @@ static const struct s2m_muic_irq_data s2mu005_muic_irq_data[] = {
 		.name = "detach",
 		.handler = s2mu005_muic_detach,
 		.call_on_cleanup = true,
+	}, {
+		.name = "vbus-on",
+		.handler = s2mu005_muic_attach,
+	}, {
+		.name = "adc-change",
+		.handler = s2mu005_muic_attach,
+	}, {
+		.name = "vbus-off",
+		.handler = s2mu005_muic_attach,
 	}, {
 		/* sentinel */
 	}

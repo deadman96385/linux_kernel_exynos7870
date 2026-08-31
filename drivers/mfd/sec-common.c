@@ -109,6 +109,9 @@ static const struct mfd_cell s2mpu05_devs[] = {
 static const struct resource s2mu005_muic_resources[] = {
 	DEFINE_RES_IRQ_NAMED(S2MU005_IRQ_MUIC_ATTACH, "attach"),
 	DEFINE_RES_IRQ_NAMED(S2MU005_IRQ_MUIC_DETACH, "detach"),
+	DEFINE_RES_IRQ_NAMED(S2MU005_IRQ_MUIC_VBUSON, "vbus-on"),
+	DEFINE_RES_IRQ_NAMED(S2MU005_IRQ_MUIC_ADC, "adc-change"),
+	DEFINE_RES_IRQ_NAMED(S2MU005_IRQ_MUIC_VBUSOFF, "vbus-off"),
 };
 
 static const struct resource s2mu005_charger_resources[] = {
