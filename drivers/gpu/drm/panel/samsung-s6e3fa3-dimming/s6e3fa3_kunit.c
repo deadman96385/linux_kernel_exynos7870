@@ -106,6 +106,55 @@ static void s6e3fa3_hbm_test(struct kunit *test)
 			   expected, sizeof(expected));
 }
 
+static void s6e3fa3_j7y17_hardware_calibration_test(struct kunit *test)
+{
+	static const u8 mtp[S6E3FA3_MTP_LEN] = {
+		0x00, 0x95, 0x00, 0x6c, 0x00, 0xc1,
+		0x5e, 0x5d, 0x5f, 0x59, 0x59, 0x5d,
+		0x45, 0x43, 0x4b, 0x4d, 0x49, 0x53,
+		0x5d, 0x59, 0x62, 0x5a, 0x56, 0x5f,
+		0x42, 0x3c, 0x5b, 0x1b, 0x11, 0x37,
+		0x00, 0x00, 0x00, 0x23, 0x02,
+	};
+	static const u8 hbm[S6E3FA3_HBM_MTP_LEN] = {
+		0x6f, 0x20, 0x1f, 0x20, 0x7c, 0x7b, 0x7d,
+		0x7c, 0x7b, 0x7b, 0x7d, 0x7d, 0x7d, 0x7d,
+		0x7d, 0x7d, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e,
+		0x7e, 0x7f, 0x7d, 0x7c, 0x7d, 0x63, 0x61,
+	};
+	struct s6e3fa3_dimming *dimming;
+
+	dimming = kunit_kzalloc(test, sizeof(*dimming), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dimming);
+	KUNIT_ASSERT_EQ(test, s6e3fa3_dimming_init_live(dimming, mtp), 0);
+	KUNIT_EXPECT_TRUE(test, dimming->valid);
+	KUNIT_EXPECT_EQ(test,
+			dimming->mtp.offset[S6E3FA3_255][S6E3FA3_RED],
+			(s16)149);
+	KUNIT_EXPECT_EQ(test,
+			dimming->mtp.offset[S6E3FA3_255][S6E3FA3_GREEN],
+			(s16)108);
+	KUNIT_EXPECT_EQ(test,
+			dimming->mtp.offset[S6E3FA3_255][S6E3FA3_BLUE],
+			(s16)193);
+	KUNIT_EXPECT_EQ(test,
+			dimming->mtp.offset[S6E3FA3_VT][S6E3FA3_RED],
+			(s16)2);
+	KUNIT_EXPECT_EQ(test,
+			dimming->mtp.offset[S6E3FA3_VT][S6E3FA3_GREEN],
+			(s16)3);
+	KUNIT_EXPECT_EQ(test,
+			dimming->mtp.offset[S6E3FA3_VT][S6E3FA3_BLUE],
+			(s16)2);
+	KUNIT_ASSERT_NOT_NULL(test,
+			      s6e3fa3_gamma(dimming, S6E3FA3_LEVEL_360NIT));
+
+	KUNIT_ASSERT_EQ(test, s6e3fa3_hbm_init_live(dimming, hbm), 0);
+	KUNIT_EXPECT_TRUE(test, dimming->hbm_valid);
+	KUNIT_ASSERT_NOT_NULL(test,
+			      s6e3fa3_gamma(dimming, S6E3FA3_LEVEL_500NIT));
+}
+
 struct s6e3fa3_emit_capture {
 	struct kunit *test;
 	const u8 *expected;
@@ -205,6 +254,7 @@ static struct kunit_case s6e3fa3_test_cases[] = {
 	KUNIT_CASE(s6e3fa3_mtp_test),
 	KUNIT_CASE(s6e3fa3_dimming_test),
 	KUNIT_CASE(s6e3fa3_hbm_test),
+	KUNIT_CASE(s6e3fa3_j7y17_hardware_calibration_test),
 	KUNIT_CASE(s6e3fa3_update_test),
 	{ }
 };

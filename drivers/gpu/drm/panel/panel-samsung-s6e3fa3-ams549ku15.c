@@ -23,6 +23,8 @@
 #include "samsung-s6e3fa3-dimming/s6e3fa3_dimming.h"
 #include "samsung-s6e3fa3-dimming/s6e3fa3_update.h"
 
+#define S6E3FA3_MTP_DATE_LEN	47
+
 struct s6e3fa3_ams549ku15 {
 	struct drm_panel panel;
 	struct mipi_dsi_device *dsi;
@@ -59,13 +61,26 @@ static int s6e3fa3_ams549ku15_write(void *context, const u8 *data,
 static int s6e3fa3_ams549ku15_read(struct s6e3fa3_ams549ku15 *ctx,
 				   u8 command, u8 *data, size_t length)
 {
+	unsigned int attempt;
+	int error = -EIO;
 	ssize_t ret;
 
-	ret = mipi_dsi_dcs_read(ctx->dsi, command, data, length);
-	if (ret < 0)
-		return ret;
+	for (attempt = 0; attempt < 2; attempt++) {
+		ret = mipi_dsi_set_maximum_return_packet_size(ctx->dsi,
+							      length);
+		if (ret < 0) {
+			error = ret;
+			continue;
+		}
 
-	return ret == length ? 0 : -EIO;
+		ret = mipi_dsi_dcs_read(ctx->dsi, command, data, length);
+		if (ret == length)
+			return 0;
+
+		error = ret < 0 ? ret : -EIO;
+	}
+
+	return error;
 }
 
 static bool s6e3fa3_ams549ku15_uniform(const u8 *data, size_t length,
@@ -83,13 +98,14 @@ static bool s6e3fa3_ams549ku15_uniform(const u8 *data, size_t length,
 /* The F0 and FC manufacturer keys must be enabled by the caller. */
 static int s6e3fa3_ams549ku15_calibrate(struct s6e3fa3_ams549ku15 *ctx)
 {
-	u8 mtp[S6E3FA3_MTP_LEN];
+	u8 mtp_date[S6E3FA3_MTP_DATE_LEN];
 	u8 hbm[S6E3FA3_HBM_MTP_LEN];
 	int ret;
 
 	if (!ctx->calibrated) {
 		ctx->panel.backlight->props.max_brightness = 255;
-		ret = s6e3fa3_ams549ku15_read(ctx, 0xc8, mtp, sizeof(mtp));
+		ret = s6e3fa3_ams549ku15_read(ctx, 0xc8, mtp_date,
+					      sizeof(mtp_date));
 		if (ret)
 			return ret;
 		ret = s6e3fa3_ams549ku15_read(ctx, 0xb6,
@@ -105,7 +121,7 @@ static int s6e3fa3_ams549ku15_calibrate(struct s6e3fa3_ams549ku15 *ctx)
 						      0xff))
 			return -ENODATA;
 
-		ret = s6e3fa3_dimming_init_live(&ctx->dimming, mtp);
+		ret = s6e3fa3_dimming_init_live(&ctx->dimming, mtp_date);
 		if (ret)
 			return ret;
 		ctx->calibrated = true;
@@ -223,9 +239,9 @@ static int s6e3fa3_ams549ku15_on(struct s6e3fa3_ams549ku15 *ctx)
 	if (dsi_ctx.accum_err)
 		return dsi_ctx.accum_err;
 
-	ret = mipi_dsi_dcs_read(ctx->dsi, MIPI_DCS_GET_DISPLAY_ID,
-				id, sizeof(id));
-	if (ret == sizeof(id))
+	ret = s6e3fa3_ams549ku15_read(ctx, MIPI_DCS_GET_DISPLAY_ID,
+				      id, sizeof(id));
+	if (!ret)
 		dev_info(&ctx->dsi->dev, "panel ID: %*ph\n", (int)sizeof(id), id);
 	else
 		dev_warn(&ctx->dsi->dev, "failed to read panel ID: %d\n", ret);
