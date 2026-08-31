@@ -9,8 +9,10 @@
 /dts-v1/;
 #include "exynos7870.dtsi"
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/i2c/i2c.h>
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/sound/samsung,s1402x.h>
 
 / {
 	model = "Samsung Galaxy J7 Pro (2017)";
@@ -125,6 +127,42 @@
 		};
 	};
 
+	sound {
+		compatible = "samsung,exynos7870-cod3026x";
+		model = "Samsung Galaxy J7 Pro";
+
+		audio-routing =
+			"Headphone", "HPOUTLN",
+			"Earpiece", "EPOUTN",
+			"Speaker", "SPKOUTLN",
+			"IN1L", "Main Mic",
+			"Main Mic", "MICBIAS1",
+			"IN2L", "Sub Mic",
+			"Sub Mic", "MICBIAS1",
+			"IN3L", "Headset Mic",
+			"Headset Mic", "MICBIAS2";
+
+		cpu {
+			sound-dai = <&i2s0 0>;
+		};
+
+		cpu-secondary {
+			sound-dai = <&i2s0 1>;
+		};
+
+		cpu-amp {
+			sound-dai = <&i2s1 0>;
+		};
+
+		mixer {
+			sound-dai = <&s1402x S1402X_DAI_AP0>;
+		};
+
+		codec {
+			sound-dai = <&cod3026x 0>;
+		};
+	};
+
 	vibrator {
 		compatible = "regulator-haptic";
 		haptic-supply = <&vdd_ldo32>;
@@ -133,6 +171,13 @@
 	};
 };
 
+&adc {
+	status = "okay";
+};
+
+&adma {
+	status = "okay";
+};
 &cmu_g3d {
 	assigned-clocks = <&cmu_g3d CLK_MOUT_G3D_SWITCH_USER>,
 			  <&cmu_g3d CLK_MOUT_G3D>;
@@ -154,6 +199,7 @@
 &hsi2c0 {
 	#address-cells = <1>;
 	#size-cells = <0>;
+	clock-frequency = <2500000>;
 
 	status = "okay";
 
@@ -380,6 +426,46 @@
 			};
 		};
 	};
+
+	cod3026x: audio-codec@80000004 {
+		compatible = "samsung,cod3026x";
+		reg = <(I2C_TEN_BIT_ADDRESS | 0x04)>;
+
+		interrupt-parent = <&gpa0>;
+		interrupts = <4 IRQ_TYPE_LEVEL_LOW>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&cod3026x_irq>;
+
+		vdd-supply = <&vdd_ldo25>;
+		samsung,audio-mixer = <&s1402x>;
+
+		io-channels = <&adc 2>;
+		io-channel-names = "jack";
+
+		samsung,mic-bias1-microvolt = <2800000>;
+		samsung,mic-bias2-microvolt = <2800000>;
+		samsung,mic-bias-ldo-microvolt = <3300000>;
+		samsung,mic-detect-threshold = <1390>;
+		samsung,mic-detect-delay-ms = <550>;
+		samsung,button-release-threshold = <1100>;
+		samsung,button-press-delay-ms = <30>;
+		samsung,headset-button-zones =
+			<KEY_MEDIA 0 275>,
+			<KEY_VOICECOMMAND 276 356>,
+			<KEY_VOLUMEUP 357 562>,
+			<KEY_VOLUMEDOWN 563 1000>;
+
+		#sound-dai-cells = <1>;
+	};
+};
+
+&i2s0 {
+	status = "okay";
+};
+
+&i2s1 {
+	status = "okay";
 };
 
 &i2c6 {
@@ -487,6 +573,13 @@
 		samsung,pin-drv = <EXYNOS5433_PIN_DRV_FAST_SR1>;
 	};
 
+	cod3026x_irq: cod3026x-irq-pins {
+		samsung,pins = "gpa0-4";
+		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
+		samsung,pin-pud = <EXYNOS_PIN_PULL_UP>;
+		samsung,pin-drv = <EXYNOS5433_PIN_DRV_FAST_SR4>;
+	};
+
 	dwmmc2_irq: dwmmc2-irq-pins {
 		samsung,pins = "gpa0-1";
 		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
@@ -566,6 +659,18 @@
 		samsung,pin-drv = <EXYNOS5433_PIN_DRV_FAST_SR4>;
 		samsung,pin-val = <0>;
 	};
+};
+
+&s1402x {
+	pinctrl-names = "default", "idle", "bt", "bt-idle";
+	pinctrl-0 = <&i2s_pmic_amp_bus &i2s_bt_bus>;
+	pinctrl-1 = <&i2s_pmic_amp_bus_idle &i2s_bt_bus_idle>;
+	pinctrl-2 = <&i2s_pmic_bus &i2s_amp_bus>;
+	pinctrl-3 = <&i2s_bt_bus_idle>;
+
+	samsung,bt-fm-combo;
+
+	status = "okay";
 };
 
 &serial2 {
