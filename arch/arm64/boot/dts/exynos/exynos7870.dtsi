@@ -237,6 +237,21 @@
 			interrupts = <GIC_SPI 392 IRQ_TYPE_LEVEL_HIGH>;
 		};
 
+		adc: adc@10550000 {
+			compatible = "samsung,exynos7870-adc",
+				     "samsung,exynos-adc-v3";
+			reg = <0x10550000 0x1000>;
+			interrupts = <GIC_SPI 395 IRQ_TYPE_LEVEL_HIGH>;
+			#io-channel-cells = <1>;
+
+			clock-names = "pclk-s0", "pclk-s1", "osc";
+			clocks = <&cmu_mif CLK_GOUT_MIF_WRAP_ADC_IF_PCLK_S0>,
+				 <&cmu_mif CLK_GOUT_MIF_WRAP_ADC_IF_PCLK_S1>,
+				 <&cmu_mif CLK_GOUT_MIF_WRAP_ADC_IF_OSC_SYS>;
+
+			status = "disabled";
+		};
+
 		gpu: gpu@11400000 {
 			compatible = "samsung,exynos7870-mali", "arm,mali-t830";
 			reg = <0x11400000 0x5000>;
