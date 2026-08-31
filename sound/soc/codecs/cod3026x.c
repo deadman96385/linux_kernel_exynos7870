@@ -1637,3 +1637,4 @@ module_i2c_driver(cod3026x_i2c_driver);
 MODULE_DESCRIPTION("Samsung COD3026X audio codec driver");
 MODULE_AUTHOR("Sean Hoyt <seanhoyt963@gmail.com>");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS("IIO_CONSUMER");
