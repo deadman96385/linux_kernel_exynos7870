@@ -364,6 +364,37 @@ static int mip4_query_device(struct mip4_ts *ts)
 	return 0;
 }
 
+static void mip4_set_input_resolution(struct mip4_ts *ts,
+				      bool set_single_touch)
+{
+	u8 ppm_x = ts->ppm_x;
+	u8 ppm_y = ts->ppm_y;
+
+	/*
+	 * libinput rejects a direct device if only one position axis has a
+	 * physical resolution.  Some MMS438 firmware reports just one of the
+	 * optional PPM values, while Samsung's downstream driver leaves both
+	 * unset.  Preserve valid pairs, but never publish an incomplete pair.
+	 */
+	if (!ppm_x || !ppm_y) {
+		if (ppm_x || ppm_y)
+			dev_warn(&ts->client->dev,
+				 "incomplete X/Y resolution %u/%u; leaving both unset\n",
+				 ppm_x, ppm_y);
+
+		ppm_x = 0;
+		ppm_y = 0;
+	}
+
+	input_abs_set_res(ts->input, ABS_MT_POSITION_X, ppm_x);
+	input_abs_set_res(ts->input, ABS_MT_POSITION_Y, ppm_y);
+
+	if (set_single_touch) {
+		input_abs_set_res(ts->input, ABS_X, ppm_x);
+		input_abs_set_res(ts->input, ABS_Y, ppm_y);
+	}
+}
+
 static int mip4_power_on(struct mip4_ts *ts)
 {
 	int error;
@@ -1170,10 +1201,7 @@ exit_bl:
 	input_set_abs_params(ts->input, ABS_MT_POSITION_Y, 0, ts->max_y, 0, 0);
 	input_set_abs_params(ts->input, ABS_X, 0, ts->max_x, 0, 0);
 	input_set_abs_params(ts->input, ABS_Y, 0, ts->max_y, 0, 0);
-	input_abs_set_res(ts->input, ABS_MT_POSITION_X, ts->ppm_x);
-	input_abs_set_res(ts->input, ABS_MT_POSITION_Y, ts->ppm_y);
-	input_abs_set_res(ts->input, ABS_X, ts->ppm_x);
-	input_abs_set_res(ts->input, ABS_Y, ts->ppm_y);
+	mip4_set_input_resolution(ts, true);
 
 	return error ? error : 0;
 }
@@ -1500,8 +1528,7 @@ static int mip4_probe(struct i2c_client *client)
 			     MIP4_TOUCH_MAJOR_MIN, MIP4_TOUCH_MAJOR_MAX, 0, 0);
 	input_set_abs_params(input, ABS_MT_TOUCH_MINOR,
 			     MIP4_TOUCH_MINOR_MIN, MIP4_TOUCH_MINOR_MAX, 0, 0);
-	input_abs_set_res(ts->input, ABS_MT_POSITION_X, ts->ppm_x);
-	input_abs_set_res(ts->input, ABS_MT_POSITION_Y, ts->ppm_y);
+	mip4_set_input_resolution(ts, false);
 
 	error = input_mt_init_slots(input, MIP4_MAX_FINGERS, INPUT_MT_DIRECT);
 	if (error)
