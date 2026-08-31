@@ -61,6 +61,12 @@ properties:
     description: Up to 1 IOMMU entry per DMA channel for writes and 1
       IOMMU entry for reads.
 
+  memory-region:
+    maxItems: 1
+    description:
+      Reserved memory region used for the controller's DMA microcode buffers.
+      If absent, the buffers are allocated from normal coherent memory.
+
   power-domains:
     maxItems: 1
 
