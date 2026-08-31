@@ -229,6 +229,42 @@ int btbcm_write_i2spcm_int_params(
 }
 EXPORT_SYMBOL_GPL(btbcm_write_i2spcm_int_params);
 
+int btbcm_set_sco_codec(struct hci_dev *hdev, __u8 codec,
+			const struct bcm_set_i2spcm_int_params *params)
+{
+	u8 codec_param[3] = { 0 };
+	u32 codec_param_len;
+	int err;
+
+	switch (codec) {
+	case BT_CODEC_CVSD:
+		codec_param_len = 1;
+		break;
+	case BT_CODEC_MSBC:
+	case BT_CODEC_TRANSPARENT:
+		codec_param[0] = 1;
+		put_unaligned_le16(2, &codec_param[1]);
+		codec_param_len = sizeof(codec_param);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	err = hci_send_cmd(hdev, 0xfc7e, codec_param_len, codec_param);
+	if (err) {
+		bt_dev_err(hdev, "BCM: Set SCO codec failed (%d)", err);
+		return err;
+	}
+
+	err = hci_send_cmd(hdev, 0xfc6d, sizeof(*params), params);
+	if (err)
+		bt_dev_err(hdev, "BCM: Set SCO I2S/PCM params failed (%d)",
+			   err);
+
+	return err;
+}
+EXPORT_SYMBOL_GPL(btbcm_set_sco_codec);
+
 int btbcm_patchram(struct hci_dev *hdev, const struct firmware *fw)
 {
 	const struct hci_command_hdr *cmd;
