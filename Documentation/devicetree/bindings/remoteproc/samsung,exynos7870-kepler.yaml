@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/remoteproc/samsung,exynos7870-kepler.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Samsung Exynos7870 KEPLER GNSS Processor
+
+maintainers:
+  - Tudor Ambarus <tudor.ambarus@linaro.org>
+
+properties:
+  compatible:
+    const: samsung,exynos7870-kepler
+
+  memory-region:
+    maxItems: 1
+    description:
+      Reserved 4 MiB region containing 2 MiB for firmware followed by 2 MiB
+      for the GNSS shared-memory transport.
+
+  firmware-name:
+    maxItems: 1
+
+  mboxes:
+    maxItems: 1
+
+  mbox-names:
+    items:
+      - const: bcmd
+
+  samsung,pmu-syscon:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Phandle to the Exynos PMU system controller.
+
+  samsung,mailbox-syscon:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Phandle to the GNSS mailbox shared registers.
+
+  interrupts:
+    maxItems: 3
+
+  interrupt-names:
+    items:
+      - const: active
+      - const: watchdog
+      - const: wakeup
+
+required:
+  - compatible
+  - memory-region
+  - firmware-name
+  - mboxes
+  - mbox-names
+  - samsung,pmu-syscon
+  - samsung,mailbox-syscon
+  - interrupts
+  - interrupt-names
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    remoteproc {
+        compatible = "samsung,exynos7870-kepler";
+        firmware-name = "samsung/exynos7870/gnss_firmware.bin";
+        interrupts = <GIC_SPI 19 IRQ_TYPE_NONE>,
+                     <GIC_SPI 478 IRQ_TYPE_NONE>,
+                     <GIC_SPI 477 IRQ_TYPE_NONE>;
+        interrupt-names = "active", "watchdog", "wakeup";
+        mbox-names = "bcmd";
+        mboxes = <&mailbox_gnss 0>;
+        memory-region = <&gnss_mem>;
+        samsung,mailbox-syscon = <&mailbox_gnss>;
+        samsung,pmu-syscon = <&pmu_system_controller>;
+    };
