@@ -51,6 +51,7 @@
 #define S2MU005_SOURCE_RETRY_MS		1000
 #define S2MU005_SOURCE_RETRY_MAX		10
 #define S2MU005_MONITOR_INTERVAL_MS	10000
+#define S2MU005_WATCHDOG_INTERVAL_MS	40000
 
 enum s2mu005_thermal_state {
 	S2MU005_THERMAL_UNKNOWN,
@@ -66,6 +67,7 @@ struct s2m_chgr {
 	struct extcon_dev *extcon;
 	struct delayed_work extcon_work;
 	struct delayed_work monitor_work;
+	struct delayed_work watchdog_work;
 	struct notifier_block extcon_nb;
 	/* Serializes source, charge, and OTG mode transitions. */
 	struct mutex lock;
@@ -85,6 +87,8 @@ struct s2m_chgr {
 	unsigned int source_retries;
 	bool thermal_policy_dirty;
 	bool thermal_limits_valid;
+	bool watchdog_enabled;
+	bool watchdog_work_ready;
 	bool suspended;
 	bool stopping;
 };
@@ -444,6 +448,51 @@ static int s2mu005_chgr_get_term_current(struct s2m_chgr *priv, int *ua)
 	return ret;
 }
 
+static int s2mu005_chgr_set_watchdog(struct s2m_chgr *priv, bool enable)
+{
+	int disable_ret;
+	int ret;
+
+	if (!enable) {
+		ret = regmap_update_bits(priv->regmap, S2MU005_REG_CHGR_CTRL12,
+					 S2MU005_CHGR_WDT,
+					 FIELD_PREP(S2MU005_CHGR_WDT,
+						    S2MU005_CHGR_WDT_OFF));
+		priv->watchdog_enabled = false;
+		return ret;
+	}
+
+	if (!priv->watchdog_work_ready)
+		return -EAGAIN;
+
+	ret = regmap_update_bits(priv->regmap, S2MU005_REG_CHGR_CTRL12,
+				 S2MU005_CHGR_WDT,
+				 FIELD_PREP(S2MU005_CHGR_WDT,
+					    S2MU005_CHGR_WDT_ON));
+	if (ret)
+		return ret;
+
+	ret = regmap_set_bits(priv->regmap, S2MU005_REG_CHGR_CTRL13,
+			      S2MU005_CHGR_WDT_CLEAR);
+	if (ret) {
+		disable_ret = regmap_update_bits(priv->regmap,
+						 S2MU005_REG_CHGR_CTRL12,
+						 S2MU005_CHGR_WDT,
+						 FIELD_PREP(S2MU005_CHGR_WDT,
+							    S2MU005_CHGR_WDT_OFF));
+		if (disable_ret)
+			dev_warn(priv->dev, "failed to disable watchdog (%d)\n",
+				 disable_ret);
+		return ret;
+	}
+
+	priv->watchdog_enabled = true;
+	mod_delayed_work(system_wq, &priv->watchdog_work,
+			 msecs_to_jiffies(S2MU005_WATCHDOG_INTERVAL_MS));
+
+	return 0;
+}
+
 static int s2mu005_chgr_mode_unset(struct s2m_chgr *priv)
 {
 	int first_error = 0;
@@ -459,11 +508,7 @@ static int s2mu005_chgr_mode_unset(struct s2m_chgr *priv)
 	if (ret && !first_error)
 		first_error = ret;
 
-	/* Keep the watchdog disabled; temperature monitoring is freezable. */
-	ret = regmap_update_bits(priv->regmap, S2MU005_REG_CHGR_CTRL12,
-				 S2MU005_CHGR_WDT,
-				 FIELD_PREP(S2MU005_CHGR_WDT,
-					    S2MU005_CHGR_WDT_OFF));
+	ret = s2mu005_chgr_set_watchdog(priv, false);
 	if (ret && !first_error)
 		first_error = ret;
 
@@ -560,10 +605,19 @@ static int s2mu005_chgr_mode_set_charger(struct s2m_chgr *priv)
 	if (ret)
 		return ret;
 
-	return regmap_update_bits(priv->regmap, S2MU005_REG_CHGR_CTRL0,
-				  S2MU005_CHGR_OP_MODE,
-				  FIELD_PREP(S2MU005_CHGR_OP_MODE,
-					     S2MU005_CHGR_OP_MODE_CHG));
+	ret = regmap_update_bits(priv->regmap, S2MU005_REG_CHGR_CTRL0,
+				 S2MU005_CHGR_OP_MODE,
+				 FIELD_PREP(S2MU005_CHGR_OP_MODE,
+					    S2MU005_CHGR_OP_MODE_CHG));
+	if (ret)
+		return ret;
+
+	ret = s2mu005_chgr_set_watchdog(priv, true);
+	if (!ret)
+		return 0;
+
+	s2mu005_chgr_mode_unset(priv);
+	return ret;
 }
 
 static void s2mu005_chgr_source_limits(int usb_type, int *input_ua,
@@ -1010,9 +1064,78 @@ static void s2mu005_chgr_monitor_work(struct work_struct *work)
 	mutex_unlock(&priv->lock);
 }
 
+static void s2mu005_chgr_watchdog_work(struct work_struct *work)
+{
+	struct s2m_chgr *priv = container_of(to_delayed_work(work),
+					    struct s2m_chgr, watchdog_work);
+	unsigned int event;
+	unsigned int status3;
+	bool retry = false;
+	int disable_ret;
+	int ret;
+
+	if (READ_ONCE(priv->stopping) || READ_ONCE(priv->suspended))
+		return;
+
+	mutex_lock(&priv->lock);
+	if (priv->stopping || priv->suspended || !priv->watchdog_enabled) {
+		mutex_unlock(&priv->lock);
+		return;
+	}
+
+	ret = regmap_read(priv->regmap, S2MU005_REG_CHGR_STATUS3, &status3);
+	if (ret)
+		goto err_disable;
+
+	ret = regmap_set_bits(priv->regmap, S2MU005_REG_CHGR_CTRL13,
+			      S2MU005_CHGR_WDT_CLEAR);
+	if (ret)
+		goto err_disable;
+
+	event = FIELD_GET(S2MU005_CHGR_EVT, status3);
+	if (event == S2MU005_CHGR_EVT_WDT_SUSP ||
+	    event == S2MU005_CHGR_EVT_WDT_RST) {
+		dev_warn(priv->dev, "recovering from charger watchdog event %u\n",
+			 event);
+		ret = s2mu005_chgr_apply_source(priv);
+		if (ret)
+			goto err_disable;
+	}
+
+	if (priv->watchdog_enabled)
+		mod_delayed_work(system_wq, &priv->watchdog_work,
+				 msecs_to_jiffies(S2MU005_WATCHDOG_INTERVAL_MS));
+	mutex_unlock(&priv->lock);
+
+	return;
+
+err_disable:
+	disable_ret = s2mu005_chgr_mode_unset(priv);
+	if (disable_ret)
+		dev_warn(priv->dev,
+			 "failed to establish safe state after watchdog error (%d)\n",
+			 disable_ret);
+	if (!priv->stopping && !priv->suspended) {
+		priv->source_retries = 0;
+		retry = true;
+	}
+	mutex_unlock(&priv->lock);
+
+	dev_err_ratelimited(priv->dev, "charger watchdog service failed: %d\n",
+			    ret);
+	if (retry)
+		mod_delayed_work(system_wq, &priv->extcon_work,
+				 msecs_to_jiffies(S2MU005_SOURCE_RETRY_MS));
+	power_supply_changed(priv->psy);
+}
+
 static irqreturn_t s2m_chgr_irq(int irq, void *data)
 {
 	struct s2m_chgr *priv = data;
+
+	if (READ_ONCE(priv->watchdog_enabled) &&
+	    !READ_ONCE(priv->stopping) && !READ_ONCE(priv->suspended))
+		mod_delayed_work(system_wq, &priv->watchdog_work, 0);
 
 	power_supply_changed(priv->psy);
 
@@ -1029,6 +1152,14 @@ static int s2mu005_chgr_init_limits(struct s2m_chgr *priv)
 	priv->thermal_state = S2MU005_THERMAL_UNKNOWN;
 
 	ret = s2mu005_chgr_get_input_current(priv, &priv->input_current_ua);
+	if (ret)
+		return ret;
+
+	/* Exact downstream J7 policy: 90-minute top-off and 80-second watchdog. */
+	ret = regmap_update_bits(priv->regmap, S2MU005_REG_CHGR_CTRL18,
+				 S2MU005_CHGR_TIMER_CONFIG,
+				 FIELD_PREP(S2MU005_CHGR_TIMER_CONFIG,
+					    S2MU005_CHGR_TIMER_90M_WDT_80S));
 	if (ret)
 		return ret;
 
@@ -1175,10 +1306,16 @@ static int s2m_chgr_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to initialize extcon work\n");
 	ret = devm_delayed_work_autocancel(dev, &priv->monitor_work,
-					   s2mu005_chgr_monitor_work);
+						   s2mu005_chgr_monitor_work);
 	if (ret)
 		return dev_err_probe(dev, ret,
-				     "failed to initialize temperature work\n");
+					     "failed to initialize temperature work\n");
+	ret = devm_delayed_work_autocancel(dev, &priv->watchdog_work,
+					   s2mu005_chgr_watchdog_work);
+	if (ret)
+		return dev_err_probe(dev, ret,
+					     "failed to initialize watchdog work\n");
+	priv->watchdog_work_ready = true;
 
 	priv->extcon_nb.notifier_call = s2m_chgr_extcon_notifier;
 	ret = devm_extcon_register_notifier_all(dev, priv->extcon,
@@ -1221,6 +1358,7 @@ static void s2m_chgr_shutdown(struct platform_device *pdev)
 	mutex_unlock(&priv->lock);
 	cancel_delayed_work_sync(&priv->extcon_work);
 	cancel_delayed_work_sync(&priv->monitor_work);
+	cancel_delayed_work_sync(&priv->watchdog_work);
 	s2m_chgr_disable(priv);
 }
 
@@ -1256,6 +1394,7 @@ static int s2m_chgr_suspend(struct device *dev)
 
 	/* A frozen monitor must never leave charging active on a stale sample. */
 	cancel_delayed_work_sync(&priv->monitor_work);
+	cancel_delayed_work_sync(&priv->watchdog_work);
 	power_supply_changed(priv->psy);
 
 	return 0;
@@ -1297,6 +1436,7 @@ static void s2m_chgr_remove(struct platform_device *pdev)
 	mutex_unlock(&priv->lock);
 	cancel_delayed_work_sync(&priv->extcon_work);
 	cancel_delayed_work_sync(&priv->monitor_work);
+	cancel_delayed_work_sync(&priv->watchdog_work);
 }
 
 static const struct platform_device_id s2m_chgr_id_table[] = {
