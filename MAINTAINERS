@@ -24260,6 +24260,8 @@ L:	linux-sound@vger.kernel.org
 S:	Maintained
 B:	mailto:linux-samsung-soc@vger.kernel.org
 F:	Documentation/devicetree/bindings/sound/samsung*
+F:	include/dt-bindings/sound/samsung,s1402x.h
+F:	sound/soc/codecs/s1402x*
 F:	sound/soc/samsung/
 
 SAMSUNG EXYNOS2200 SoC SUPPORT
