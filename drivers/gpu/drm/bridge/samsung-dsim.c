@@ -624,6 +624,8 @@ static const struct samsung_dsim_driver_data exynos7870_dsi_driver_data = {
 	.max_freq = 1500,
 	.wait_for_hdr_fifo = 0,
 	.wait_for_reset = 1,
+	.rx_fifo_init_bit = BIT(2),
+	.rx_fifo_empty_bit = BIT(12),
 	.num_bits_resol = 12,
 	.video_mode_bit = 18,
 	.pll_stable_bit = 24,
@@ -1274,6 +1276,20 @@ static void samsung_dsim_force_bta(struct samsung_dsim *dsi)
 	samsung_dsim_write(dsi, DSIM_ESCMODE_REG, v);
 }
 
+static void samsung_dsim_reset_rx_fifo(struct samsung_dsim *dsi)
+{
+	u32 mask = dsi->driver_data->rx_fifo_init_bit;
+	u32 reg;
+
+	if (!mask)
+		return;
+
+	reg = samsung_dsim_read(dsi, DSIM_FIFOCTRL_REG);
+	samsung_dsim_write(dsi, DSIM_FIFOCTRL_REG, reg & ~mask);
+	samsung_dsim_write(dsi, DSIM_FIFOCTRL_REG, reg | mask);
+	samsung_dsim_write(dsi, DSIM_INTSRC_REG, DSIM_INT_RX_DONE);
+}
+
 static void samsung_dsim_send_to_fifo(struct samsung_dsim *dsi,
 				      struct samsung_dsim_transfer *xfer)
 {
@@ -1290,6 +1306,9 @@ static void samsung_dsim_send_to_fifo(struct samsung_dsim *dsi,
 
 	if (length > DSI_TX_FIFO_SIZE)
 		length = DSI_TX_FIFO_SIZE;
+
+	if (first && xfer->rx_len)
+		samsung_dsim_reset_rx_fifo(dsi);
 
 	xfer->tx_done += length;
 
@@ -1417,8 +1436,13 @@ static void samsung_dsim_read_from_fifo(struct samsung_dsim *dsi,
 clear_fifo:
 	length = DSI_RX_FIFO_SIZE / 4;
 	do {
+		if (dsi->driver_data->rx_fifo_empty_bit &&
+		    samsung_dsim_read(dsi, DSIM_FIFOCTRL_REG) &
+		    dsi->driver_data->rx_fifo_empty_bit)
+			break;
 		reg = samsung_dsim_read(dsi, DSIM_RXFIFO_REG);
-		if (reg == DSI_RX_FIFO_EMPTY)
+		if (!dsi->driver_data->rx_fifo_empty_bit &&
+		    reg == DSI_RX_FIFO_EMPTY)
 			break;
 	} while (--length);
 }
