@@ -32,6 +32,26 @@ properties:
     required:
       - sound-dai
 
+  cpu-secondary:
+    type: object
+    additionalProperties: false
+    properties:
+      sound-dai:
+        maxItems: 1
+        description: Exynos7870 secondary playback DAI.
+    required:
+      - sound-dai
+
+  cpu-amp:
+    type: object
+    additionalProperties: false
+    properties:
+      sound-dai:
+        maxItems: 1
+        description: Exynos7870 amplifier-path I2S DAI.
+    required:
+      - sound-dai
+
   mixer:
     type: object
     additionalProperties: false
@@ -57,6 +77,8 @@ required:
   - model
   - audio-routing
   - cpu
+  - cpu-secondary
+  - cpu-amp
   - mixer
   - codec
 
@@ -83,6 +105,14 @@ examples:
 
         cpu {
             sound-dai = <&i2s0 0>;
+        };
+
+        cpu-secondary {
+            sound-dai = <&i2s0 1>;
+        };
+
+        cpu-amp {
+            sound-dai = <&i2s1 0>;
         };
 
         mixer {
