@@ -57,8 +57,11 @@ struct s2mu005_fg {
 	struct mutex monout_mutex;
 	/* Serializes profile recovery with all regmap and SMBus gauge I/O. */
 	struct mutex init_mutex;
+	const struct s2mu005_fg_profile *profiles;
+	size_t profile_count;
 	const struct s2mu005_fg_profile *profile;
 	struct iio_channel *battery_temp;
+	int cycle_count;
 	u8 revision;
 };
 
@@ -69,6 +72,8 @@ struct s2mu005_fg_temp_point {
 
 struct s2mu005_fg_profile {
 	const char *battery_compatible;
+	unsigned int cycle_count;
+	unsigned int charge_voltage_uv;
 	u8 battery_table3[S2MU005_FG_TABLE3_SIZE];
 	u8 battery_table4[S2MU005_FG_TABLE4_SIZE];
 	u8 battery_capacity[4];
@@ -89,9 +94,12 @@ static const struct s2mu005_fg_temp_point s2mu005_eb_bj730abe_temp_table[] = {
 	{ 3396, -100 }, { 3515, -150 }, { 3606, -200 },
 };
 
-/* First-life (4.35 V) data from Samsung's j7y17lte battery profile. */
-static const struct s2mu005_fg_profile s2mu005_eb_bj730abe_profile = {
+/* Five cycle-age steps from Samsung's j7y17lte EB-BJ730ABE profile. */
+static const struct s2mu005_fg_profile s2mu005_eb_bj730abe_profiles[] = {
+	{
 	.battery_compatible = "samsung,eb-bj730abe",
+	.cycle_count = 0,
+	.charge_voltage_uv = 4350000,
 	.battery_table3 = {
 		197, 11, 63, 11, 186, 10, 53, 10, 186, 9,
 		67, 9, 209, 8, 102, 8, 3, 8, 173, 7,
@@ -111,6 +119,99 @@ static const struct s2mu005_fg_profile s2mu005_eb_bj730abe_profile = {
 	.accumulative_rate = { 0xad, 0x07 },
 	.temp_table = s2mu005_eb_bj730abe_temp_table,
 	.temp_table_size = ARRAY_SIZE(s2mu005_eb_bj730abe_temp_table),
+	}, {
+	.battery_compatible = "samsung,eb-bj730abe",
+	.cycle_count = 200,
+	.charge_voltage_uv = 4330000,
+	.battery_table3 = {
+		82, 11, 213, 10, 87, 10, 220, 9, 108, 9,
+		0, 9, 157, 8, 55, 8, 204, 7, 141, 7,
+		44, 7, 218, 6, 166, 6, 127, 6, 94, 6,
+		66, 6, 31, 6, 248, 5, 192, 5, 142, 5,
+		82, 5, 151, 1, 216, 8, 105, 8, 251, 7,
+		140, 7, 30, 7, 175, 6, 65, 6, 211, 5,
+		100, 5, 246, 4, 135, 4, 25, 4, 170, 3,
+		60, 3, 205, 2, 95, 2, 240, 1, 130, 1,
+		19, 1, 165, 0, 54, 0, 200, 15,
+	},
+	.battery_table4 = {
+		55, 55, 55, 56, 55, 55, 55, 55, 55, 54, 54,
+		54, 55, 55, 55, 56, 57, 58, 61, 64, 71, 154,
+	},
+	.battery_capacity = { 0x33, 0x90, 0x0c, 0xe4 },
+	.accumulative_rate = { 0xad, 0x07 },
+	.temp_table = s2mu005_eb_bj730abe_temp_table,
+	.temp_table_size = ARRAY_SIZE(s2mu005_eb_bj730abe_temp_table),
+	}, {
+	.battery_compatible = "samsung,eb-bj730abe",
+	.cycle_count = 250,
+	.charge_voltage_uv = 4310000,
+	.battery_table3 = {
+		34, 11, 168, 10, 46, 10, 182, 9, 74, 9,
+		227, 8, 131, 8, 12, 8, 188, 7, 120, 7,
+		23, 7, 207, 6, 159, 6, 121, 6, 90, 6,
+		63, 6, 29, 6, 245, 5, 189, 5, 144, 5,
+		62, 5, 124, 1, 216, 8, 105, 8, 251, 7,
+		140, 7, 30, 7, 176, 6, 65, 6, 211, 5,
+		100, 5, 246, 4, 135, 4, 25, 4, 170, 3,
+		60, 3, 205, 2, 95, 2, 241, 1, 130, 1,
+		20, 1, 165, 0, 55, 0, 200, 15,
+	},
+	.battery_table4 = {
+		60, 60, 60, 60, 59, 59, 58, 59, 58, 58, 58,
+		58, 59, 59, 60, 61, 62, 62, 62, 65, 73, 154,
+	},
+	.battery_capacity = { 0x33, 0x40, 0x0c, 0xd0 },
+	.accumulative_rate = { 0xad, 0x07 },
+	.temp_table = s2mu005_eb_bj730abe_temp_table,
+	.temp_table_size = ARRAY_SIZE(s2mu005_eb_bj730abe_temp_table),
+	}, {
+	.battery_compatible = "samsung,eb-bj730abe",
+	.cycle_count = 300,
+	.charge_voltage_uv = 4290000,
+	.battery_table3 = {
+		243, 10, 126, 10, 9, 10, 149, 9, 44, 9,
+		201, 8, 111, 8, 240, 7, 175, 7, 97, 7,
+		2, 7, 197, 6, 152, 6, 116, 6, 87, 6,
+		59, 6, 22, 6, 239, 5, 183, 5, 140, 5,
+		68, 5, 154, 1, 181, 8, 72, 8, 219, 7,
+		111, 7, 2, 7, 149, 6, 40, 6, 187, 5,
+		78, 5, 225, 4, 116, 4, 8, 4, 155, 3,
+		46, 3, 193, 2, 84, 2, 231, 1, 122, 1,
+		14, 1, 161, 0, 52, 0, 199, 15,
+	},
+	.battery_table4 = {
+		55, 55, 55, 55, 55, 56, 55, 56, 56, 55, 55,
+		55, 56, 57, 57, 58, 59, 60, 63, 67, 73, 154,
+	},
+	.battery_capacity = { 0x32, 0xa0, 0x0c, 0xa0 },
+	.accumulative_rate = { 0xad, 0x07 },
+	.temp_table = s2mu005_eb_bj730abe_temp_table,
+	.temp_table_size = ARRAY_SIZE(s2mu005_eb_bj730abe_temp_table),
+	}, {
+	.battery_compatible = "samsung,eb-bj730abe",
+	.cycle_count = 1000,
+	.charge_voltage_uv = 4240000,
+	.battery_table3 = {
+		126, 10, 18, 10, 166, 9, 59, 9, 220, 8,
+		136, 8, 10, 8, 192, 7, 134, 7, 38, 7,
+		221, 6, 173, 6, 135, 6, 104, 6, 77, 6,
+		49, 6, 14, 6, 228, 5, 173, 5, 137, 5,
+		238, 4, 70, 1, 181, 8, 72, 8, 220, 7,
+		111, 7, 3, 7, 150, 6, 42, 6, 189, 5,
+		80, 5, 228, 4, 119, 4, 11, 4, 158, 3,
+		50, 3, 197, 2, 88, 2, 236, 1, 127, 1,
+		19, 1, 166, 0, 58, 0, 205, 15,
+	},
+	.battery_table4 = {
+		56, 56, 56, 56, 56, 56, 57, 57, 56, 55, 56,
+		56, 57, 58, 59, 60, 60, 62, 65, 70, 77, 154,
+	},
+	.battery_capacity = { 0x30, 0xe8, 0x0c, 0x3a },
+	.accumulative_rate = { 0xad, 0x07 },
+	.temp_table = s2mu005_eb_bj730abe_temp_table,
+	.temp_table_size = ARRAY_SIZE(s2mu005_eb_bj730abe_temp_table),
+	},
 };
 
 static const struct regmap_config s2mu005_fg_regmap_config = {
@@ -155,27 +256,49 @@ static int s2mu005_fg_update_byte(struct s2mu005_fg *priv, u8 reg,
 }
 
 static const struct s2mu005_fg_profile *
-s2mu005_fg_get_profile(struct device *dev)
+s2mu005_fg_get_profiles(struct device *dev, size_t *profile_count)
 {
 	struct device_node *battery;
-	const struct s2mu005_fg_profile *profile = NULL;
+	const struct s2mu005_fg_profile *profiles = NULL;
+
+	*profile_count = 0;
 
 	battery = of_parse_phandle(dev->of_node, "monitored-battery", 0);
 	if (!battery)
 		return NULL;
 
 	if (of_device_is_compatible(battery,
-				    s2mu005_eb_bj730abe_profile.battery_compatible))
-		profile = &s2mu005_eb_bj730abe_profile;
+				    s2mu005_eb_bj730abe_profiles[0].battery_compatible)) {
+		profiles = s2mu005_eb_bj730abe_profiles;
+		*profile_count = ARRAY_SIZE(s2mu005_eb_bj730abe_profiles);
+	}
 
 	of_node_put(battery);
+
+	return profiles;
+}
+
+static const struct s2mu005_fg_profile *
+s2mu005_fg_profile_for_cycle(struct s2mu005_fg *priv, unsigned int cycle_count)
+{
+	const struct s2mu005_fg_profile *profile;
+
+	if (!priv->profiles || !priv->profile_count)
+		return NULL;
+
+	profile = &priv->profiles[0];
+	for (size_t i = 1; i < priv->profile_count; i++) {
+		if (cycle_count < priv->profiles[i].cycle_count)
+			break;
+		profile = &priv->profiles[i];
+	}
 
 	return profile;
 }
 
-static int s2mu005_fg_program_profile(struct s2mu005_fg *priv)
+static int s2mu005_fg_program_profile(struct s2mu005_fg *priv,
+				      const struct s2mu005_fg_profile *profile)
 {
-	const struct s2mu005_fg_profile *profile = priv->profile;
 	u8 revision;
 	int ret;
 
@@ -329,13 +452,124 @@ static int s2mu005_fg_initialize_if_needed_locked(struct s2mu005_fg *priv)
 
 	dev_info(priv->dev, "restoring lost %s fuel-gauge profile\n",
 		 priv->profile->battery_compatible);
-	ret = s2mu005_fg_program_profile(priv);
+	ret = s2mu005_fg_program_profile(priv, priv->profile);
 
 	restore_ret = power_supply_set_property(charger,
 						POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
 						&behaviour);
 	if (!ret)
 		ret = restore_ret;
+
+out_put:
+	power_supply_put(charger);
+
+	return ret;
+}
+
+static int s2mu005_fg_set_cycle_count(struct s2mu005_fg *priv,
+				      unsigned int cycle_count)
+{
+	union power_supply_propval behaviour;
+	union power_supply_propval inhibit = {
+		.intval = POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE,
+	};
+	union power_supply_propval old_voltage;
+	union power_supply_propval new_voltage;
+	const struct s2mu005_fg_profile *new_profile;
+	const struct s2mu005_fg_profile *old_profile = priv->profile;
+	struct power_supply *charger;
+	int rollback_ret;
+	int restore_ret;
+	bool safe_to_restore = false;
+	int ret;
+
+	if (priv->cycle_count >= 0 && cycle_count < priv->cycle_count)
+		return -EINVAL;
+
+	new_profile = s2mu005_fg_profile_for_cycle(priv, cycle_count);
+	if (!new_profile)
+		return -ENODEV;
+
+	if (new_profile == old_profile) {
+		priv->cycle_count = cycle_count;
+		return 0;
+	}
+
+	charger = power_supply_get_by_name("s2mu005-charger");
+	if (!charger)
+		return -EPROBE_DEFER;
+
+	ret = power_supply_get_property(charger,
+					POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+					&behaviour);
+	if (ret)
+		goto out_put;
+
+	ret = power_supply_get_property(charger,
+					POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE,
+					&old_voltage);
+	if (ret)
+		goto out_put;
+
+	ret = power_supply_set_property(charger,
+					POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+					&inhibit);
+	if (ret)
+		goto out_put;
+
+	new_voltage.intval = min_t(int, old_voltage.intval,
+				   new_profile->charge_voltage_uv);
+	ret = power_supply_set_property(charger,
+					POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE,
+					&new_voltage);
+	if (ret)
+		goto restore_old_voltage;
+
+	ret = s2mu005_fg_program_profile(priv, new_profile);
+	if (ret) {
+		rollback_ret = s2mu005_fg_program_profile(priv, old_profile);
+		if (rollback_ret) {
+			dev_err(priv->dev,
+				"failed to restore prior fuel-gauge profile (%d); charging remains inhibited\n",
+				rollback_ret);
+			goto out_put;
+		}
+		goto restore_old_voltage;
+	}
+
+	priv->profile = new_profile;
+	priv->cycle_count = cycle_count;
+	safe_to_restore = true;
+	dev_info(priv->dev,
+		 "selected battery age step %zu at %u cycles (%u uV ceiling)\n",
+		 (size_t)(new_profile - priv->profiles), cycle_count,
+		 new_profile->charge_voltage_uv);
+	goto restore_behaviour;
+
+restore_old_voltage:
+	rollback_ret = power_supply_set_property(charger,
+						 POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE,
+						 &old_voltage);
+	if (rollback_ret) {
+		dev_err(priv->dev,
+			"failed to restore charge voltage (%d); charging remains inhibited\n",
+			rollback_ret);
+		goto out_put;
+	}
+	safe_to_restore = true;
+
+restore_behaviour:
+	if (safe_to_restore) {
+		restore_ret = power_supply_set_property(charger,
+							POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+							&behaviour);
+		if (restore_ret)
+			dev_err(priv->dev,
+				"failed to restore charge behaviour (%d)\n",
+				restore_ret);
+		if (!ret)
+			ret = restore_ret;
+	}
 
 out_put:
 	power_supply_put(charger);
@@ -578,6 +812,7 @@ static const enum power_supply_property s2mu005_fg_properties[] = {
 	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_CURRENT_AVG,
 	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_CYCLE_COUNT,
 	POWER_SUPPLY_PROP_STATUS,
 };
 
@@ -587,6 +822,7 @@ static const enum power_supply_property s2mu005_fg_temp_properties[] = {
 	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_CURRENT_AVG,
 	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_CYCLE_COUNT,
 	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_TEMP,
 };
@@ -620,6 +856,14 @@ static int s2mu005_fg_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CAPACITY:
 		ret = s2mu005_fg_get_capacity(priv, &val->intval);
 		break;
+	case POWER_SUPPLY_PROP_CYCLE_COUNT:
+		if (priv->cycle_count < 0) {
+			ret = -ENODATA;
+		} else {
+			val->intval = priv->cycle_count;
+			ret = 0;
+		}
+		break;
 	case POWER_SUPPLY_PROP_STATUS:
 		ret = s2mu005_fg_get_status(priv, &val->intval);
 		break;
@@ -637,12 +881,53 @@ out_unlock:
 	return ret;
 }
 
+static int s2mu005_fg_set_property(struct power_supply *psy,
+				   enum power_supply_property psp,
+				   const union power_supply_propval *val)
+{
+	struct s2mu005_fg *priv = power_supply_get_drvdata(psy);
+	int ret;
+
+	mutex_lock(&priv->init_mutex);
+
+	ret = s2mu005_fg_initialize_if_needed_locked(priv);
+	if (ret)
+		goto out_unlock;
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_CYCLE_COUNT:
+		if (val->intval < 0)
+			ret = -EINVAL;
+		else
+			ret = s2mu005_fg_set_cycle_count(priv, val->intval);
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+
+out_unlock:
+	mutex_unlock(&priv->init_mutex);
+	if (!ret)
+		power_supply_changed(priv->psy);
+
+	return ret;
+}
+
+static int s2mu005_fg_property_is_writeable(struct power_supply *psy,
+					    enum power_supply_property psp)
+{
+	return psp == POWER_SUPPLY_PROP_CYCLE_COUNT;
+}
+
 static const struct power_supply_desc s2mu005_fg_desc = {
 	.name = "s2mu005-fuel-gauge",
 	.type = POWER_SUPPLY_TYPE_BATTERY,
 	.properties = s2mu005_fg_properties,
 	.num_properties = ARRAY_SIZE(s2mu005_fg_properties),
 	.get_property = s2mu005_fg_get_property,
+	.set_property = s2mu005_fg_set_property,
+	.property_is_writeable = s2mu005_fg_property_is_writeable,
 };
 
 static const struct power_supply_desc s2mu005_fg_temp_desc = {
@@ -651,6 +936,8 @@ static const struct power_supply_desc s2mu005_fg_temp_desc = {
 	.properties = s2mu005_fg_temp_properties,
 	.num_properties = ARRAY_SIZE(s2mu005_fg_temp_properties),
 	.get_property = s2mu005_fg_get_property,
+	.set_property = s2mu005_fg_set_property,
+	.property_is_writeable = s2mu005_fg_property_is_writeable,
 };
 
 static int s2mu005_fg_i2c_probe(struct i2c_client *client)
@@ -669,7 +956,9 @@ static int s2mu005_fg_i2c_probe(struct i2c_client *client)
 	dev_set_drvdata(dev, priv);
 	priv->dev = dev;
 	priv->client = client;
-	priv->profile = s2mu005_fg_get_profile(dev);
+	priv->profiles = s2mu005_fg_get_profiles(dev, &priv->profile_count);
+	priv->profile = s2mu005_fg_profile_for_cycle(priv, 0);
+	priv->cycle_count = -1;
 	priv->battery_temp = devm_iio_channel_get(dev, "battery-temperature");
 	if (IS_ERR(priv->battery_temp)) {
 		ret = PTR_ERR(priv->battery_temp);
