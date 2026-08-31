@@ -29,6 +29,12 @@ properties:
   vdd-supply:
     description: Codec analog and digital supply.
 
+  samsung,audio-mixer:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      S1402X mixer which supplies the codec serial clock. The operating-system
+      device link keeps the mixer powered whenever the codec is active.
+
   io-channels:
     maxItems: 1
     description: ADC channel used for headset microphone and button detection.
@@ -80,13 +86,15 @@ properties:
       maxItems: 3
 
   '#sound-dai-cells':
-    const: 0
+    const: 1
+    description: 0 selects the primary AIF and 1 selects the secondary AIF.
 
 required:
   - compatible
   - reg
   - interrupts
   - vdd-supply
+  - samsung,audio-mixer
   - '#sound-dai-cells'
 
 dependencies:
@@ -111,6 +119,7 @@ examples:
             interrupt-parent = <&gpa0>;
             interrupts = <4 IRQ_TYPE_LEVEL_LOW>;
             vdd-supply = <&ldo25>;
+            samsung,audio-mixer = <&s1402x>;
             io-channels = <&adc 2>;
             io-channel-names = "jack";
             samsung,mic-bias1-microvolt = <2800000>;
@@ -123,6 +132,6 @@ examples:
                 <582 276 356>,
                 <115 357 562>,
                 <114 563 1000>;
-            #sound-dai-cells = <0>;
+            #sound-dai-cells = <1>;
         };
     };
