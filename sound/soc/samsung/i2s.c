@@ -102,6 +102,7 @@ struct samsung_i2s_priv {
 
 	/* The I2S controller's core clock */
 	struct clk *clk;
+	struct clk *pclk;
 	struct reset_control *rstc;
 
 	/* Clock for generating I2S signals */
@@ -1219,6 +1220,7 @@ static int i2s_runtime_suspend(struct device *dev)
 
 	clk_disable_unprepare(priv->op_clk);
 	clk_disable_unprepare(priv->clk);
+	clk_disable_unprepare(priv->pclk);
 
 	return 0;
 }
@@ -1228,15 +1230,19 @@ static int i2s_runtime_resume(struct device *dev)
 	struct samsung_i2s_priv *priv = dev_get_drvdata(dev);
 	int ret;
 
-	ret = clk_prepare_enable(priv->clk);
+	ret = clk_prepare_enable(priv->pclk);
 	if (ret)
 		return ret;
+
+	ret = clk_prepare_enable(priv->clk);
+	if (ret)
+		goto err_disable_pclk;
 
 	if (priv->op_clk) {
 		ret = clk_prepare_enable(priv->op_clk);
 		if (ret) {
 			clk_disable_unprepare(priv->clk);
-			return ret;
+			goto err_disable_pclk;
 		}
 	}
 
@@ -1245,6 +1251,10 @@ static int i2s_runtime_resume(struct device *dev)
 	writel(priv->suspend_i2spsr, priv->addr + I2SPSR);
 
 	return 0;
+
+err_disable_pclk:
+	clk_disable_unprepare(priv->pclk);
+	return ret;
 }
 
 static void i2s_unregister_clocks(struct samsung_i2s_priv *priv)
@@ -1463,11 +1473,19 @@ static int samsung_i2s_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, PTR_ERR(priv->clk),
 				     "Failed to get iis clock\n");
 
+	priv->pclk = devm_clk_get_optional(&pdev->dev, "pclk");
+	if (IS_ERR(priv->pclk))
+		return dev_err_probe(&pdev->dev, PTR_ERR(priv->pclk),
+				     "Failed to get pclk\n");
+
+	ret = clk_prepare_enable(priv->pclk);
+	if (ret)
+		return ret;
 
 	ret = clk_prepare_enable(priv->clk);
 	if (ret != 0) {
 		dev_err(&pdev->dev, "failed to enable clock: %d\n", ret);
-		return ret;
+		goto err_disable_pclk;
 	}
 
 	priv->rstc = devm_reset_control_get_optional_exclusive(&pdev->dev,
@@ -1561,6 +1579,8 @@ err_del_sec:
 	i2s_delete_secondary_device(priv);
 err_disable_clk:
 	clk_disable_unprepare(priv->clk);
+err_disable_pclk:
+	clk_disable_unprepare(priv->pclk);
 	return ret;
 }
 
@@ -1578,6 +1598,7 @@ static void samsung_i2s_remove(struct platform_device *pdev)
 	i2s_unregister_clock_provider(priv);
 	i2s_delete_secondary_device(priv);
 	clk_disable_unprepare(priv->clk);
+	clk_disable_unprepare(priv->pclk);
 
 	pm_runtime_put_noidle(&pdev->dev);
 }
