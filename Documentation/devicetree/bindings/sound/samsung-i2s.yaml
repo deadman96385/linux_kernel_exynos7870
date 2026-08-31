@@ -10,9 +10,6 @@ maintainers:
   - Krzysztof Kozlowski <krzk@kernel.org>
   - Sylwester Nawrocki <s.nawrocki@samsung.com>
 
-allOf:
-  - $ref: dai-common.yaml#
-
 properties:
   compatible:
     description: |
@@ -38,6 +35,13 @@ properties:
       stereo channels. Exynos7 I2S1 upgraded to 5.1 multichannel with
       slightly modified bit offsets.
 
+      samsung,exynos7870-i2s: for the primary Exynos7870 MI2S interface with
+      six-channel playback, secondary transmit FIFO, software reset control,
+      and the stream-mode register layout.
+
+      samsung,exynos7870-i2s1: for the capture-only Exynos7870 amplifier MI2S
+      interface using the stream-mode register layout.
+
       tesla,fsd-i2s: for 8/16/24bit stereo channel I2S for playback and
       capture, secondary FIFO using external DMA, s/w reset control,
       internal mux for root clock source with all root clock sampling
@@ -51,6 +55,8 @@ properties:
           - samsung,exynos5420-i2s
           - samsung,exynos7-i2s
           - samsung,exynos7-i2s1
+          - samsung,exynos7870-i2s
+          - samsung,exynos7870-i2s1
           - tesla,fsd-i2s
       - items:
           - enum:
@@ -67,11 +73,13 @@ properties:
     maxItems: 1
 
   dmas:
-    minItems: 2
+    minItems: 1
     maxItems: 3
 
   dma-names:
     oneOf:
+      - items:
+          - const: rx
       - items:
           - const: tx
           - const: rx
@@ -126,6 +134,12 @@ properties:
   power-domains:
     maxItems: 1
 
+  resets:
+    maxItems: 1
+
+  reset-names:
+    const: i2s
+
   "#sound-dai-cells":
     const: 1
 
@@ -136,6 +150,24 @@ required:
   - dma-names
   - clocks
   - clock-names
+
+allOf:
+  - $ref: dai-common.yaml#
+  - if:
+      properties:
+        compatible:
+          const: samsung,exynos7870-i2s1
+    then:
+      properties:
+        dmas:
+          maxItems: 1
+        dma-names:
+          items:
+            - const: rx
+    else:
+      properties:
+        dmas:
+          minItems: 2
 
 unevaluatedProperties: false
 
