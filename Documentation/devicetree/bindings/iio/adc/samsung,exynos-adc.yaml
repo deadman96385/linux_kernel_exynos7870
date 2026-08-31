@@ -15,6 +15,7 @@ properties:
       - enum:
           - samsung,exynos-adc-v1                 # Exynos5250
           - samsung,exynos-adc-v2
+          - samsung,exynos-adc-v3
           - samsung,exynos3250-adc
           - samsung,exynos4212-adc                # Exynos4212 and Exynos4412
           - samsung,exynos7-adc
@@ -24,22 +25,26 @@ properties:
           - enum:
               - samsung,exynos5433-adc
           - const: samsung,exynos7-adc
+      - items:
+          - const: samsung,exynos7870-adc
+          - const: samsung,exynos-adc-v3
 
   reg:
     maxItems: 1
 
   clocks:
     description:
-      Phandle to ADC bus clock. For Exynos3250 additional clock is needed.
+      Phandle to ADC bus clock. Exynos3250 needs an additional sample clock;
+      Exynos7870 needs both peripheral gates and its oscillator gate.
     minItems: 1
-    maxItems: 2
+    maxItems: 3
 
   clock-names:
     description:
       Must contain clock names (adc, sclk) matching phandles in clocks
       property.
     minItems: 1
-    maxItems: 2
+    maxItems: 3
 
   interrupts:
     minItems: 1
@@ -63,7 +68,6 @@ required:
   - clock-names
   - interrupts
   - "#io-channel-cells"
-  - vdd-supply
 
 additionalProperties:
   type: object
@@ -86,8 +90,26 @@ allOf:
       properties:
         compatible:
           contains:
-            enum:
-              - samsung,exynos3250-adc
+            const: samsung,exynos-adc-v3
+    then:
+      properties:
+        clocks:
+          minItems: 3
+          maxItems: 3
+        clock-names:
+          items:
+            - const: pclk-s0
+            - const: pclk-s1
+            - const: osc
+    else:
+      required:
+        - vdd-supply
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: samsung,exynos3250-adc
     then:
       properties:
         clocks:
@@ -98,13 +120,20 @@ allOf:
             - const: adc
             - const: sclk
     else:
-      properties:
-        clocks:
-          minItems: 1
-          maxItems: 1
-        clock-names:
-          items:
-            - const: adc
+      if:
+        properties:
+          compatible:
+            not:
+              contains:
+                const: samsung,exynos-adc-v3
+      then:
+        properties:
+          clocks:
+            minItems: 1
+            maxItems: 1
+          clock-names:
+            items:
+              - const: adc
 
   - if:
       properties:
