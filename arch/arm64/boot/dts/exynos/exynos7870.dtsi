@@ -361,7 +361,7 @@
 
 			status = "disabled";
 
-			usb@0 {
+			usbdrd_dwc3: usb@0 {
 				compatible = "snps,dwc3";
 				reg = <0x0 0x10000>;
 				interrupts = <GIC_SPI 230 IRQ_TYPE_LEVEL_HIGH>;
