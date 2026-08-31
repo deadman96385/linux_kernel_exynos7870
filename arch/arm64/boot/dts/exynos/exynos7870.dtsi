@@ -8,6 +8,7 @@
 
 #include <dt-bindings/clock/samsung,exynos7870-cmu.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/reset/samsung,exynos7870-dispaud.h>
 
 / {
 	compatible = "samsung,exynos7870";
@@ -137,6 +138,18 @@
 		cpu_suspend = <0xc4000001>;
 		cpu_off = <0x84000002>;
 		cpu_on = <0xc4000003>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <1>;
+		ranges;
+
+		adma_mcode: dma-pool@3002000 {
+			compatible = "shared-dma-pool";
+			reg = <0x0 0x03002000 0x1000>;
+			no-map;
+		};
 	};
 
 	soc: soc@0 {
@@ -822,6 +835,57 @@
 			clock-names = "sysmmu";
 		};
 
+		adma: dma-controller@14890000 {
+			compatible = "arm,pl330", "arm,primecell";
+			reg = <0x14890000 0x1000>;
+			interrupts = <GIC_SPI 73 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&cmu_dispaud CLK_GOUT_DISPAUD_APB_AUD_AMP>;
+			clock-names = "apb_pclk";
+			memory-region = <&adma_mcode>;
+			resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_ADMA>;
+			reset-names = "dma";
+			arm,primecell-periphid = <0x341330>;
+			#dma-cells = <1>;
+
+			status = "disabled";
+		};
+
+		i2s0: i2s@148a0000 {
+			compatible = "samsung,exynos7870-i2s";
+			reg = <0x148a0000 0x100>;
+			interrupts = <GIC_SPI 69 IRQ_TYPE_LEVEL_HIGH>;
+			dmas = <&adma 0>, <&adma 2>, <&adma 1>;
+			dma-names = "tx", "rx", "tx-sec";
+			clocks = <&cmu_dispaud CLK_GOUT_DISPAUD_MI2S_AUD_I2SCODCLKI>,
+				 <&cmu_dispaud CLK_GOUT_DISPAUD_APB_AUD>,
+				 <&cmu_dispaud CLK_DOUT_DISPAUD_MI2S>,
+				 <&cmu_dispaud CLK_DOUT_DISPAUD_MI2S>;
+			clock-names = "iis", "pclk", "i2s_opclk0", "i2s_opclk1";
+			resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_I2S>;
+			reset-names = "i2s";
+			#clock-cells = <1>;
+			#sound-dai-cells = <1>;
+
+			status = "disabled";
+		};
+
+			i2s1: i2s@148b0000 {
+			compatible = "samsung,exynos7870-i2s1";
+			reg = <0x148b0000 0x100>;
+			interrupts = <GIC_SPI 71 IRQ_TYPE_LEVEL_HIGH>;
+			dmas = <&adma 3>;
+			dma-names = "rx";
+			clocks = <&cmu_dispaud CLK_GOUT_DISPAUD_MI2S_AMP_I2SCODCLKI>,
+				 <&cmu_dispaud CLK_GOUT_DISPAUD_APB_AUD_AMP>,
+				 <&cmu_dispaud CLK_DOUT_DISPAUD_MI2S>,
+				 <&cmu_dispaud CLK_DOUT_DISPAUD_MI2S>;
+			clock-names = "iis", "pclk", "i2s_opclk0", "i2s_opclk1";
+			#clock-cells = <1>;
+			#sound-dai-cells = <1>;
+
+			status = "disabled";
+		};
+
 		pinctrl_dispaud: pinctrl@148c0000 {
 			compatible = "samsung,exynos7870-pinctrl";
 			reg = <0x148c0000 0x1000>;
@@ -838,6 +902,12 @@
 				 <&cmu_mif CLK_GOUT_MIF_CMU_DISPAUD_BUS>,
 				 <&cmu_mif CLK_GOUT_MIF_CMU_DISPAUD_DECON_ECLK>,
 				 <&cmu_mif CLK_GOUT_MIF_CMU_DISPAUD_DECON_VCLK>;
+		};
+
+		dispaud_reset: reset-controller@148f1000 {
+			compatible = "samsung,exynos7870-dispaud-reset";
+			reg = <0x148f1000 0x4>;
+			#reset-cells = <1>;
 		};
 
 		syscon_disp: system-controller@148f100c {
