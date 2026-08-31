@@ -19,6 +19,7 @@
 #include <linux/of.h>
 #include <linux/of_graph.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
 
@@ -84,6 +85,7 @@ struct s2m_chgr {
 	unsigned int source_retries;
 	bool thermal_policy_dirty;
 	bool thermal_limits_valid;
+	bool suspended;
 	bool stopping;
 };
 
@@ -598,6 +600,10 @@ static int s2mu005_chgr_apply_source(struct s2m_chgr *priv)
 	int state;
 	int ret;
 
+	/* Suspend has already forced the hardware off; preserve only user intent. */
+	if (priv->suspended)
+		return 0;
+
 	state = extcon_get_state(priv->extcon, EXTCON_USB_HOST);
 	if (state < 0)
 		return state;
@@ -837,7 +843,7 @@ static void s2mu005_chgr_extcon_work(struct work_struct *work)
 		return;
 
 	mutex_lock(&priv->lock);
-	if (priv->stopping) {
+	if (priv->stopping || priv->suspended) {
 		mutex_unlock(&priv->lock);
 		return;
 	}
@@ -870,7 +876,7 @@ static int s2m_chgr_extcon_notifier(struct notifier_block *nb,
 	struct s2m_chgr *priv = container_of(nb, struct s2m_chgr, extcon_nb);
 
 	mutex_lock(&priv->lock);
-	if (!priv->stopping) {
+	if (!priv->stopping && !priv->suspended) {
 		priv->source_retries = 0;
 		mod_delayed_work(system_wq, &priv->extcon_work,
 				 msecs_to_jiffies(S2MU005_EXTCON_DEBOUNCE_MS));
@@ -933,7 +939,7 @@ static void s2mu005_chgr_monitor_work(struct work_struct *work)
 	int temp = 0;
 	int ret;
 
-	if (READ_ONCE(priv->stopping))
+	if (READ_ONCE(priv->stopping) || READ_ONCE(priv->suspended))
 		return;
 
 	if (priv->thermal_limits_valid)
@@ -942,7 +948,7 @@ static void s2mu005_chgr_monitor_work(struct work_struct *work)
 		ret = -EINVAL;
 
 	mutex_lock(&priv->lock);
-	if (priv->stopping) {
+	if (priv->stopping || priv->suspended) {
 		mutex_unlock(&priv->lock);
 		return;
 	}
@@ -998,7 +1004,7 @@ static void s2mu005_chgr_monitor_work(struct work_struct *work)
 		power_supply_changed(priv->psy);
 
 	mutex_lock(&priv->lock);
-	if (!priv->stopping)
+	if (!priv->stopping && !priv->suspended)
 		mod_delayed_work(system_freezable_wq, &priv->monitor_work,
 				 msecs_to_jiffies(S2MU005_MONITOR_INTERVAL_MS));
 	mutex_unlock(&priv->lock);
@@ -1218,6 +1224,70 @@ static void s2m_chgr_shutdown(struct platform_device *pdev)
 	s2m_chgr_disable(priv);
 }
 
+static int s2m_chgr_suspend(struct device *dev)
+{
+	struct s2m_chgr *priv = dev_get_drvdata(dev);
+	enum s2mu005_thermal_state old_thermal;
+	int ret;
+
+	mutex_lock(&priv->lock);
+	if (priv->stopping) {
+		mutex_unlock(&priv->lock);
+		return 0;
+	}
+
+	old_thermal = priv->thermal_state;
+	priv->suspended = true;
+	priv->thermal_state = S2MU005_THERMAL_UNKNOWN;
+	priv->thermal_policy_dirty = true;
+	ret = s2mu005_chgr_mode_unset(priv);
+	if (ret) {
+		priv->suspended = false;
+		priv->thermal_state = old_thermal;
+	}
+	mutex_unlock(&priv->lock);
+
+	if (ret) {
+		mod_delayed_work(system_freezable_wq, &priv->monitor_work, 0);
+		mod_delayed_work(system_wq, &priv->extcon_work, 0);
+		return dev_err_probe(dev, ret,
+				     "failed to inhibit charging for suspend\n");
+	}
+
+	/* A frozen monitor must never leave charging active on a stale sample. */
+	cancel_delayed_work_sync(&priv->monitor_work);
+	power_supply_changed(priv->psy);
+
+	return 0;
+}
+
+static int s2m_chgr_resume(struct device *dev)
+{
+	struct s2m_chgr *priv = dev_get_drvdata(dev);
+
+	mutex_lock(&priv->lock);
+	if (priv->stopping) {
+		mutex_unlock(&priv->lock);
+		return 0;
+	}
+
+	priv->suspended = false;
+	priv->thermal_state = S2MU005_THERMAL_UNKNOWN;
+	priv->thermal_policy_dirty = true;
+	priv->source_retries = 0;
+	mutex_unlock(&priv->lock);
+
+	/* UNKNOWN keeps charging off until the fresh temperature sample succeeds. */
+	mod_delayed_work(system_freezable_wq, &priv->monitor_work, 0);
+	mod_delayed_work(system_wq, &priv->extcon_work, 0);
+	power_supply_changed(priv->psy);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(s2m_chgr_pm_ops, s2m_chgr_suspend,
+				s2m_chgr_resume);
+
 static void s2m_chgr_remove(struct platform_device *pdev)
 {
 	struct s2m_chgr *priv = platform_get_drvdata(pdev);
@@ -1238,6 +1308,7 @@ MODULE_DEVICE_TABLE(platform, s2m_chgr_id_table);
 static struct platform_driver s2m_chgr_driver = {
 	.driver = {
 		.name = "s2m-charger",
+		.pm = pm_sleep_ptr(&s2m_chgr_pm_ops),
 	},
 	.probe = s2m_chgr_probe,
 	.remove = s2m_chgr_remove,
