@@ -285,6 +285,11 @@ static int s1402x_set_bclk_ratio(struct snd_soc_dai *dai, unsigned int ratio)
 		shift = S1402X_I2S_XFS_SHIFT;
 		mask = S1402X_I2S_XFS_MASK;
 		break;
+	case S1402X_DAI_AMP:
+		reg = S1402X_INAMP_CTL;
+		shift = S1402X_INAMP_XFS_SHIFT;
+		mask = S1402X_INAMP_XFS_MASK;
+		break;
 	case S1402X_DAI_AP1:
 		reg = S1402X_OUTAP1_CTL;
 		shift = S1402X_OUT_XFS_SHIFT;
@@ -356,15 +361,17 @@ static int s1402x_hw_params(struct snd_pcm_substream *substream,
 			    struct snd_soc_dai *dai)
 {
 	struct s1402x_priv *s1402x = snd_soc_component_get_drvdata(dai->component);
-	unsigned int dl, rate = params_rate(params);
+	unsigned int bfs, dl, rate = params_rate(params);
 	int ret = 0;
 
 	switch (params_format(params)) {
 	case SNDRV_PCM_FORMAT_S16_LE:
 		dl = S1402X_I2S_DL_16BIT;
+		bfs = 32;
 		break;
 	case SNDRV_PCM_FORMAT_S24_LE:
 		dl = S1402X_I2S_DL_24BIT;
+		bfs = 48;
 		break;
 	default:
 		return -EINVAL;
@@ -440,6 +447,9 @@ static int s1402x_hw_params(struct snd_pcm_substream *substream,
 		return -EINVAL;
 	}
 
+	if (!ret && dai->id != S1402X_DAI_AP0)
+		ret = s1402x_set_bclk_ratio(dai, bfs);
+
 	if (!ret && s1402x->active_streams == 1)
 		s1402x_reset_data(s1402x);
 
@@ -459,6 +469,14 @@ static int s1402x_startup(struct snd_pcm_substream *substream,
 		return ret;
 
 	mutex_lock(&s1402x->stream_lock);
+	if ((dai->id == S1402X_DAI_BT &&
+	     s1402x->use_count[S1402X_DAI_FM]) ||
+	    (dai->id == S1402X_DAI_FM &&
+	     s1402x->use_count[S1402X_DAI_BT])) {
+		ret = -EBUSY;
+		goto err_unlock;
+	}
+
 	if (dai->id == S1402X_DAI_BT) {
 		state = s1402x->pins_bt;
 		mux = 0;
@@ -477,6 +495,12 @@ static int s1402x_startup(struct snd_pcm_substream *substream,
 	mutex_unlock(&s1402x->stream_lock);
 
 	return 0;
+
+err_unlock:
+	mutex_unlock(&s1402x->stream_lock);
+	pm_runtime_mark_last_busy(s1402x->dev);
+	pm_runtime_put_autosuspend(s1402x->dev);
+	return ret;
 }
 
 static void s1402x_shutdown(struct snd_pcm_substream *substream,
@@ -569,7 +593,8 @@ static struct snd_soc_dai_driver s1402x_dais[] = {
 	}, {
 		.name = "CP1", .id = S1402X_DAI_CP1, .ops = &s1402x_dai_ops,
 		.capture = S1402X_STREAM("CP1 Capture",
-			SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000),
+			SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000 |
+			SNDRV_PCM_RATE_48000),
 	},
 };
 
