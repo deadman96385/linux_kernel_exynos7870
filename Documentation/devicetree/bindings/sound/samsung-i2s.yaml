@@ -90,7 +90,7 @@ properties:
 
   clocks:
     minItems: 1
-    maxItems: 3
+    maxItems: 4
 
   clock-names:
     oneOf:
@@ -100,13 +100,20 @@ properties:
           - const: iis
           - const: i2s_opclk0
           - const: i2s_opclk1
+      - items: # for Exynos7870 I2S0 and I2S1
+          - const: iis
+          - const: pclk
+          - const: i2s_opclk0
+          - const: i2s_opclk1
       - items: # for I2S1 and I2S2
           - const: iis
           - const: i2s_opclk0
     description: |
-      "iis" is the I2S bus clock and i2s_opclk0, i2s_opclk1 are sources
-      of the root clock. I2S0 has internal mux to select the source
-      of root clock and I2S1 and I2S2 doesn't have any such mux.
+      "iis" is the I2S functional clock, optional "pclk" is a separate bus
+      clock, and i2s_opclk0, i2s_opclk1 are sources of the root clock. I2S0
+      has an internal mux to select the source of root clock and I2S1 and I2S2
+      do not normally have such a mux. Exynos7870 provides both sources to its
+      stream-mode I2S interfaces.
 
   "#clock-cells":
     const: 1
