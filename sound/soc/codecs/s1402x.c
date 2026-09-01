@@ -24,7 +24,7 @@
 #define S1402X_SYSCLK_48KHZ	24576100
 #define S1402X_SYSCLK_192KHZ	49152100
 #define S1402X_AUTOSUSPEND_MS	500
-#define S1402X_NUM_CLKS		6
+#define S1402X_NUM_CLKS		7
 
 #define S1402X_PMU_GPIO_MODE_AUD			0x1340
 #define S1402X_PMU_DISPAUD_SYS_PWR		0x1404
@@ -1078,6 +1078,7 @@ static int s1402x_probe(struct platform_device *pdev)
 	s1402x->clks[3].id = "fm-bclk";
 	s1402x->clks[4].id = "mixer";
 	s1402x->clks[5].id = "dout";
+	s1402x->clks[6].id = "apb";
 	mutex_init(&s1402x->stream_lock);
 	platform_set_drvdata(pdev, s1402x);
 
