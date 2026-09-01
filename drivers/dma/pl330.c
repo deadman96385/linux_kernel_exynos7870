@@ -486,6 +486,8 @@ struct pl330_dmac {
 	dma_addr_t		mcode_bus;
 	/* CPU address of MicroCode buffer */
 	void			*mcode_cpu;
+	/* MicroCode buffer is a fixed reserved-memory mapping. */
+	bool			mcode_reserved;
 	/* List of all Channel threads */
 	struct pl330_thread	*channels;
 	/* Pointer to the MANAGER thread */
@@ -1914,31 +1916,54 @@ static int dmac_alloc_threads(struct pl330_dmac *pl330)
 
 static int dmac_alloc_resources(struct pl330_dmac *pl330)
 {
+	struct device *dev = pl330->ddma.dev;
+	struct device_node *np = dev->of_node;
+	struct resource res;
 	int chans = pl330->pcfg.num_chan;
+	size_t mcode_size = chans * pl330->mcbufsz;
 	int ret;
 
 	/*
 	 * Alloc MicroCode buffer for 'chans' Channel threads.
 	 * A channel's buffer offset is (Channel_Id * MCODE_BUFF_PERCHAN)
 	 */
-	pl330->mcode_cpu = dma_alloc_attrs(pl330->ddma.dev,
-				chans * pl330->mcbufsz,
-				&pl330->mcode_bus, GFP_KERNEL,
-				DMA_ATTR_PRIVILEGED);
-	if (!pl330->mcode_cpu) {
-		dev_err(pl330->ddma.dev, "%s:%d Can't allocate memory!\n",
-			__func__, __LINE__);
-		return -ENOMEM;
+	if (np && of_property_present(np, "memory-region")) {
+		ret = of_reserved_mem_region_to_resource(np, 0, &res);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "failed to get microcode memory\n");
+
+		if (resource_size(&res) < mcode_size)
+			return dev_err_probe(dev, -EINVAL,
+					     "microcode memory is too small\n");
+
+		pl330->mcode_cpu = devm_memremap(dev, res.start, mcode_size,
+						 MEMREMAP_WC);
+		if (IS_ERR(pl330->mcode_cpu))
+			return dev_err_probe(dev, PTR_ERR(pl330->mcode_cpu),
+					     "failed to map microcode memory\n");
+
+		pl330->mcode_bus = res.start;
+		pl330->mcode_reserved = true;
+	} else {
+		pl330->mcode_cpu = dma_alloc_attrs(dev, mcode_size,
+						   &pl330->mcode_bus, GFP_KERNEL,
+						   DMA_ATTR_PRIVILEGED);
+		if (!pl330->mcode_cpu) {
+			dev_err(dev, "%s:%d Can't allocate memory!\n",
+				__func__, __LINE__);
+			return -ENOMEM;
+		}
 	}
 
 	ret = dmac_alloc_threads(pl330);
 	if (ret) {
 		dev_err(pl330->ddma.dev, "%s:%d Can't to create channels for DMAC!\n",
 			__func__, __LINE__);
-		dma_free_attrs(pl330->ddma.dev,
-				chans * pl330->mcbufsz,
-				pl330->mcode_cpu, pl330->mcode_bus,
-				DMA_ATTR_PRIVILEGED);
+		if (!pl330->mcode_reserved)
+			dma_free_attrs(dev, mcode_size, pl330->mcode_cpu,
+				       pl330->mcode_bus,
+				       DMA_ATTR_PRIVILEGED);
 		return ret;
 	}
 
@@ -2042,9 +2067,11 @@ static void pl330_del(struct pl330_dmac *pl330)
 	/* Free DMAC resources */
 	dmac_free_threads(pl330);
 
-	dma_free_attrs(pl330->ddma.dev,
-		pl330->pcfg.num_chan * pl330->mcbufsz, pl330->mcode_cpu,
-		pl330->mcode_bus, DMA_ATTR_PRIVILEGED);
+	if (!pl330->mcode_reserved)
+		dma_free_attrs(pl330->ddma.dev,
+			       pl330->pcfg.num_chan * pl330->mcbufsz,
+			       pl330->mcode_cpu, pl330->mcode_bus,
+			       DMA_ATTR_PRIVILEGED);
 }
 
 /* forward declaration */
@@ -3048,13 +3075,6 @@ pl330_probe(struct amba_device *adev, const struct amba_id *id)
 	ret = dma_set_mask_and_coherent(&adev->dev, DMA_BIT_MASK(32));
 	if (ret)
 		return ret;
-
-	if (np && of_property_present(np, "memory-region")) {
-		ret = devm_of_reserved_mem_device_init(&adev->dev);
-		if (ret)
-			return dev_err_probe(&adev->dev, ret,
-					     "failed to initialize reserved memory\n");
-	}
 
 	/* Allocate a new DMAC and its Channels */
 	pl330 = devm_kzalloc(&adev->dev, sizeof(*pl330), GFP_KERNEL);
