@@ -41,7 +41,9 @@ properties:
   samsung,pmu-syscon:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:
-      PMU syscon containing the Bluetooth/FM input-path selector.
+      PMU syscon containing the Bluetooth/FM input-path selector and the
+      Exynos7870 DISPAUD power controls used when no generic power domain is
+      attached.
 
   samsung,bt-fm-combo:
     type: boolean
