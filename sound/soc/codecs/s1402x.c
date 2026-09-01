@@ -27,6 +27,7 @@
 #define S1402X_NUM_CLKS		6
 
 #define S1402X_PMU_GPIO_MODE_AUD			0x1340
+#define S1402X_PMU_DISPAUD_SYS_PWR		0x1404
 #define S1402X_PMU_CLKRUN_CMU_DISPAUD		0x1444
 #define S1402X_PMU_CLKSTOP_CMU_DISPAUD		0x1484
 #define S1402X_PMU_DISABLE_PLL_CMU_DISPAUD	0x14c4
@@ -235,6 +236,12 @@ static int s1402x_dispaud_power_on(struct s1402x_priv *s1402x)
 
 	if (!s1402x->pmu_power_fallback)
 		return 0;
+
+	ret = regmap_update_bits(s1402x->pmu, S1402X_PMU_DISPAUD_SYS_PWR,
+				 S1402X_PMU_LOCAL_PWR_CFG,
+				 S1402X_PMU_LOCAL_PWR_CFG);
+	if (ret)
+		return ret;
 
 	for (i = 0; i < ARRAY_SIZE(sys_pwr_regs); i++) {
 		ret = regmap_update_bits(s1402x->pmu, sys_pwr_regs[i], BIT(0), 0);
