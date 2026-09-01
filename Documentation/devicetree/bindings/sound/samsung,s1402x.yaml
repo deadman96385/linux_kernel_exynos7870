@@ -28,8 +28,9 @@ properties:
       - description: Bluetooth serial-audio bit-clock gate
       - description: Modem serial-audio bit-clock gate
       - description: FM serial-audio bit-clock gate
-      - description: Mixer register-interface and system clock
+      - description: Mixer functional system clock
       - description: Rate-programmable mixer source clock
+      - description: DISPAUD APB register-interface clock
 
   clock-names:
     items:
@@ -39,6 +40,7 @@ properties:
       - const: fm-bclk
       - const: mixer
       - const: dout
+      - const: apb
 
   resets:
     maxItems: 1
@@ -95,9 +97,10 @@ examples:
                  <&cmu_dispaud CLK_GOUT_DISPAUD_CON_CP2AUD_BCK>,
                  <&cmu_dispaud CLK_GOUT_DISPAUD_CON_AUD_I2S_BCLK_FM_IN>,
                  <&cmu_dispaud CLK_GOUT_DISPAUD_MIXER_AUD_SYSCLK>,
-                 <&cmu_dispaud CLK_DOUT_DISPAUD_MIXER>;
+                 <&cmu_dispaud CLK_DOUT_DISPAUD_MIXER>,
+                 <&cmu_dispaud CLK_GOUT_DISPAUD_APB>;
         clock-names = "ap-bclk", "bt-bclk", "cp-bclk", "fm-bclk", "mixer",
-                      "dout";
+                      "dout", "apb";
         resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_MIXER>;
         reset-names = "mixer";
         samsung,pmu-syscon = <&pmu_system_controller>;
