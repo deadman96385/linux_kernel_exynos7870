@@ -48,6 +48,9 @@ properties:
   reset-names:
     const: mixer
 
+  power-domains:
+    maxItems: 1
+
   samsung,pmu-syscon:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:
@@ -76,6 +79,7 @@ required:
   - clock-names
   - resets
   - reset-names
+  - power-domains
   - samsung,pmu-syscon
   - '#sound-dai-cells'
 
@@ -103,6 +107,7 @@ examples:
                       "dout", "apb";
         resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_MIXER>;
         reset-names = "mixer";
+        power-domains = <&pd_dispaud>;
         samsung,pmu-syscon = <&pmu_system_controller>;
         #sound-dai-cells = <1>;
     };
