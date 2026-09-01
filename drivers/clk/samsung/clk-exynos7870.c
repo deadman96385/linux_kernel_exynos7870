@@ -770,6 +770,7 @@ static const struct samsung_cmu_info mif_cmu_info __initconst = {
 #define CLK_CON_GAT_DISPAUD_BUS					0x0810
 #define CLK_CON_GAT_DISPAUD_BUS_DISP				0x0810
 #define CLK_CON_GAT_DISPAUD_BUS_PPMU				0x0810
+#define CLK_CON_GAT_DISPAUD_APB					0x0814
 #define CLK_CON_GAT_DISPAUD_APB_AUD				0x0814
 #define CLK_CON_GAT_DISPAUD_APB_AUD_AMP				0x0814
 #define CLK_CON_GAT_DISPAUD_APB_DISP				0x0814
@@ -816,6 +817,7 @@ static const unsigned long dispaud_clk_regs[] __initconst = {
 	CLK_CON_GAT_DISPAUD_BUS,
 	CLK_CON_GAT_DISPAUD_BUS_DISP,
 	CLK_CON_GAT_DISPAUD_BUS_PPMU,
+	CLK_CON_GAT_DISPAUD_APB,
 	CLK_CON_GAT_DISPAUD_APB_AUD,
 	CLK_CON_GAT_DISPAUD_APB_AUD_AMP,
 	CLK_CON_GAT_DISPAUD_APB_DISP,
@@ -901,6 +903,9 @@ static const struct samsung_gate_clock dispaud_gate_clks[] __initconst = {
 	GATE(CLK_GOUT_DISPAUD_BUS_PPMU, "gout_dispaud_bus_ppmu",
 	     "gout_dispaud_mux_bus_user", CLK_CON_GAT_DISPAUD_BUS_PPMU, 3,
 	     CLK_IS_CRITICAL | CLK_SET_RATE_PARENT, 0),
+	GATE(CLK_GOUT_DISPAUD_APB, "gout_dispaud_apb",
+	     "dout_dispaud_apb", CLK_CON_GAT_DISPAUD_APB, 0,
+	     CLK_SET_RATE_PARENT, 0),
 	GATE(CLK_GOUT_DISPAUD_APB_AUD, "gout_dispaud_apb_aud",
 	     "dout_dispaud_apb", CLK_CON_GAT_DISPAUD_APB_AUD, 2,
 	     CLK_SET_RATE_PARENT, 0),
