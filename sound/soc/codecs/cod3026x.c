@@ -241,6 +241,19 @@ static int cod3026x_runtime_resume(struct device *dev)
 
 	pinctrl_pm_select_default_state(dev);
 	regcache_cache_only(cod3026x->regmap, false);
+
+	/*
+	 * The OTP bank is clocked by the jack-detection clock.  Samsung's
+	 * downstream driver enables it before the mandatory settling delay and
+	 * before saving the boot-time D0-DE values.  Reading the bank before this
+	 * clock is running returns zeroes and leaves the analogue output stages
+	 * without their factory trims.
+	 */
+	ret = regmap_update_bits(cod3026x->regmap, COD3026X_DET_ON,
+				 COD3026X_JD_CLK, COD3026X_JD_CLK);
+	if (ret)
+		goto err_disable;
+
 	usleep_range(15000, 16000);
 
 	if (!cod3026x->initialized) {
@@ -250,7 +263,11 @@ static int cod3026x_runtime_resume(struct device *dev)
 				regmap_read(cod3026x->regmap, reg, &val);
 		}
 
-		ret = cod3026x_save_otp(cod3026x);
+		ret = regmap_update_bits(cod3026x->regmap, COD3026X_CHOP_DA,
+					 COD3026X_CHOP_HP | COD3026X_CHOP_EP |
+					 COD3026X_CHOP_SPK_PGA, 0);
+		if (!ret)
+			ret = cod3026x_save_otp(cod3026x);
 		if (!ret)
 			ret = cod3026x_hw_init(cod3026x);
 		if (!ret)
@@ -264,6 +281,7 @@ static int cod3026x_runtime_resume(struct device *dev)
 	if (!ret)
 		return 0;
 
+err_disable:
 	regcache_cache_only(cod3026x->regmap, true);
 	regulator_disable(cod3026x->vdd);
 	return ret;
@@ -915,6 +933,9 @@ static int cod3026x_output_event(struct snd_soc_dapm_widget *widget,
 			       COD3026X_SPK_MIX_ADCR;
 			mix |= COD3026X_SPK_MIX_DACL |
 			       COD3026X_SPK_MIX_DACR;
+			regmap_update_bits(cod3026x->regmap, COD3026X_MIX_DA2,
+					   COD3026X_SPK_MIX_DACL |
+					   COD3026X_SPK_MIX_DACR, 0);
 			regmap_read(cod3026x->regmap, COD3026X_VOL_EP_SPK,
 				    &gain);
 			regmap_update_bits(cod3026x->regmap,
@@ -1470,7 +1491,8 @@ static int cod3026x_add_mixer_link(struct cod3026x_priv *cod3026x)
 {
 	struct device_node *mixer_np;
 	struct platform_device *mixer_pdev;
-	u32 flags = DL_FLAG_PM_RUNTIME | DL_FLAG_AUTOREMOVE_CONSUMER;
+	u32 flags = DL_FLAG_PM_RUNTIME | DL_FLAG_RPM_ACTIVE |
+		    DL_FLAG_AUTOREMOVE_CONSUMER;
 
 	mixer_np = of_parse_phandle(cod3026x->dev->of_node,
 				    "samsung,audio-mixer", 0);
@@ -1481,6 +1503,10 @@ static int cod3026x_add_mixer_link(struct cod3026x_priv *cod3026x)
 	of_node_put(mixer_np);
 	if (!mixer_pdev)
 		return -EPROBE_DEFER;
+	if (!device_is_bound(&mixer_pdev->dev)) {
+		put_device(&mixer_pdev->dev);
+		return -EPROBE_DEFER;
+	}
 
 	cod3026x->mixer_link =
 		device_link_add(cod3026x->dev, &mixer_pdev->dev, flags);
