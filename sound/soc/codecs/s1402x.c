@@ -25,6 +25,20 @@
 #define S1402X_SYSCLK_192KHZ	49152100
 #define S1402X_AUTOSUSPEND_MS	500
 
+#define S1402X_PMU_CLKRUN_CMU_DISPAUD		0x1444
+#define S1402X_PMU_CLKSTOP_CMU_DISPAUD		0x1484
+#define S1402X_PMU_DISABLE_PLL_CMU_DISPAUD	0x14c4
+#define S1402X_PMU_RESET_LOGIC_DISPAUD		0x1504
+#define S1402X_PMU_RESET_CMU_DISPAUD		0x1584
+#define S1402X_PMU_PAD_RETENTION_AUD_OPTION	0x3028
+#define S1402X_PMU_DISPAUD_CONFIGURATION		0x4020
+#define S1402X_PMU_DISPAUD_STATUS		0x4024
+#define S1402X_PMU_DISPAUD_OPTION		0x4028
+
+#define S1402X_PMU_LOCAL_PWR_CFG		GENMASK(3, 0)
+#define S1402X_PMU_OPTION_USE_SC_FEEDBACK	GENMASK(1, 0)
+#define S1402X_PMU_PAD_RETENTION_RELEASE	BIT(28)
+
 struct s1402x_priv {
 	struct device *dev;
 	struct regmap *regmap;
@@ -43,7 +57,7 @@ struct s1402x_priv {
 	unsigned int active_streams;
 	bool bt_fm_combo;
 	bool bck4_mcko;
-	bool runtime_pm_held;
+	bool pmu_power_fallback;
 };
 
 static const struct reg_default s1402x_reg_defaults[] = {
@@ -204,10 +218,61 @@ static void s1402x_select_state(struct s1402x_priv *s1402x,
 		dev_warn(s1402x->dev, "failed to select pin state: %d\n", ret);
 }
 
+static int s1402x_dispaud_power_on(struct s1402x_priv *s1402x)
+{
+	static const unsigned int sys_pwr_regs[] = {
+		S1402X_PMU_CLKRUN_CMU_DISPAUD,
+		S1402X_PMU_CLKSTOP_CMU_DISPAUD,
+		S1402X_PMU_DISABLE_PLL_CMU_DISPAUD,
+		S1402X_PMU_RESET_LOGIC_DISPAUD,
+		S1402X_PMU_RESET_CMU_DISPAUD,
+	};
+	unsigned int i, status;
+	int ret;
+
+	if (!s1402x->pmu_power_fallback)
+		return 0;
+
+	for (i = 0; i < ARRAY_SIZE(sys_pwr_regs); i++) {
+		ret = regmap_update_bits(s1402x->pmu, sys_pwr_regs[i], BIT(0), 0);
+		if (ret)
+			return ret;
+	}
+
+	ret = regmap_update_bits(s1402x->pmu, S1402X_PMU_DISPAUD_OPTION,
+				 S1402X_PMU_OPTION_USE_SC_FEEDBACK,
+				 BIT(1));
+	if (ret)
+		return ret;
+
+	ret = regmap_write(s1402x->pmu,
+			   S1402X_PMU_PAD_RETENTION_AUD_OPTION,
+			   S1402X_PMU_PAD_RETENTION_RELEASE);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(s1402x->pmu,
+				 S1402X_PMU_DISPAUD_CONFIGURATION,
+				 S1402X_PMU_LOCAL_PWR_CFG,
+				 S1402X_PMU_LOCAL_PWR_CFG);
+	if (ret)
+		return ret;
+
+	return regmap_read_poll_timeout(s1402x->pmu,
+					S1402X_PMU_DISPAUD_STATUS, status,
+					(status & S1402X_PMU_LOCAL_PWR_CFG) ==
+					S1402X_PMU_LOCAL_PWR_CFG, 1, 10000);
+}
+
 static int s1402x_runtime_resume(struct device *dev)
 {
 	struct s1402x_priv *s1402x = dev_get_drvdata(dev);
 	int ret;
+
+	ret = s1402x_dispaud_power_on(s1402x);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "failed to power on DISPAUD domain\n");
 
 	ret = clk_bulk_prepare_enable(ARRAY_SIZE(s1402x->clks), s1402x->clks);
 	if (ret)
@@ -969,6 +1034,9 @@ static int s1402x_probe(struct platform_device *pdev)
 							"samsung,bt-fm-combo");
 	s1402x->bck4_mcko = device_property_read_bool(dev,
 						      "samsung,bck4-mcko");
+	s1402x->pmu_power_fallback = !dev->pm_domain;
+	if (s1402x->pmu_power_fallback)
+		dev_info(dev, "using PMU fallback to power the DISPAUD domain\n");
 
 	s1402x->pinctrl = devm_pinctrl_get(dev);
 	if (IS_ERR(s1402x->pinctrl)) {
@@ -1008,21 +1076,8 @@ static int s1402x_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_put;
 
-	/*
-	 * Downstream firmware keeps the mixer MMIO window accessible through
-	 * LPASS.  Runtime suspend is only safe when a power domain is attached
-	 * here and can restore that window before the clocks are enabled.  Keep
-	 * the initial runtime PM reference otherwise; nested users still balance
-	 * their own references around it.
-	 */
-	if (!dev->pm_domain) {
-		s1402x->runtime_pm_held = true;
-		dev_warn(dev,
-			 "audio power domain unavailable; keeping mixer active\n");
-	} else {
-		pm_runtime_mark_last_busy(dev);
-		pm_runtime_put_autosuspend(dev);
-	}
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
 
 	return 0;
 
@@ -1038,36 +1093,10 @@ err_pm:
 static void s1402x_remove(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	struct s1402x_priv *s1402x = platform_get_drvdata(pdev);
-
-	if (s1402x->runtime_pm_held) {
-		pm_runtime_put_noidle(dev);
-		s1402x->runtime_pm_held = false;
-	}
 
 	pm_runtime_disable(dev);
 	if (!pm_runtime_status_suspended(dev))
 		s1402x_runtime_suspend(dev);
-}
-
-static int s1402x_suspend(struct device *dev)
-{
-	struct s1402x_priv *s1402x = dev_get_drvdata(dev);
-
-	if (s1402x->runtime_pm_held)
-		return 0;
-
-	return pm_runtime_force_suspend(dev);
-}
-
-static int s1402x_resume(struct device *dev)
-{
-	struct s1402x_priv *s1402x = dev_get_drvdata(dev);
-
-	if (s1402x->runtime_pm_held)
-		return 0;
-
-	return pm_runtime_force_resume(dev);
 }
 
 static const struct of_device_id s1402x_of_match[] = {
@@ -1078,7 +1107,7 @@ MODULE_DEVICE_TABLE(of, s1402x_of_match);
 
 static const struct dev_pm_ops s1402x_pm_ops = {
 	SET_RUNTIME_PM_OPS(s1402x_runtime_suspend, s1402x_runtime_resume, NULL)
-	SET_SYSTEM_SLEEP_PM_OPS(s1402x_suspend, s1402x_resume)
+	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
 };
 
 static struct platform_driver s1402x_driver = {
