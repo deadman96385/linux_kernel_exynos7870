@@ -859,9 +859,11 @@
 				 <&cmu_dispaud CLK_GOUT_DISPAUD_CON_AUD_I2S_BCLK_FM_IN>,
 				 <&cmu_dispaud CLK_GOUT_DISPAUD_MIXER_AUD_SYSCLK>,
 				 <&cmu_dispaud CLK_DOUT_DISPAUD_MIXER>,
-				 <&cmu_dispaud CLK_GOUT_DISPAUD_APB>;
+				 <&cmu_dispaud CLK_GOUT_DISPAUD_APB>,
+				 <&cmu_dispaud CLK_GOUT_DISPAUD_APB_AUD>;
 			clock-names = "ap-bclk", "bt-bclk", "cp-bclk",
-				      "fm-bclk", "mixer", "dout", "apb";
+				      "fm-bclk", "mixer", "dout", "apb",
+				      "audio-apb";
 			resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_MIXER>;
 			reset-names = "mixer";
 			power-domains = <&pd_dispaud>;
