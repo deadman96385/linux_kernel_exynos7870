@@ -235,9 +235,6 @@ static int s1402x_dispaud_power_on(struct s1402x_priv *s1402x)
 	unsigned int i, status;
 	int ret;
 
-	if (!s1402x->pmu_power_fallback)
-		return 0;
-
 	ret = regmap_update_bits(s1402x->pmu, S1402X_PMU_DISPAUD_SYS_PWR,
 				 S1402X_PMU_LOCAL_PWR_CFG,
 				 S1402X_PMU_LOCAL_PWR_CFG);
