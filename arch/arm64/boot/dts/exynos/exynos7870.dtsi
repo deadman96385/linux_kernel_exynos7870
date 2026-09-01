@@ -846,14 +846,14 @@
 		s1402x: audio-mixer@14880000 {
 			compatible = "samsung,s1402x";
 			reg = <0x14880000 0x200>;
-			clocks = <&cmu_dispaud CLK_DOUT_DISPAUD_MIXER>,
-				 <&cmu_dispaud CLK_GOUT_DISPAUD_MIXER_AUD_SYSCLK>,
-				 <&cmu_dispaud CLK_GOUT_DISPAUD_CON_EXT2AUD_BCK_GPIO_I2S>,
+			clocks = <&cmu_dispaud CLK_GOUT_DISPAUD_CON_EXT2AUD_BCK_GPIO_I2S>,
 				 <&cmu_dispaud CLK_GOUT_DISPAUD_CON_AUD_I2S_BCLK_BT_IN>,
 				 <&cmu_dispaud CLK_GOUT_DISPAUD_CON_CP2AUD_BCK>,
-				 <&cmu_dispaud CLK_GOUT_DISPAUD_CON_AUD_I2S_BCLK_FM_IN>;
-			clock-names = "dout", "mixer", "ap-bclk", "bt-bclk",
-				      "cp-bclk", "fm-bclk";
+				 <&cmu_dispaud CLK_GOUT_DISPAUD_CON_AUD_I2S_BCLK_FM_IN>,
+				 <&cmu_dispaud CLK_GOUT_DISPAUD_MIXER_AUD_SYSCLK>,
+				 <&cmu_dispaud CLK_DOUT_DISPAUD_MIXER>;
+			clock-names = "ap-bclk", "bt-bclk", "cp-bclk",
+				      "fm-bclk", "mixer", "dout";
 			resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_MIXER>;
 			reset-names = "mixer";
 			samsung,pmu-syscon = <&pmu_system_controller>;
