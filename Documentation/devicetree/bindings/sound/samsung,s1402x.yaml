@@ -26,11 +26,19 @@ properties:
     items:
       - description: Rate-programmable mixer source clock
       - description: Mixer register-interface and system clock
+      - description: Application-processor serial-audio bit-clock gate
+      - description: Bluetooth serial-audio bit-clock gate
+      - description: Modem serial-audio bit-clock gate
+      - description: FM serial-audio bit-clock gate
 
   clock-names:
     items:
       - const: dout
       - const: mixer
+      - const: ap-bclk
+      - const: bt-bclk
+      - const: cp-bclk
+      - const: fm-bclk
 
   resets:
     maxItems: 1
@@ -83,8 +91,13 @@ examples:
         compatible = "samsung,s1402x";
         reg = <0x14880000 0x200>;
         clocks = <&cmu_dispaud CLK_DOUT_DISPAUD_MIXER>,
-                 <&cmu_dispaud CLK_GOUT_DISPAUD_MIXER_AUD_SYSCLK>;
-        clock-names = "dout", "mixer";
+                 <&cmu_dispaud CLK_GOUT_DISPAUD_MIXER_AUD_SYSCLK>,
+                 <&cmu_dispaud CLK_GOUT_DISPAUD_CON_EXT2AUD_BCK_GPIO_I2S>,
+                 <&cmu_dispaud CLK_GOUT_DISPAUD_CON_AUD_I2S_BCLK_BT_IN>,
+                 <&cmu_dispaud CLK_GOUT_DISPAUD_CON_CP2AUD_BCK>,
+                 <&cmu_dispaud CLK_GOUT_DISPAUD_CON_AUD_I2S_BCLK_FM_IN>;
+        clock-names = "dout", "mixer", "ap-bclk", "bt-bclk", "cp-bclk",
+                      "fm-bclk";
         resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_MIXER>;
         reset-names = "mixer";
         samsung,pmu-syscon = <&pmu_system_controller>;
