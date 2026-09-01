@@ -232,9 +232,9 @@
 	kepler: remoteproc {
 		compatible = "samsung,exynos7870-kepler";
 		firmware-name = "samsung/exynos7870/gnss_firmware.bin";
-		interrupts = <GIC_SPI 19 IRQ_TYPE_NONE>,
-			     <GIC_SPI 478 IRQ_TYPE_NONE>,
-			     <GIC_SPI 477 IRQ_TYPE_NONE>;
+		interrupts = <GIC_SPI 19 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 478 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 477 IRQ_TYPE_LEVEL_HIGH>;
 		interrupt-names = "active", "watchdog", "wakeup";
 		mbox-names = "bcmd";
 		mboxes = <&mailbox_gnss 0>;
