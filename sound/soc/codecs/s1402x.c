@@ -26,6 +26,7 @@
 #define S1402X_AUTOSUSPEND_MS	500
 #define S1402X_NUM_CLKS		6
 
+#define S1402X_PMU_GPIO_MODE_AUD			0x1340
 #define S1402X_PMU_CLKRUN_CMU_DISPAUD		0x1444
 #define S1402X_PMU_CLKSTOP_CMU_DISPAUD		0x1484
 #define S1402X_PMU_DISABLE_PLL_CMU_DISPAUD	0x14c4
@@ -39,6 +40,7 @@
 #define S1402X_PMU_LOCAL_PWR_CFG		GENMASK(3, 0)
 #define S1402X_PMU_OPTION_USE_SC_FEEDBACK	GENMASK(1, 0)
 #define S1402X_PMU_PAD_RETENTION_RELEASE	BIT(28)
+#define S1402X_PMU_GPIO_MODE_AUD_ENABLE		BIT(0)
 
 struct s1402x_priv {
 	struct device *dev;
@@ -59,7 +61,6 @@ struct s1402x_priv {
 	bool bt_fm_combo;
 	bool bck4_mcko;
 	bool pmu_power_fallback;
-	bool reset_released;
 };
 
 static const struct reg_default s1402x_reg_defaults[] = {
@@ -253,6 +254,12 @@ static int s1402x_dispaud_power_on(struct s1402x_priv *s1402x)
 	if (ret)
 		return ret;
 
+	ret = regmap_update_bits(s1402x->pmu, S1402X_PMU_GPIO_MODE_AUD,
+				 S1402X_PMU_GPIO_MODE_AUD_ENABLE,
+				 S1402X_PMU_GPIO_MODE_AUD_ENABLE);
+	if (ret)
+		return ret;
+
 	ret = regmap_update_bits(s1402x->pmu,
 				 S1402X_PMU_DISPAUD_CONFIGURATION,
 				 S1402X_PMU_LOCAL_PWR_CFG,
@@ -273,10 +280,22 @@ static int s1402x_set_mixer_alive(struct s1402x_priv *s1402x, bool active)
 				  active ? 0 : S1402X_PMU_MIXER_ALIVE);
 }
 
+static int s1402x_pulse_system_reset(struct s1402x_priv *s1402x)
+{
+	int ret;
+
+	ret = reset_control_assert(s1402x->reset);
+	if (ret)
+		return ret;
+
+	usleep_range(100, 200);
+
+	return reset_control_deassert(s1402x->reset);
+}
+
 static int s1402x_runtime_resume(struct device *dev)
 {
 	struct s1402x_priv *s1402x = dev_get_drvdata(dev);
-	bool released_reset = false;
 	int ret;
 
 	dev_info(dev, "runtime resume: DISPAUD power begin\n");
@@ -285,6 +304,13 @@ static int s1402x_runtime_resume(struct device *dev)
 		return dev_err_probe(dev, ret,
 				     "failed to power on DISPAUD domain\n");
 	dev_info(dev, "runtime resume: DISPAUD power complete\n");
+
+	dev_info(dev, "runtime resume: system reset pulse begin\n");
+	ret = s1402x_pulse_system_reset(s1402x);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "failed to pulse mixer system reset\n");
+	dev_info(dev, "runtime resume: system reset pulse complete\n");
 
 	dev_info(dev, "runtime resume: mixer path begin\n");
 	ret = s1402x_set_mixer_alive(s1402x, true);
@@ -301,16 +327,6 @@ static int s1402x_runtime_resume(struct device *dev)
 	dev_info(dev, "runtime resume: default pins begin\n");
 	s1402x_select_state(s1402x, s1402x->pins_default);
 	dev_info(dev, "runtime resume: default pins complete\n");
-
-	if (!s1402x->reset_released) {
-		dev_info(dev, "runtime resume: initial reset release begin\n");
-		ret = reset_control_deassert(s1402x->reset);
-		if (ret)
-			goto err_pins;
-		s1402x->reset_released = true;
-		released_reset = true;
-		dev_info(dev, "runtime resume: initial reset release complete\n");
-	}
 
 	dev_info(dev, "runtime resume: register access begin\n");
 	regcache_cache_only(s1402x->regmap, false);
@@ -331,11 +347,6 @@ static int s1402x_runtime_resume(struct device *dev)
 
 err_reset:
 	regcache_cache_only(s1402x->regmap, true);
-	if (released_reset) {
-		reset_control_assert(s1402x->reset);
-		s1402x->reset_released = false;
-	}
-err_pins:
 	s1402x_select_state(s1402x, s1402x->pins_idle);
 	clk_bulk_disable_unprepare(ARRAY_SIZE(s1402x->clks), s1402x->clks);
 err_alive:
@@ -1113,7 +1124,6 @@ static int s1402x_probe(struct platform_device *pdev)
 	ret = reset_control_assert(s1402x->reset);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to assert reset\n");
-	s1402x->reset_released = false;
 
 	pm_runtime_set_autosuspend_delay(dev, S1402X_AUTOSUSPEND_MS);
 	pm_runtime_use_autosuspend(dev);
@@ -1146,7 +1156,6 @@ err_pm:
 	if (!pm_runtime_status_suspended(dev))
 		s1402x_runtime_suspend(dev);
 	reset_control_assert(s1402x->reset);
-	s1402x->reset_released = false;
 	return ret;
 }
 
@@ -1159,7 +1168,6 @@ static void s1402x_remove(struct platform_device *pdev)
 	if (!pm_runtime_status_suspended(dev))
 		s1402x_runtime_suspend(dev);
 	reset_control_assert(s1402x->reset);
-	s1402x->reset_released = false;
 }
 
 static const struct of_device_id s1402x_of_match[] = {
