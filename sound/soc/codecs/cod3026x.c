@@ -1287,7 +1287,7 @@ static void cod3026x_button_work(struct work_struct *work)
 	for (i = 0; i < cod3026x->num_buttons; i++) {
 		if (adc >= cod3026x->buttons[i].low &&
 		    adc <= cod3026x->buttons[i].high) {
-			new_mask = SND_JACK_BTN_0 << i;
+			new_mask = SND_JACK_BTN_0 >> i;
 			break;
 		}
 	}
@@ -1374,7 +1374,7 @@ static int cod3026x_set_jack(struct snd_soc_component *component,
 
 	if (jack) {
 		for (i = 0; i < cod3026x->num_buttons; i++) {
-			ret = snd_jack_set_key(jack->jack, SND_JACK_BTN_0 << i,
+			ret = snd_jack_set_key(jack->jack, SND_JACK_BTN_0 >> i,
 					       cod3026x->buttons[i].code);
 			if (ret)
 				return ret;
