@@ -62,6 +62,7 @@ struct s1402x_priv {
 	bool bt_fm_combo;
 	bool bck4_mcko;
 	bool pmu_power_fallback;
+	bool runtime_pm_held;
 };
 
 static const struct reg_default s1402x_reg_defaults[] = {
@@ -1151,8 +1152,21 @@ static int s1402x_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_put;
 
-	pm_runtime_mark_last_busy(dev);
-	pm_runtime_put_autosuspend(dev);
+	/*
+	 * Runtime gating the mixer relies on the DISPAUD power domain to
+	 * restore the shared MMIO clock path before the mixer clocks are
+	 * enabled.  The PMU fallback only controls the power sequencer, so keep
+	 * the initial runtime PM reference until a power domain is attached.
+	 * Nested mixer users still balance their own runtime PM references.
+	 */
+	if (s1402x->pmu_power_fallback) {
+		s1402x->runtime_pm_held = true;
+		dev_warn(dev,
+			 "DISPAUD power domain unavailable; keeping mixer active\n");
+	} else {
+		pm_runtime_mark_last_busy(dev);
+		pm_runtime_put_autosuspend(dev);
+	}
 
 	return 0;
 
@@ -1171,10 +1185,35 @@ static void s1402x_remove(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct s1402x_priv *s1402x = platform_get_drvdata(pdev);
 
+	if (s1402x->runtime_pm_held) {
+		pm_runtime_put_noidle(dev);
+		s1402x->runtime_pm_held = false;
+	}
+
 	pm_runtime_disable(dev);
 	if (!pm_runtime_status_suspended(dev))
 		s1402x_runtime_suspend(dev);
 	reset_control_assert(s1402x->reset);
+}
+
+static int s1402x_suspend(struct device *dev)
+{
+	struct s1402x_priv *s1402x = dev_get_drvdata(dev);
+
+	if (s1402x->runtime_pm_held)
+		return 0;
+
+	return pm_runtime_force_suspend(dev);
+}
+
+static int s1402x_resume(struct device *dev)
+{
+	struct s1402x_priv *s1402x = dev_get_drvdata(dev);
+
+	if (s1402x->runtime_pm_held)
+		return 0;
+
+	return pm_runtime_force_resume(dev);
 }
 
 static const struct of_device_id s1402x_of_match[] = {
@@ -1185,7 +1224,7 @@ MODULE_DEVICE_TABLE(of, s1402x_of_match);
 
 static const struct dev_pm_ops s1402x_pm_ops = {
 	SET_RUNTIME_PM_OPS(s1402x_runtime_suspend, s1402x_runtime_resume, NULL)
-	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+	SET_SYSTEM_SLEEP_PM_OPS(s1402x_suspend, s1402x_resume)
 };
 
 static struct platform_driver s1402x_driver = {
