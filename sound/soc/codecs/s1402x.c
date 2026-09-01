@@ -59,6 +59,7 @@ struct s1402x_priv {
 	bool bt_fm_combo;
 	bool bck4_mcko;
 	bool pmu_power_fallback;
+	bool reset_released;
 };
 
 static const struct reg_default s1402x_reg_defaults[] = {
@@ -275,41 +276,67 @@ static int s1402x_set_mixer_alive(struct s1402x_priv *s1402x, bool active)
 static int s1402x_runtime_resume(struct device *dev)
 {
 	struct s1402x_priv *s1402x = dev_get_drvdata(dev);
+	bool released_reset = false;
 	int ret;
 
+	dev_info(dev, "runtime resume: DISPAUD power begin\n");
 	ret = s1402x_dispaud_power_on(s1402x);
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "failed to power on DISPAUD domain\n");
+	dev_info(dev, "runtime resume: DISPAUD power complete\n");
 
+	dev_info(dev, "runtime resume: mixer path begin\n");
 	ret = s1402x_set_mixer_alive(s1402x, true);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to enable mixer path\n");
+	dev_info(dev, "runtime resume: mixer path complete\n");
 
+	dev_info(dev, "runtime resume: clocks begin\n");
 	ret = clk_bulk_prepare_enable(ARRAY_SIZE(s1402x->clks), s1402x->clks);
 	if (ret)
 		goto err_alive;
+	dev_info(dev, "runtime resume: clocks complete\n");
 
-	ret = reset_control_deassert(s1402x->reset);
-	if (ret)
-		goto err_clks;
+	dev_info(dev, "runtime resume: default pins begin\n");
+	s1402x_select_state(s1402x, s1402x->pins_default);
+	dev_info(dev, "runtime resume: default pins complete\n");
 
+	if (!s1402x->reset_released) {
+		dev_info(dev, "runtime resume: initial reset release begin\n");
+		ret = reset_control_deassert(s1402x->reset);
+		if (ret)
+			goto err_pins;
+		s1402x->reset_released = true;
+		released_reset = true;
+		dev_info(dev, "runtime resume: initial reset release complete\n");
+	}
+
+	dev_info(dev, "runtime resume: register access begin\n");
 	regcache_cache_only(s1402x->regmap, false);
+	dev_info(dev, "runtime resume: soft reset begin\n");
 	ret = s1402x_reset(s1402x);
 	if (ret)
 		goto err_reset;
+	dev_info(dev, "runtime resume: soft reset complete\n");
 
+	dev_info(dev, "runtime resume: register restore begin\n");
 	ret = regcache_sync(s1402x->regmap);
 	if (ret)
 		goto err_reset;
+	dev_info(dev, "runtime resume: register restore complete\n");
 
-	s1402x_select_state(s1402x, s1402x->pins_default);
+	dev_info(dev, "runtime resume: complete\n");
 	return 0;
 
 err_reset:
 	regcache_cache_only(s1402x->regmap, true);
-	reset_control_assert(s1402x->reset);
-err_clks:
+	if (released_reset) {
+		reset_control_assert(s1402x->reset);
+		s1402x->reset_released = false;
+	}
+err_pins:
+	s1402x_select_state(s1402x, s1402x->pins_idle);
 	clk_bulk_disable_unprepare(ARRAY_SIZE(s1402x->clks), s1402x->clks);
 err_alive:
 	s1402x_set_mixer_alive(s1402x, false);
@@ -321,16 +348,22 @@ static int s1402x_runtime_suspend(struct device *dev)
 	struct s1402x_priv *s1402x = dev_get_drvdata(dev);
 	int ret;
 
+	dev_info(dev, "runtime suspend: register cache begin\n");
 	regcache_cache_only(s1402x->regmap, true);
 	regcache_mark_dirty(s1402x->regmap);
+	dev_info(dev, "runtime suspend: register cache complete\n");
+	dev_info(dev, "runtime suspend: idle pins begin\n");
 	s1402x_select_state(s1402x, s1402x->pins_idle);
-	ret = s1402x_set_mixer_alive(s1402x, false);
-	if (ret) {
-		regcache_cache_only(s1402x->regmap, false);
-		s1402x_select_state(s1402x, s1402x->pins_default);
-		return ret;
-	}
+	dev_info(dev, "runtime suspend: idle pins complete\n");
+	dev_info(dev, "runtime suspend: clocks begin\n");
 	clk_bulk_disable_unprepare(ARRAY_SIZE(s1402x->clks), s1402x->clks);
+	dev_info(dev, "runtime suspend: clocks complete\n");
+	dev_info(dev, "runtime suspend: mixer path begin\n");
+	ret = s1402x_set_mixer_alive(s1402x, false);
+	if (ret)
+		return ret;
+	dev_info(dev, "runtime suspend: mixer path complete\n");
+	dev_info(dev, "runtime suspend: complete\n");
 
 	return 0;
 }
@@ -1020,12 +1053,12 @@ static int s1402x_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	s1402x->dev = dev;
-	s1402x->clks[0].id = "dout";
-	s1402x->clks[1].id = "mixer";
-	s1402x->clks[2].id = "ap-bclk";
-	s1402x->clks[3].id = "bt-bclk";
-	s1402x->clks[4].id = "cp-bclk";
-	s1402x->clks[5].id = "fm-bclk";
+	s1402x->clks[0].id = "ap-bclk";
+	s1402x->clks[1].id = "bt-bclk";
+	s1402x->clks[2].id = "cp-bclk";
+	s1402x->clks[3].id = "fm-bclk";
+	s1402x->clks[4].id = "mixer";
+	s1402x->clks[5].id = "dout";
 	mutex_init(&s1402x->stream_lock);
 	platform_set_drvdata(pdev, s1402x);
 
@@ -1080,6 +1113,7 @@ static int s1402x_probe(struct platform_device *pdev)
 	ret = reset_control_assert(s1402x->reset);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to assert reset\n");
+	s1402x->reset_released = false;
 
 	pm_runtime_set_autosuspend_delay(dev, S1402X_AUTOSUSPEND_MS);
 	pm_runtime_use_autosuspend(dev);
@@ -1112,6 +1146,7 @@ err_pm:
 	if (!pm_runtime_status_suspended(dev))
 		s1402x_runtime_suspend(dev);
 	reset_control_assert(s1402x->reset);
+	s1402x->reset_released = false;
 	return ret;
 }
 
@@ -1124,6 +1159,7 @@ static void s1402x_remove(struct platform_device *pdev)
 	if (!pm_runtime_status_suspended(dev))
 		s1402x_runtime_suspend(dev);
 	reset_control_assert(s1402x->reset);
+	s1402x->reset_released = false;
 }
 
 static const struct of_device_id s1402x_of_match[] = {
