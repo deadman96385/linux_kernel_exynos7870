@@ -214,6 +214,13 @@
 			};
 		};
 
+		pd_dispaud: power-domain@10484020 {
+			compatible = "samsung,exynos7870-pd";
+			reg = <0x10484020 0x20>;
+			#power-domain-cells = <0>;
+			label = "DISPAUD";
+		};
+
 		gic: interrupt-controller@104e1000 {
 			compatible = "arm,cortex-a15-gic";
 			reg = <0x104e1000 0x1000>,
@@ -857,6 +864,7 @@
 				      "fm-bclk", "mixer", "dout", "apb";
 			resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_MIXER>;
 			reset-names = "mixer";
+			power-domains = <&pd_dispaud>;
 			samsung,pmu-syscon = <&pmu_system_controller>;
 			#sound-dai-cells = <1>;
 
@@ -872,6 +880,7 @@
 			memory-region = <&adma_mcode>;
 			resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_ADMA>;
 			reset-names = "dma";
+			power-domains = <&pd_dispaud>;
 			dma-channels = <4>;
 			dma-requests = <4>;
 			arm,primecell-periphid = <0x341330>;
@@ -893,6 +902,7 @@
 			clock-names = "iis", "pclk", "i2s_opclk0", "i2s_opclk1";
 			resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_I2S>;
 			reset-names = "i2s";
+			power-domains = <&pd_dispaud>;
 			#clock-cells = <1>;
 			#sound-dai-cells = <1>;
 
@@ -910,6 +920,7 @@
 				 <&cmu_dispaud CLK_DOUT_DISPAUD_MI2S>,
 				 <&cmu_dispaud CLK_DOUT_DISPAUD_MI2S>;
 			clock-names = "iis", "pclk", "i2s_opclk0", "i2s_opclk1";
+			power-domains = <&pd_dispaud>;
 			#clock-cells = <1>;
 			#sound-dai-cells = <1>;
 
@@ -926,6 +937,7 @@
 			compatible = "samsung,exynos7870-cmu-dispaud";
 			reg = <0x148d0000 0x1000>;
 			#clock-cells = <1>;
+			power-domains = <&pd_dispaud>;
 
 			clock-names = "oscclk", "bus", "decon_eclk", "decon_vclk";
 			clocks = <&oscclk>,
