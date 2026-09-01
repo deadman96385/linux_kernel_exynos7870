@@ -866,6 +866,8 @@
 			memory-region = <&adma_mcode>;
 			resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_ADMA>;
 			reset-names = "dma";
+			dma-channels = <4>;
+			dma-requests = <16>;
 			arm,primecell-periphid = <0x341330>;
 			#dma-cells = <1>;
 
