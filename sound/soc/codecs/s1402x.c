@@ -43,6 +43,7 @@ struct s1402x_priv {
 	unsigned int active_streams;
 	bool bt_fm_combo;
 	bool bck4_mcko;
+	bool runtime_pm_held;
 };
 
 static const struct reg_default s1402x_reg_defaults[] = {
@@ -998,19 +999,35 @@ static int s1402x_probe(struct platform_device *pdev)
 		goto err_pm;
 
 	ret = s1402x_hw_init(s1402x);
-	pm_runtime_mark_last_busy(dev);
-	pm_runtime_put_autosuspend(dev);
 	if (ret)
-		goto err_pm;
+		goto err_put;
 
 	ret = devm_snd_soc_register_component(dev, &s1402x_component,
 					      s1402x_dais,
 					      ARRAY_SIZE(s1402x_dais));
 	if (ret)
-		goto err_pm;
+		goto err_put;
+
+	/*
+	 * Downstream firmware keeps the mixer MMIO window accessible through
+	 * LPASS.  Runtime suspend is only safe when a power domain is attached
+	 * here and can restore that window before the clocks are enabled.  Keep
+	 * the initial runtime PM reference otherwise; nested users still balance
+	 * their own references around it.
+	 */
+	if (!dev->pm_domain) {
+		s1402x->runtime_pm_held = true;
+		dev_warn(dev,
+			 "audio power domain unavailable; keeping mixer active\n");
+	} else {
+		pm_runtime_mark_last_busy(dev);
+		pm_runtime_put_autosuspend(dev);
+	}
 
 	return 0;
 
+err_put:
+	pm_runtime_put_noidle(dev);
 err_pm:
 	pm_runtime_disable(dev);
 	if (!pm_runtime_status_suspended(dev))
@@ -1021,10 +1038,36 @@ err_pm:
 static void s1402x_remove(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct s1402x_priv *s1402x = platform_get_drvdata(pdev);
+
+	if (s1402x->runtime_pm_held) {
+		pm_runtime_put_noidle(dev);
+		s1402x->runtime_pm_held = false;
+	}
 
 	pm_runtime_disable(dev);
 	if (!pm_runtime_status_suspended(dev))
 		s1402x_runtime_suspend(dev);
+}
+
+static int s1402x_suspend(struct device *dev)
+{
+	struct s1402x_priv *s1402x = dev_get_drvdata(dev);
+
+	if (s1402x->runtime_pm_held)
+		return 0;
+
+	return pm_runtime_force_suspend(dev);
+}
+
+static int s1402x_resume(struct device *dev)
+{
+	struct s1402x_priv *s1402x = dev_get_drvdata(dev);
+
+	if (s1402x->runtime_pm_held)
+		return 0;
+
+	return pm_runtime_force_resume(dev);
 }
 
 static const struct of_device_id s1402x_of_match[] = {
@@ -1035,7 +1078,7 @@ MODULE_DEVICE_TABLE(of, s1402x_of_match);
 
 static const struct dev_pm_ops s1402x_pm_ops = {
 	SET_RUNTIME_PM_OPS(s1402x_runtime_suspend, s1402x_runtime_resume, NULL)
-	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+	SET_SYSTEM_SLEEP_PM_OPS(s1402x_suspend, s1402x_resume)
 };
 
 static struct platform_driver s1402x_driver = {
