@@ -286,7 +286,6 @@
 &hsi2c0 {
 	#address-cells = <1>;
 	#size-cells = <0>;
-	clock-frequency = <2500000>;
 
 	status = "okay";
 
