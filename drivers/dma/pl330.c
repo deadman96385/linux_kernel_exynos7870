@@ -1947,6 +1947,8 @@ static int dmac_alloc_resources(struct pl330_dmac *pl330)
 
 static int pl330_add(struct pl330_dmac *pl330)
 {
+	struct device_node *np = pl330->ddma.dev->of_node;
+	u32 expected;
 	int i, ret;
 
 	/* Check if we can handle this DMAC */
@@ -1958,6 +1960,29 @@ static int pl330_add(struct pl330_dmac *pl330)
 
 	/* Read the configuration of the DMAC */
 	read_dmac_config(pl330);
+
+	/*
+	 * Some integrations describe the implemented channel and request counts.
+	 * Treat those values as a probe-time sanity check instead of registering a
+	 * controller whose configuration registers were read while it was still in
+	 * reset. A zero-filled configuration can otherwise survive probe and fault
+	 * later when a client releases the unusable channel.
+	 */
+	if (np && !of_property_read_u32(np, "dma-channels", &expected) &&
+	    pl330->pcfg.num_chan != expected) {
+		dev_err(pl330->ddma.dev,
+			"configuration reports %u channels, expected %u\n",
+			pl330->pcfg.num_chan, expected);
+		return -ENODEV;
+	}
+
+	if (np && !of_property_read_u32(np, "dma-requests", &expected) &&
+	    pl330->pcfg.num_peri != expected) {
+		dev_err(pl330->ddma.dev,
+			"configuration reports %u peripheral requests, expected %u\n",
+			pl330->pcfg.num_peri, expected);
+		return -ENODEV;
+	}
 
 	if (pl330->pcfg.num_events == 0) {
 		dev_err(pl330->ddma.dev, "%s:%d Can't work without events!\n",
@@ -3057,9 +3082,17 @@ pl330_probe(struct amba_device *adev, const struct amba_id *id)
 	if (IS_ERR(pl330->rstc)) {
 		return dev_err_probe(&adev->dev, PTR_ERR(pl330->rstc), "Failed to get reset!\n");
 	} else {
-		ret = reset_control_deassert(pl330->rstc);
+		/*
+		 * Exynos7870 ADMA requires an active-high reset pulse before its
+		 * PrimeCell configuration registers become valid. Prefer the reset
+		 * controller's pulse operation and retain deassert-only behavior for
+		 * older reset providers that do not implement it.
+		 */
+		ret = reset_control_reset(pl330->rstc);
+		if (ret == -ENOTSUPP)
+			ret = reset_control_deassert(pl330->rstc);
 		if (ret) {
-			dev_err(&adev->dev, "Couldn't deassert the device from reset!\n");
+			dev_err(&adev->dev, "Couldn't reset the device!\n");
 			return ret;
 		}
 	}
