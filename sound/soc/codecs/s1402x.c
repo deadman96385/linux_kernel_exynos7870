@@ -868,10 +868,57 @@ static const struct snd_kcontrol_new s1402x_controls[] = {
 	SOC_ENUM("ALC Noise Gate En", s1402x_noise_gate),
 };
 
+static unsigned int s1402x_component_read(struct snd_soc_component *component,
+					  unsigned int reg)
+{
+	struct s1402x_priv *s1402x = snd_soc_component_get_drvdata(component);
+	unsigned int val = 0;
+	int ret;
+
+	ret = pm_runtime_resume_and_get(s1402x->dev);
+	if (ret < 0) {
+		dev_err_ratelimited(s1402x->dev,
+				    "failed to power mixer for register read: %d\n",
+				    ret);
+		return 0;
+	}
+
+	ret = regmap_read(s1402x->regmap, reg, &val);
+	pm_runtime_mark_last_busy(s1402x->dev);
+	pm_runtime_put_autosuspend(s1402x->dev);
+	if (ret) {
+		dev_err_ratelimited(s1402x->dev,
+				    "failed to read register %#x: %d\n", reg,
+				    ret);
+		return 0;
+	}
+
+	return val;
+}
+
+static int s1402x_component_write(struct snd_soc_component *component,
+				   unsigned int reg, unsigned int val)
+{
+	struct s1402x_priv *s1402x = snd_soc_component_get_drvdata(component);
+	int ret;
+
+	ret = pm_runtime_resume_and_get(s1402x->dev);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_write(s1402x->regmap, reg, val);
+	pm_runtime_mark_last_busy(s1402x->dev);
+	pm_runtime_put_autosuspend(s1402x->dev);
+
+	return ret;
+}
+
 static const struct snd_soc_component_driver s1402x_component = {
 	.name = "s1402x",
 	.controls = s1402x_controls,
 	.num_controls = ARRAY_SIZE(s1402x_controls),
+	.read = s1402x_component_read,
+	.write = s1402x_component_write,
 	.endianness = 1,
 };
 
