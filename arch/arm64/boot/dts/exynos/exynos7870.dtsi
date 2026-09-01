@@ -922,6 +922,8 @@
 				 <&cmu_dispaud CLK_DOUT_DISPAUD_MI2S>,
 				 <&cmu_dispaud CLK_DOUT_DISPAUD_MI2S>;
 			clock-names = "iis", "pclk", "i2s_opclk0", "i2s_opclk1";
+			resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_AMP>;
+			reset-names = "i2s";
 			power-domains = <&pd_dispaud>;
 			#clock-cells = <1>;
 			#sound-dai-cells = <1>;
