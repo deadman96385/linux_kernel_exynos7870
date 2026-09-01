@@ -286,7 +286,8 @@
 &hsi2c0 {
 	#address-cells = <1>;
 	#size-cells = <0>;
-	clock-frequency = <2500000>;
+	/* Use standard mode to isolate the failing high-speed transaction path. */
+	clock-frequency = <100000>;
 
 	status = "okay";
 
