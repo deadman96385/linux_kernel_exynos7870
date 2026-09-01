@@ -1151,20 +1151,15 @@ static int s1402x_probe(struct platform_device *pdev)
 		goto err_put;
 
 	/*
-	 * Runtime gating the mixer relies on the DISPAUD power domain to
-	 * restore the shared MMIO clock path before the mixer clocks are
-	 * enabled.  The PMU fallback only controls the power sequencer, so keep
-	 * the initial runtime PM reference until a power domain is attached.
-	 * Nested mixer users still balance their own runtime PM references.
+	 * DISPAUD is shared by the mixer, I2S and its runtime-PM-aware clock
+	 * provider.  Keep the initial reference until coordinated domain
+	 * collapse is safe for every member.  In particular, dropping it here
+	 * can make the clock provider suspend synchronously while the mixer is
+	 * still tearing down its clocks.  Nested mixer users still balance
+	 * their own runtime PM references.
 	 */
-	if (s1402x->pmu_power_fallback) {
-		s1402x->runtime_pm_held = true;
-		dev_warn(dev,
-			 "DISPAUD power domain unavailable; keeping mixer active\n");
-	} else {
-		pm_runtime_mark_last_busy(dev);
-		pm_runtime_put_autosuspend(dev);
-	}
+	s1402x->runtime_pm_held = true;
+	dev_info(dev, "keeping shared DISPAUD domain active\n");
 
 	return 0;
 
