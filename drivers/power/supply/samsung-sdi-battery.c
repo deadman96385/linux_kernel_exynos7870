@@ -924,6 +924,7 @@ int samsung_sdi_battery_get_info(struct device *dev,
 				 struct power_supply_battery_info **info)
 {
 	struct samsung_sdi_battery *batt;
+	struct power_supply_battery_info *copy;
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(samsung_sdi_batteries); i++) {
@@ -935,10 +936,56 @@ int samsung_sdi_battery_get_info(struct device *dev,
 	if (i == ARRAY_SIZE(samsung_sdi_batteries))
 		return -ENODEV;
 
-	*info = &batt->info;
+	/*
+	 * power_supply_get_battery_info() returns device-managed data and its
+	 * callers release it with power_supply_put_battery_info().  Keep the
+	 * compiled-in tables immutable, but give each caller an owned copy of
+	 * every field that the put helper frees.
+	 */
+	copy = devm_kmemdup(dev, &batt->info, sizeof(*copy), GFP_KERNEL);
+	if (!copy)
+		return -ENOMEM;
+
+	for (i = 0; i < POWER_SUPPLY_OCV_TEMP_MAX; i++)
+		copy->ocv_table[i] = NULL;
+	copy->resist_table = NULL;
+
+	for (i = 0; i < POWER_SUPPLY_OCV_TEMP_MAX; i++) {
+		if (!batt->info.ocv_table[i])
+			continue;
+
+		copy->ocv_table[i] = devm_kmemdup(dev,
+						  batt->info.ocv_table[i],
+						  batt->info.ocv_table_size[i] *
+						  sizeof(*batt->info.ocv_table[i]),
+						  GFP_KERNEL);
+		if (!copy->ocv_table[i])
+			goto err_free;
+	}
+
+	if (batt->info.resist_table) {
+		copy->resist_table = devm_kmemdup(dev,
+						  batt->info.resist_table,
+						  batt->info.resist_table_size *
+						  sizeof(*batt->info.resist_table),
+						  GFP_KERNEL);
+		if (!copy->resist_table)
+			goto err_free;
+	}
+
+	*info = copy;
 	dev_info(dev, "Samsung SDI %s battery %d mAh\n",
 		 batt->name, batt->info.charge_full_design_uah / 1000);
 
 	return 0;
+
+err_free:
+	for (i = 0; i < POWER_SUPPLY_OCV_TEMP_MAX; i++)
+		if (copy->ocv_table[i])
+			devm_kfree(dev, copy->ocv_table[i]);
+	if (copy->resist_table)
+		devm_kfree(dev, copy->resist_table);
+	devm_kfree(dev, copy);
+	return -ENOMEM;
 }
 EXPORT_SYMBOL_GPL(samsung_sdi_battery_get_info);
