@@ -9,6 +9,7 @@
 #include <linux/clk-provider.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 
 #include <dt-bindings/clock/samsung,exynos7870-cmu.h>
 
@@ -1010,6 +1011,7 @@ static const struct samsung_cmu_info dispaud_cmu_info __initconst = {
 	.clk_regs		= dispaud_clk_regs,
 	.nr_clk_regs		= ARRAY_SIZE(dispaud_clk_regs),
 	.nr_clk_ids		= DISPAUD_NR_CLK,
+	.clk_name		= "bus",
 };
 
 /*
@@ -1781,10 +1783,34 @@ static int __init exynos7870_cmu_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 
 	info = of_device_get_match_data(dev);
+	if (info == &dispaud_cmu_info)
+		return exynos_arm64_register_cmu_pm(pdev, true);
+
 	exynos_arm64_register_cmu(dev, dev->of_node, info);
 
 	return 0;
 }
+
+static int exynos7870_cmu_suspend(struct device *dev)
+{
+	if (!dev_get_drvdata(dev))
+		return 0;
+
+	return exynos_arm64_cmu_suspend(dev);
+}
+
+static int exynos7870_cmu_resume(struct device *dev)
+{
+	if (!dev_get_drvdata(dev))
+		return 0;
+
+	return exynos_arm64_cmu_resume(dev);
+}
+
+static const struct dev_pm_ops exynos7870_cmu_pm_ops = {
+	SET_RUNTIME_PM_OPS(exynos7870_cmu_suspend, exynos7870_cmu_resume, NULL)
+	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+};
 
 static const struct of_device_id exynos7870_cmu_of_match[] = {
 	{
@@ -1817,6 +1843,7 @@ static struct platform_driver exynos7870_cmu_driver __refdata = {
 		.name = "exynos7870-cmu",
 		.of_match_table = exynos7870_cmu_of_match,
 		.suppress_bind_attrs = true,
+		.pm = &exynos7870_cmu_pm_ops,
 	},
 	.probe = exynos7870_cmu_probe,
 };
