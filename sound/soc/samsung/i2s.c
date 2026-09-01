@@ -1569,10 +1569,36 @@ static int samsung_i2s_probe(struct platform_device *pdev)
 	if (ret < 0)
 		goto err_disable_pm;
 
-	priv->op_clk = clk_get_parent(priv->clk_table[CLK_I2S_RCLK_SRC]);
+	if (priv->clk_table[CLK_I2S_RCLK_SRC]) {
+		const char *op_clk_name;
+		u32 mod;
+
+		mod = readl(priv->addr + I2SMOD);
+		op_clk_name = mod & BIT(priv->variant_regs->rclksrc_off) ?
+				      "i2s_opclk1" : "i2s_opclk0";
+		priv->op_clk = clk_get(&pdev->dev, op_clk_name);
+		if (IS_ERR(priv->op_clk)) {
+			ret = dev_err_probe(&pdev->dev, PTR_ERR(priv->op_clk),
+					    "Failed to get operation clock\n");
+			priv->op_clk = NULL;
+			goto err_unregister_clocks;
+		}
+
+		ret = clk_prepare_enable(priv->op_clk);
+		if (ret) {
+			dev_err(&pdev->dev,
+				"Failed to enable operation clock: %d\n", ret);
+			goto err_put_op_clk;
+		}
+	}
 
 	return 0;
 
+err_put_op_clk:
+	clk_put(priv->op_clk);
+	priv->op_clk = NULL;
+err_unregister_clocks:
+	i2s_unregister_clock_provider(priv);
 err_disable_pm:
 	pm_runtime_disable(&pdev->dev);
 err_del_sec:
@@ -1597,6 +1623,8 @@ static void samsung_i2s_remove(struct platform_device *pdev)
 
 	i2s_unregister_clock_provider(priv);
 	i2s_delete_secondary_device(priv);
+	clk_disable_unprepare(priv->op_clk);
+	clk_put(priv->op_clk);
 	clk_disable_unprepare(priv->clk);
 	clk_disable_unprepare(priv->pclk);
 
