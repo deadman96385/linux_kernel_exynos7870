@@ -898,13 +898,12 @@
 
 &s1402x {
 	pinctrl-names = "default", "idle", "bt", "bt-idle";
-	pinctrl-0 = <&i2s_pmic_bus &i2s_bt_bus>;
-	pinctrl-1 = <&i2s_pmic_bus_idle &i2s_bt_bus_idle>;
+	pinctrl-0 = <&i2s_pmic_amp_bus &i2s_bt_bus>;
+	pinctrl-1 = <&i2s_pmic_amp_bus_idle &i2s_bt_bus_idle>;
 	pinctrl-2 = <&i2s_pmic_bus &i2s_amp_bus>;
 	pinctrl-3 = <&i2s_bt_bus_idle>;
 
 	samsung,bt-fm-combo;
-	samsung,bck4-mcko;
 
 	status = "okay";
 };

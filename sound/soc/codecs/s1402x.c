@@ -519,6 +519,7 @@ static int s1402x_hw_params(struct snd_pcm_substream *substream,
 			    struct snd_soc_dai *dai)
 {
 	struct s1402x_priv *s1402x = snd_soc_component_get_drvdata(dai->component);
+	unsigned int hq_mask = S1402X_MCKO_EN | S1402X_BCK4_MODE;
 	unsigned int bfs, dl, rate = params_rate(params);
 	int ret = 0;
 
@@ -537,6 +538,19 @@ static int s1402x_hw_params(struct snd_pcm_substream *substream,
 
 	switch (dai->id) {
 	case S1402X_DAI_AP0:
+		/*
+		 * The board wiring, not a restored userspace mixer state, owns the
+		 * BCK4 pin function.  Reassert it with MCKO enable whenever the
+		 * primary stream is configured so stale alsactl state cannot silently
+		 * change the physical codec clock interface after probe.
+		 */
+		ret = regmap_update_bits(s1402x->regmap, S1402X_HQ_CTL,
+					 hq_mask, S1402X_MCKO_EN |
+					 (s1402x->bck4_mcko ?
+					  S1402X_BCK4_MODE : 0));
+		if (ret)
+			return ret;
+
 		ret = regmap_update_bits(s1402x->regmap, S1402X_IN1_CTL2,
 					 S1402X_I2S_DL_MASK,
 					 dl << S1402X_I2S_DL_SHIFT);
