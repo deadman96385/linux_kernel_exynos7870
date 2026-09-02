@@ -209,10 +209,6 @@
 			sound-dai = <&i2s0 1>;
 		};
 
-		cpu-amp {
-			sound-dai = <&i2s1 0>;
-		};
-
 		mixer {
 			sound-dai = <&s1402x S1402X_DAI_AP0>;
 		};
@@ -553,7 +549,11 @@
 };
 
 &i2s1 {
-	status = "okay";
+	/*
+	 * The AP1 amplifier capture interface currently aborts on its I2SMOD
+	 * register.  It is independent of the primary COD3026X playback path.
+	 */
+	status = "disabled";
 };
 
 &i2c0 {
