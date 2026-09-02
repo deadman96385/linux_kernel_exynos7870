@@ -7,6 +7,7 @@
  * Copyright (C) 2013 Sony Mobile Communications Inc.
  */
 
+#include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
@@ -60,7 +61,66 @@ struct tfa989x {
 	const struct tfa989x_rev *rev;
 	struct regulator *vddd_supply;
 	struct gpio_desc *rcv_gpiod;
+	struct regmap *regmap;
 };
+
+static void tfa989x_log_state(struct device *dev, struct regmap *regmap,
+			      const char *phase)
+{
+	static const unsigned int regs[] = {
+		TFA989X_STATUSREG, TFA989X_BATTERYVOLTAGE,
+		TFA989X_TEMPERATURE, TFA989X_REVISIONNUMBER,
+		TFA989X_I2SREG, TFA989X_BAT_PROT, TFA989X_AUDIO_CTR,
+		TFA989X_DCDCBOOST, TFA989X_SPKR_CALIBRATION,
+		TFA989X_SYS_CTRL, TFA989X_I2S_SEL_REG,
+		TFA989X_PWM_CONTROL, TFA989X_CURRENTSENSE1,
+		TFA989X_CURRENTSENSE2, TFA989X_CURRENTSENSE3,
+		TFA989X_CURRENTSENSE4,
+	};
+	unsigned int val[ARRAY_SIZE(regs)] = {};
+	int i, ret = 0;
+
+	/* Read the hardware, not the non-volatile regcache, for diagnostics. */
+	regcache_cache_bypass(regmap, true);
+	for (i = 0; i < ARRAY_SIZE(regs); i++) {
+		ret = regmap_read(regmap, regs[i], &val[i]);
+		if (ret)
+			break;
+	}
+	regcache_cache_bypass(regmap, false);
+
+	if (ret) {
+		dev_err(dev, "audio-debug %s register %#x read failed: %d\n",
+			phase, regs[i], ret);
+		return;
+	}
+
+	dev_info(dev,
+		 "audio-debug %s status=%#04x battery=%#04x temp=%#04x rev=%#04x i2s=%#04x\n",
+		 phase, val[0], val[1], val[2], val[3], val[4]);
+	dev_info(dev,
+		 "audio-debug %s batprot=%#04x audio=%#04x dcdc=%#04x spkcal=%#04x sys=%#04x\n",
+		 phase, val[5], val[6], val[7], val[8], val[9]);
+	dev_info(dev,
+		 "audio-debug %s i2ssel=%#04x pwm=%#04x cs=%#04x/%#04x/%#04x/%#04x\n",
+		 phase, val[10], val[11], val[12], val[13], val[14], val[15]);
+}
+
+static int tfa989x_ampe_event(struct snd_soc_dapm_widget *w,
+			      struct snd_kcontrol *kcontrol, int event)
+{
+	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
+	struct tfa989x *tfa989x = snd_soc_component_get_drvdata(component);
+
+	if (event == SND_SOC_DAPM_POST_PMU)
+		usleep_range(5000, 5500);
+
+	tfa989x_log_state(component->dev, tfa989x->regmap,
+			  event == SND_SOC_DAPM_POST_PMU ?
+			  "power-up" : "power-down");
+
+	return 0;
+}
 
 static bool tfa989x_writeable_reg(struct device *dev, unsigned int reg)
 {
@@ -88,7 +148,9 @@ static const struct snd_kcontrol_new chsa_mux = SOC_DAPM_ENUM("Amp Input", chsa_
 static const struct snd_soc_dapm_widget tfa989x_dapm_widgets[] = {
 	SND_SOC_DAPM_OUTPUT("OUT"),
 	SND_SOC_DAPM_SUPPLY("POWER", TFA989X_SYS_CTRL, TFA989X_SYS_CTRL_PWDN, 1, NULL, 0),
-	SND_SOC_DAPM_OUT_DRV("AMPE", TFA989X_SYS_CTRL, TFA989X_SYS_CTRL_AMPE, 0, NULL, 0),
+	SND_SOC_DAPM_OUT_DRV_E("AMPE", TFA989X_SYS_CTRL, TFA989X_SYS_CTRL_AMPE,
+			       0, NULL, 0, tfa989x_ampe_event,
+			       SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD),
 
 	SND_SOC_DAPM_MUX("Amp Input", SND_SOC_NOPM, 0, 0, &chsa_mux),
 	SND_SOC_DAPM_AIF_IN("AIFINL", "HiFi Playback", 0, SND_SOC_NOPM, 0, 0),
@@ -160,15 +222,20 @@ static int tfa989x_hw_params(struct snd_pcm_substream *substream,
 			     struct snd_soc_dai *dai)
 {
 	struct snd_soc_component *component = dai->component;
-	int sr;
+	struct tfa989x *tfa989x = snd_soc_component_get_drvdata(component);
+	int ret, sr;
 
 	sr = tfa989x_find_sample_rate(params_rate(params));
 	if (sr < 0)
 		return sr;
 
-	return snd_soc_component_update_bits(component, TFA989X_I2SREG,
-					     TFA989X_I2SREG_I2SSR_MSK,
-					     sr << TFA989X_I2SREG_I2SSR);
+	ret = snd_soc_component_update_bits(component, TFA989X_I2SREG,
+					    TFA989X_I2SREG_I2SSR_MSK,
+					    sr << TFA989X_I2SREG_I2SSR);
+	if (!ret)
+		tfa989x_log_state(component->dev, tfa989x->regmap, "hw-params");
+
+	return ret;
 }
 
 static const struct snd_soc_dai_ops tfa989x_dai_ops = {
@@ -350,6 +417,7 @@ static int tfa989x_i2c_probe(struct i2c_client *i2c)
 	regmap = devm_regmap_init_i2c(i2c, &tfa989x_regmap);
 	if (IS_ERR(regmap))
 		return PTR_ERR(regmap);
+	tfa989x->regmap = regmap;
 
 	ret = regulator_enable(tfa989x->vddd_supply);
 	if (ret) {
