@@ -31,8 +31,8 @@ struct exynos7870_audio {
 	struct snd_soc_dai_link links[EXYNOS7870_NUM_LINKS];
 	struct snd_soc_dai_link_component cpus[EXYNOS7870_NUM_LINKS];
 	struct snd_soc_dai_link_component platforms[EXYNOS7870_NUM_LINKS];
-	struct snd_soc_dai_link_component primary_codecs[2];
-	struct snd_soc_dai_link_component secondary_codecs[2];
+	struct snd_soc_dai_link_component primary_codecs[3];
+	struct snd_soc_dai_link_component secondary_codecs[3];
 	struct snd_soc_dai_link_component amp_codecs[1];
 	struct snd_soc_dai_link_component voice_codecs[2];
 	struct snd_soc_dai_link_component bluetooth_codecs[1];
@@ -309,6 +309,7 @@ static void exynos7870_put_dai_nodes(void *data)
 	of_node_put(audio->cpus[EXYNOS7870_LINK_AMP].of_node);
 	of_node_put(audio->primary_codecs[0].of_node);
 	of_node_put(audio->primary_codecs[1].of_node);
+	of_node_put(audio->primary_codecs[2].of_node);
 }
 
 static void exynos7870_init_link(struct snd_soc_dai_link *link,
@@ -357,8 +358,10 @@ static int exynos7870_audio_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct exynos7870_audio *audio;
 	struct device_node *amp_node;
+	struct device_node *speaker_amp_node;
 	struct snd_soc_card *card;
-	bool has_amp;
+	bool has_amp, has_speaker_amp;
+	unsigned int num_primary_codecs;
 	int ret;
 
 	audio = devm_kzalloc(dev, sizeof(*audio), GFP_KERNEL);
@@ -398,46 +401,60 @@ static int exynos7870_audio_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_put_mixer;
 
+	speaker_amp_node = of_get_child_by_name(dev->of_node, "amplifier");
+	has_speaker_amp = !!speaker_amp_node;
+	of_node_put(speaker_amp_node);
+	if (has_speaker_amp) {
+		ret = exynos7870_parse_dai(dev, "amplifier",
+					   &audio->primary_codecs[2]);
+		if (ret)
+			goto err_put_codec;
+	}
+
 	audio->secondary_codecs[0] = audio->primary_codecs[0];
 	audio->secondary_codecs[1] = audio->primary_codecs[1];
+	audio->secondary_codecs[2] = audio->primary_codecs[2];
+	num_primary_codecs = has_speaker_amp ?
+		ARRAY_SIZE(audio->primary_codecs) :
+		ARRAY_SIZE(audio->primary_codecs) - 1;
 
 	if (has_amp) {
 		ret = exynos7870_derive_dai(dev, &audio->primary_codecs[0],
 					    S1402X_DAI_AP1,
 					    &audio->amp_codecs[0], "mixer AP1");
 		if (ret)
-			goto err_put_codec;
+			goto err_put_speaker_amp;
 	}
 
 	ret = exynos7870_derive_dai(dev, &audio->primary_codecs[0],
 				    S1402X_DAI_CP0,
 				    &audio->voice_codecs[0], "mixer CP0");
 	if (ret)
-		goto err_put_codec;
+		goto err_put_speaker_amp;
 
 	ret = exynos7870_derive_dai(dev, &audio->primary_codecs[1], 1,
 				    &audio->voice_codecs[1], "codec AIF2");
 	if (ret)
-		goto err_put_codec;
+		goto err_put_speaker_amp;
 
 	ret = exynos7870_derive_dai(dev, &audio->primary_codecs[0],
 				    S1402X_DAI_BT,
 				    &audio->bluetooth_codecs[0], "mixer BT");
 	if (ret)
-		goto err_put_codec;
+		goto err_put_speaker_amp;
 
 	ret = exynos7870_derive_dai(dev, &audio->primary_codecs[0],
 				    S1402X_DAI_FM,
 				    &audio->fm_codecs[0], "mixer FM");
 	if (ret)
-		goto err_put_codec;
+		goto err_put_speaker_amp;
 	audio->fm_codecs[1] = audio->primary_codecs[1];
 
 	ret = exynos7870_derive_dai(dev, &audio->primary_codecs[0],
 				    S1402X_DAI_CP1,
 				    &audio->cp_amp_codecs[0], "mixer CP1");
 	if (ret)
-		goto err_put_codec;
+		goto err_put_speaker_amp;
 
 	ret = devm_add_action_or_reset(dev, exynos7870_put_dai_nodes, audio);
 	if (ret)
@@ -464,7 +481,7 @@ static int exynos7870_audio_probe(struct platform_device *pdev)
 			     &audio->cpus[EXYNOS7870_LINK_PRIMARY],
 			     &audio->platforms[EXYNOS7870_LINK_PRIMARY],
 			     audio->primary_codecs,
-			     ARRAY_SIZE(audio->primary_codecs));
+			     num_primary_codecs);
 	audio->links[EXYNOS7870_LINK_PRIMARY].init = exynos7870_link_init;
 	audio->links[EXYNOS7870_LINK_PRIMARY].exit = exynos7870_link_exit;
 
@@ -473,7 +490,7 @@ static int exynos7870_audio_probe(struct platform_device *pdev)
 			     &audio->cpus[EXYNOS7870_LINK_SECONDARY],
 			     &audio->platforms[EXYNOS7870_LINK_SECONDARY],
 			     audio->secondary_codecs,
-			     ARRAY_SIZE(audio->secondary_codecs));
+			     num_primary_codecs);
 	if (has_amp) {
 		exynos7870_init_link(&audio->links[EXYNOS7870_LINK_AMP],
 				     "Amplifier",
@@ -540,6 +557,8 @@ static int exynos7870_audio_probe(struct platform_device *pdev)
 		return ret;
 
 	return devm_snd_soc_register_card(dev, card);
+err_put_speaker_amp:
+	of_node_put(audio->primary_codecs[2].of_node);
 err_put_codec:
 	of_node_put(audio->primary_codecs[1].of_node);
 err_put_mixer:

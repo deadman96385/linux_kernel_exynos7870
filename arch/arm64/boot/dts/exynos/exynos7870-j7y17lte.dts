@@ -193,7 +193,7 @@
 		audio-routing =
 			"Headphone", "HPOUTLN",
 			"Earpiece", "EPOUTN",
-			"Speaker", "SPKOUTLN",
+			"Speaker", "Speaker Amp OUT",
 			"IN1L", "Main Mic",
 			"Main Mic", "MICBIAS1",
 			"IN2L", "Sub Mic",
@@ -215,6 +215,10 @@
 
 		codec {
 			sound-dai = <&cod3026x 0>;
+		};
+
+		amplifier {
+			sound-dai = <&speaker_amp>;
 		};
 	};
 
@@ -581,6 +585,20 @@
 		pinctrl-0 = <&fuel_irq>;
 
 		monitored-battery = <&battery>;
+	};
+};
+
+&i2c3 {
+	samsung,i2c-sda-delay = <100>;
+	samsung,i2c-max-bus-freq = <400000>;
+	status = "okay";
+
+	speaker_amp: audio-codec@34 {
+		compatible = "nxp,tfa9890";
+		reg = <0x34>;
+		vddd-supply = <&vdd_buck5>;
+		sound-name-prefix = "Speaker Amp";
+		#sound-dai-cells = <0>;
 	};
 };
 
