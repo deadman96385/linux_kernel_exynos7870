@@ -138,6 +138,13 @@ properties:
       Internal DMA register base address of the audio
       subsystem (used in secondary sound source).
 
+  samsung,audio-mixer:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      S1402X mixer which initializes and supplies the shared Exynos7870 audio
+      island. The operating-system device link orders I2S register access after
+      mixer initialization and keeps the mixer active while I2S is active.
+
   power-domains:
     maxItems: 1
 
@@ -160,6 +167,16 @@ required:
 
 allOf:
   - $ref: dai-common.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - samsung,exynos7870-i2s
+              - samsung,exynos7870-i2s1
+    then:
+      required:
+        - samsung,audio-mixer
   - if:
       properties:
         compatible:

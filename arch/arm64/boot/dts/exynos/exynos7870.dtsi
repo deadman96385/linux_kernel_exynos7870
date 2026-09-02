@@ -894,6 +894,7 @@
 		i2s0: i2s@148a0000 {
 			compatible = "samsung,exynos7870-i2s";
 			reg = <0x148a0000 0x100>;
+			samsung,audio-mixer = <&s1402x>;
 			interrupts = <GIC_SPI 69 IRQ_TYPE_LEVEL_HIGH>;
 			dmas = <&adma 0>, <&adma 2>, <&adma 1>;
 			dma-names = "tx", "rx", "tx-sec";
@@ -914,6 +915,7 @@
 		i2s1: i2s@148b0000 {
 			compatible = "samsung,exynos7870-i2s1";
 			reg = <0x148b0000 0x100>;
+			samsung,audio-mixer = <&s1402x>;
 			interrupts = <GIC_SPI 71 IRQ_TYPE_LEVEL_HIGH>;
 			dmas = <&adma 3>;
 			dma-names = "rx";

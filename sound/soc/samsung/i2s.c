@@ -14,6 +14,7 @@
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
 
@@ -1393,6 +1394,36 @@ static void i2s_delete_secondary_device(struct samsung_i2s_priv *priv)
 	priv->pdev_sec = NULL;
 }
 
+static int samsung_i2s_add_mixer_link(struct device *dev)
+{
+	struct platform_device *mixer_pdev;
+	struct device_node *mixer_np;
+	struct device_link *link;
+	u32 flags = DL_FLAG_PM_RUNTIME | DL_FLAG_RPM_ACTIVE |
+		    DL_FLAG_AUTOREMOVE_CONSUMER;
+
+	mixer_np = of_parse_phandle(dev->of_node, "samsung,audio-mixer", 0);
+	if (!mixer_np)
+		return 0;
+
+	mixer_pdev = of_find_device_by_node(mixer_np);
+	of_node_put(mixer_np);
+	if (!mixer_pdev)
+		return -EPROBE_DEFER;
+
+	if (!device_is_bound(&mixer_pdev->dev)) {
+		put_device(&mixer_pdev->dev);
+		return -EPROBE_DEFER;
+	}
+
+	link = device_link_add(dev, &mixer_pdev->dev, flags);
+	put_device(&mixer_pdev->dev);
+	if (!link)
+		return -ENOMEM;
+
+	return 0;
+}
+
 static int samsung_i2s_probe(struct platform_device *pdev)
 {
 	struct i2s_dai *pri_dai, *sec_dai = NULL;
@@ -1407,6 +1438,11 @@ static int samsung_i2s_probe(struct platform_device *pdev)
 
 	if (IS_ENABLED(CONFIG_OF) && pdev->dev.of_node) {
 		i2s_dai_data = of_device_get_match_data(&pdev->dev);
+
+		ret = samsung_i2s_add_mixer_link(&pdev->dev);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret,
+					     "waiting for audio mixer\n");
 	} else {
 		id = platform_get_device_id(pdev);
 
