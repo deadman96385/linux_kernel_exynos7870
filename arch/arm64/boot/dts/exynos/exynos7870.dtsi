@@ -879,8 +879,9 @@
 			compatible = "arm,pl330", "arm,primecell";
 			reg = <0x14890000 0x1000>;
 			interrupts = <GIC_SPI 73 IRQ_TYPE_LEVEL_HIGH>;
-			clocks = <&cmu_dispaud CLK_GOUT_DISPAUD_APB_AUD_AMP>;
-			clock-names = "apb_pclk";
+			clocks = <&cmu_dispaud CLK_GOUT_DISPAUD_APB_AUD_AMP>,
+				 <&cmu_dispaud CLK_GOUT_DISPAUD_MI2S_AMP_I2SCODCLKI>;
+			clock-names = "apb_pclk", "core";
 			memory-region = <&adma_mcode>;
 			resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_ADMA>;
 			reset-names = "dma";

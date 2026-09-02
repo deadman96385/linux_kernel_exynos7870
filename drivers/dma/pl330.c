@@ -506,6 +506,7 @@ struct pl330_dmac {
 	int quirks;
 
 	struct dentry		*dbgfs;
+	struct clk		*core_clk;
 	struct reset_control	*rstc;
 	struct reset_control	*rstc_ocp;
 };
@@ -3026,17 +3027,38 @@ static inline void deinit_pl330_debugfs(struct pl330_dmac *pl330)
 }
 #endif
 
-/*
- * Runtime PM callbacks are provided by amba/bus.c driver.
- *
- * It is assumed here that IRQ safe runtime PM is chosen in probe and amba
- * bus driver will only disable/enable the clock in runtime PM callbacks.
- */
+static int __maybe_unused pl330_runtime_suspend(struct device *dev)
+{
+	struct pl330_dmac *pl330 = dev_get_drvdata(dev);
+
+	if (pl330->core_clk)
+		clk_disable(pl330->core_clk);
+
+	return 0;
+}
+
+static int __maybe_unused pl330_runtime_resume(struct device *dev)
+{
+	struct pl330_dmac *pl330 = dev_get_drvdata(dev);
+
+	if (pl330->core_clk)
+		return clk_enable(pl330->core_clk);
+
+	return 0;
+}
+
 static int __maybe_unused pl330_suspend(struct device *dev)
 {
 	struct amba_device *pcdev = to_amba_device(dev);
+	struct pl330_dmac *pl330 = dev_get_drvdata(dev);
+	int ret;
 
-	pm_runtime_force_suspend(dev);
+	ret = pm_runtime_force_suspend(dev);
+	if (ret)
+		return ret;
+
+	if (pl330->core_clk)
+		clk_unprepare(pl330->core_clk);
 	clk_unprepare(pcdev->pclk);
 
 	return 0;
@@ -3045,18 +3067,35 @@ static int __maybe_unused pl330_suspend(struct device *dev)
 static int __maybe_unused pl330_resume(struct device *dev)
 {
 	struct amba_device *pcdev = to_amba_device(dev);
+	struct pl330_dmac *pl330 = dev_get_drvdata(dev);
 	int ret;
 
 	ret = clk_prepare(pcdev->pclk);
 	if (ret)
 		return ret;
 
-	pm_runtime_force_resume(dev);
+	if (pl330->core_clk) {
+		ret = clk_prepare(pl330->core_clk);
+		if (ret)
+			goto err_unprepare_pclk;
+	}
 
+	ret = pm_runtime_force_resume(dev);
+	if (ret)
+		goto err_unprepare_core;
+
+	return 0;
+
+err_unprepare_core:
+	if (pl330->core_clk)
+		clk_unprepare(pl330->core_clk);
+err_unprepare_pclk:
+	clk_unprepare(pcdev->pclk);
 	return ret;
 }
 
 static const struct dev_pm_ops pl330_pm = {
+	SET_RUNTIME_PM_OPS(pl330_runtime_suspend, pl330_runtime_resume, NULL)
 	SET_LATE_SYSTEM_SLEEP_PM_OPS(pl330_suspend, pl330_resume)
 };
 
@@ -3098,9 +3137,28 @@ pl330_probe(struct amba_device *adev, const struct amba_id *id)
 
 	amba_set_drvdata(adev, pl330);
 
+	/*
+	 * Some integrations have a functional clock in addition to the AMBA
+	 * APB clock.  Keep it prepared for IRQ-safe runtime PM and enable it
+	 * before reset or register access.
+	 */
+	pl330->core_clk = devm_clk_get_optional_prepared(&adev->dev, "core");
+	if (IS_ERR(pl330->core_clk))
+		return dev_err_probe(&adev->dev, PTR_ERR(pl330->core_clk),
+				     "Failed to get core clock\n");
+
+	if (pl330->core_clk) {
+		ret = clk_enable(pl330->core_clk);
+		if (ret)
+			return dev_err_probe(&adev->dev, ret,
+					     "Failed to enable core clock\n");
+	}
+
 	pl330->rstc = devm_reset_control_get_optional(&adev->dev, "dma");
 	if (IS_ERR(pl330->rstc)) {
-		return dev_err_probe(&adev->dev, PTR_ERR(pl330->rstc), "Failed to get reset!\n");
+		ret = dev_err_probe(&adev->dev, PTR_ERR(pl330->rstc),
+				    "Failed to get reset!\n");
+		goto probe_err_clk;
 	} else {
 		/*
 		 * Exynos7870 ADMA requires an active-high reset pulse before its
@@ -3113,19 +3171,20 @@ pl330_probe(struct amba_device *adev, const struct amba_id *id)
 			ret = reset_control_deassert(pl330->rstc);
 		if (ret) {
 			dev_err(&adev->dev, "Couldn't reset the device!\n");
-			return ret;
+			goto probe_err_clk;
 		}
 	}
 
 	pl330->rstc_ocp = devm_reset_control_get_optional(&adev->dev, "dma-ocp");
 	if (IS_ERR(pl330->rstc_ocp)) {
-		return dev_err_probe(&adev->dev, PTR_ERR(pl330->rstc_ocp),
-				     "Failed to get OCP reset!\n");
+		ret = dev_err_probe(&adev->dev, PTR_ERR(pl330->rstc_ocp),
+				    "Failed to get OCP reset!\n");
+		goto probe_err_clk;
 	} else {
 		ret = reset_control_deassert(pl330->rstc_ocp);
 		if (ret) {
 			dev_err(&adev->dev, "Couldn't deassert the device from OCP reset!\n");
-			return ret;
+			goto probe_err_clk;
 		}
 	}
 
@@ -3136,7 +3195,7 @@ pl330_probe(struct amba_device *adev, const struct amba_id *id)
 					       pl330_irq_handler, 0,
 					       dev_name(&adev->dev), pl330);
 			if (ret)
-				return ret;
+				goto probe_err_clk;
 		} else {
 			break;
 		}
@@ -3147,7 +3206,7 @@ pl330_probe(struct amba_device *adev, const struct amba_id *id)
 	pcfg->periph_id = adev->periphid;
 	ret = pl330_add(pl330);
 	if (ret)
-		return ret;
+		goto probe_err_clk;
 
 	INIT_LIST_HEAD(&pl330->desc_pool);
 	spin_lock_init(&pl330->pool_lock);
@@ -3267,6 +3326,9 @@ probe_err2:
 
 	if (pl330->rstc)
 		reset_control_assert(pl330->rstc);
+probe_err_clk:
+	if (pl330->core_clk)
+		clk_disable(pl330->core_clk);
 	return ret;
 }
 
@@ -3312,6 +3374,9 @@ static void pl330_remove(struct amba_device *adev)
 
 	if (pl330->rstc)
 		reset_control_assert(pl330->rstc);
+
+	if (pl330->core_clk)
+		clk_disable(pl330->core_clk);
 }
 
 static const struct amba_id pl330_ids[] = {
