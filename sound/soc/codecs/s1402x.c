@@ -612,6 +612,31 @@ static int s1402x_hw_params(struct snd_pcm_substream *substream,
 	if (!ret && s1402x->active_streams == 1)
 		s1402x_reset_data(s1402x);
 
+	if (!ret) {
+		unsigned int rst = 0, in1ctl1 = 0, in1ctl2 = 0, in1ctl3 = 0;
+		unsigned int dig = 0, dmix1 = 0, dmix2 = 0, dout1 = 0;
+		unsigned int dout2 = 0, hq = 0;
+
+		regmap_read(s1402x->regmap, S1402X_SOFT_RSTB, &rst);
+		regmap_read(s1402x->regmap, S1402X_IN1_CTL1, &in1ctl1);
+		regmap_read(s1402x->regmap, S1402X_IN1_CTL2, &in1ctl2);
+		regmap_read(s1402x->regmap, S1402X_IN1_CTL3, &in1ctl3);
+		regmap_read(s1402x->regmap, S1402X_DIG_EN, &dig);
+		regmap_read(s1402x->regmap, S1402X_DMIX1, &dmix1);
+		regmap_read(s1402x->regmap, S1402X_DMIX2, &dmix2);
+		regmap_read(s1402x->regmap, S1402X_DOUTMX1, &dout1);
+		regmap_read(s1402x->regmap, S1402X_DOUTMX2, &dout2);
+		regmap_read(s1402x->regmap, S1402X_HQ_CTL, &hq);
+		dev_info(s1402x->dev,
+			 "audio-debug hw_params dai=%d rate=%u bfs=%u root=%luHz dout=%luHz mixer=%luHz rst=%#x in1=%#x/%#x/%#x dig=%#x dmix=%#x/%#x doutmx=%#x/%#x hq=%#x\n",
+			 dai->id, rate, bfs,
+			 clk_get_rate(clk_get_parent(s1402x->clks[S1402X_CLK_DOUT].clk)),
+			 clk_get_rate(s1402x->clks[S1402X_CLK_DOUT].clk),
+			 clk_get_rate(s1402x->clks[S1402X_CLK_MIXER].clk),
+			 rst, in1ctl1, in1ctl2, in1ctl3, dig, dmix1, dmix2,
+			 dout1, dout2, hq);
+	}
+
 	return ret;
 }
 

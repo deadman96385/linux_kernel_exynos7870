@@ -821,6 +821,7 @@ static int cod3026x_output_event(struct snd_soc_dapm_widget *widget,
 	struct cod3026x_priv *cod3026x =
 		snd_soc_component_get_drvdata(component);
 	unsigned int chop = 0, gain = 0, mix = 0;
+	unsigned int pwauto = 0, dig = 0, fmt = 0, vol = 0, spks = 0;
 	bool hp, ep, spk;
 
 	regmap_read(cod3026x->regmap, COD3026X_CHOP_DA, &chop);
@@ -966,6 +967,16 @@ static int cod3026x_output_event(struct snd_soc_dapm_widget *widget,
 					   COD3026X_SPK_MIX_DACL |
 					   COD3026X_SPK_MIX_DACR, 0);
 		}
+		regmap_read(cod3026x->regmap, COD3026X_CHOP_DA, &chop);
+		regmap_read(cod3026x->regmap, COD3026X_MIX_DA2, &mix);
+		regmap_read(cod3026x->regmap, COD3026X_PWAUTO_DA, &pwauto);
+		regmap_read(cod3026x->regmap, COD3026X_DIGITAL_POWER, &dig);
+		regmap_read(cod3026x->regmap, COD3026X_FORMAT, &fmt);
+		regmap_read(cod3026x->regmap, COD3026X_VOL_EP_SPK, &vol);
+		regmap_read(cod3026x->regmap, COD3026X_CTRL_SPKS1, &spks);
+		dev_info(cod3026x->dev,
+			 "audio-debug speaker event=%#x chop=%#x mix=%#x pwauto=%#x dig=%#x fmt=%#x vol=%#x spks=%#x\n",
+			 event, chop, mix, pwauto, dig, fmt, vol, spks);
 		break;
 	}
 
