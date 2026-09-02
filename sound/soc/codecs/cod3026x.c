@@ -524,6 +524,16 @@ static const struct snd_kcontrol_new cod3026x_controls[] = {
 	SOC_ENUM("MonoMix Mode", cod3026x_monomix),
 	SOC_ENUM("Chargepump Mode", cod3026x_chargepump),
 	SOC_SINGLE("DAC Soft Mute", COD3026X_DAC1, 1, 1, 1),
+#ifdef CONFIG_SND_DEBUG
+	SOC_SINGLE("Debug Digital Loopback Select", COD3026X_TEST,
+		   COD3026X_TEST_LOOPSEL_DIG_SHIFT, 3, 0),
+	SOC_SINGLE("Debug Digital Loopback Switch", COD3026X_TEST,
+		   COD3026X_TEST_LOOPBACK_DIG_SHIFT, 1, 0),
+	SOC_SINGLE("Debug Full Loopback Select", COD3026X_TEST,
+		   COD3026X_TEST_LOOPSEL_FULL_SHIFT, 3, 0),
+	SOC_SINGLE("Debug Full Loopback Switch", COD3026X_TEST,
+		   COD3026X_TEST_LOOPBACK_FULL_SHIFT, 1, 0),
+#endif
 };
 
 static void cod3026x_adc_unmute_work(struct work_struct *work)
@@ -822,6 +832,7 @@ static int cod3026x_output_event(struct snd_soc_dapm_widget *widget,
 		snd_soc_component_get_drvdata(component);
 	unsigned int chop = 0, gain = 0, mix = 0;
 	unsigned int pwauto = 0, dig = 0, fmt = 0, vol = 0, spks = 0;
+	unsigned int pdref = 0, pdda1 = 0, pdda3 = 0, test = 0;
 	bool hp, ep, spk;
 
 	regmap_read(cod3026x->regmap, COD3026X_CHOP_DA, &chop);
@@ -974,9 +985,14 @@ static int cod3026x_output_event(struct snd_soc_dapm_widget *widget,
 		regmap_read(cod3026x->regmap, COD3026X_FORMAT, &fmt);
 		regmap_read(cod3026x->regmap, COD3026X_VOL_EP_SPK, &vol);
 		regmap_read(cod3026x->regmap, COD3026X_CTRL_SPKS1, &spks);
+		regmap_read(cod3026x->regmap, COD3026X_PD_REF, &pdref);
+		regmap_read(cod3026x->regmap, COD3026X_PD_DA1, &pdda1);
+		regmap_read(cod3026x->regmap, COD3026X_PD_DA3, &pdda3);
+		regmap_read(cod3026x->regmap, COD3026X_TEST, &test);
 		dev_info(cod3026x->dev,
-			 "audio-debug speaker event=%#x chop=%#x mix=%#x pwauto=%#x dig=%#x fmt=%#x vol=%#x spks=%#x\n",
-			 event, chop, mix, pwauto, dig, fmt, vol, spks);
+			 "audio-debug speaker event=%#x chop=%#x mix=%#x pwauto=%#x dig=%#x fmt=%#x vol=%#x spks=%#x pd=%#x/%#x/%#x test=%#x\n",
+			 event, chop, mix, pwauto, dig, fmt, vol, spks,
+			 pdref, pdda1, pdda3, test);
 		break;
 	}
 
