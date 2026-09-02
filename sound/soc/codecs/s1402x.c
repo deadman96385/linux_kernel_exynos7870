@@ -24,8 +24,19 @@
 #define S1402X_SYSCLK_48KHZ	24576100
 #define S1402X_SYSCLK_192KHZ	49152100
 #define S1402X_AUTOSUSPEND_MS	500
-#define S1402X_NUM_CLKS		8
 #define S1402X_NUM_RESETS	3
+
+enum s1402x_clk_id {
+	S1402X_CLK_AP_BCLK,
+	S1402X_CLK_BT_BCLK,
+	S1402X_CLK_CP_BCLK,
+	S1402X_CLK_FM_BCLK,
+	S1402X_CLK_MIXER,
+	S1402X_CLK_DOUT,
+	S1402X_CLK_APB,
+	S1402X_CLK_AUDIO_APB,
+	S1402X_NUM_CLKS,
+};
 
 #define S1402X_PMU_GPIO_MODE_AUD			0x1340
 #define S1402X_PMU_DISPAUD_SYS_PWR		0x1404
@@ -532,7 +543,7 @@ static int s1402x_hw_params(struct snd_pcm_substream *substream,
 		if (ret)
 			return ret;
 		if (rate == 192000) {
-			ret = clk_set_rate(s1402x->clks[0].clk,
+			ret = clk_set_rate(s1402x->clks[S1402X_CLK_DOUT].clk,
 					   S1402X_SYSCLK_192KHZ);
 			if (!ret)
 				ret = regmap_update_bits(s1402x->regmap,
@@ -540,7 +551,7 @@ static int s1402x_hw_params(struct snd_pcm_substream *substream,
 							 S1402X_HQ_EN,
 							 S1402X_HQ_EN);
 		} else if (rate == 48000) {
-			ret = clk_set_rate(s1402x->clks[0].clk,
+			ret = clk_set_rate(s1402x->clks[S1402X_CLK_DOUT].clk,
 					   S1402X_SYSCLK_48KHZ);
 			if (!ret)
 				ret = regmap_update_bits(s1402x->regmap,
@@ -551,7 +562,8 @@ static int s1402x_hw_params(struct snd_pcm_substream *substream,
 		}
 		break;
 	case S1402X_DAI_CP0:
-		ret = clk_set_rate(s1402x->clks[0].clk, S1402X_SYSCLK_48KHZ);
+		ret = clk_set_rate(s1402x->clks[S1402X_CLK_DOUT].clk,
+				   S1402X_SYSCLK_48KHZ);
 		if (!ret)
 			ret = regmap_update_bits(s1402x->regmap, S1402X_IN2_CTL2,
 						 S1402X_I2S_DL_MASK,
@@ -570,7 +582,7 @@ static int s1402x_hw_params(struct snd_pcm_substream *substream,
 						 (rate == 8000 ? 0 : 1) <<
 						 S1402X_MPCM_SRATE_SHIFT);
 		if (!ret)
-			ret = clk_set_rate(s1402x->clks[0].clk,
+			ret = clk_set_rate(s1402x->clks[S1402X_CLK_DOUT].clk,
 					   S1402X_SYSCLK_48KHZ);
 		break;
 	case S1402X_DAI_AMP:
@@ -1085,14 +1097,14 @@ static int s1402x_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	s1402x->dev = dev;
-	s1402x->clks[0].id = "ap-bclk";
-	s1402x->clks[1].id = "bt-bclk";
-	s1402x->clks[2].id = "cp-bclk";
-	s1402x->clks[3].id = "fm-bclk";
-	s1402x->clks[4].id = "mixer";
-	s1402x->clks[5].id = "dout";
-	s1402x->clks[6].id = "apb";
-	s1402x->clks[7].id = "audio-apb";
+	s1402x->clks[S1402X_CLK_AP_BCLK].id = "ap-bclk";
+	s1402x->clks[S1402X_CLK_BT_BCLK].id = "bt-bclk";
+	s1402x->clks[S1402X_CLK_CP_BCLK].id = "cp-bclk";
+	s1402x->clks[S1402X_CLK_FM_BCLK].id = "fm-bclk";
+	s1402x->clks[S1402X_CLK_MIXER].id = "mixer";
+	s1402x->clks[S1402X_CLK_DOUT].id = "dout";
+	s1402x->clks[S1402X_CLK_APB].id = "apb";
+	s1402x->clks[S1402X_CLK_AUDIO_APB].id = "audio-apb";
 	mutex_init(&s1402x->stream_lock);
 	platform_set_drvdata(pdev, s1402x);
 
