@@ -193,6 +193,7 @@
 		audio-routing =
 			"Headphone", "HPOUTLN",
 			"Earpiece", "EPOUTN",
+			"Speaker", "SPKOUTLN",
 			"Speaker", "Speaker Amp OUT",
 			"IN1L", "Main Mic",
 			"Main Mic", "MICBIAS1",
@@ -560,6 +561,12 @@
 };
 
 &i2s1 {
+	/*
+	 * The mixer holds the shared DISPAUD domain active.  Attaching this
+	 * secondary receiver as another genpd consumer makes its APB bridge
+	 * inaccessible before the driver can read I2SMOD on this board.
+	 */
+	/delete-property/ power-domains;
 	status = "okay";
 };
 
