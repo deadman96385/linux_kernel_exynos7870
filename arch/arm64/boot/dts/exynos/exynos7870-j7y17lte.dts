@@ -210,10 +210,6 @@
 			sound-dai = <&i2s0 1>;
 		};
 
-		cpu-amp {
-			sound-dai = <&i2s1 0>;
-		};
-
 		mixer {
 			sound-dai = <&s1402x S1402X_DAI_AP0>;
 		};
@@ -562,12 +558,11 @@
 
 &i2s1 {
 	/*
-	 * The mixer holds the shared DISPAUD domain active.  Attaching this
-	 * secondary receiver as another genpd consumer makes its APB bridge
-	 * inaccessible before the driver can read I2SMOD on this board.
+	 * The external speaker amplifier is fed by the primary playback path.
+	 * Leave this auxiliary capture/feedback interface off until its APB
+	 * bridge can be brought up independently without aborting on I2SMOD.
 	 */
-	/delete-property/ power-domains;
-	status = "okay";
+	status = "disabled";
 };
 
 &i2c0 {
