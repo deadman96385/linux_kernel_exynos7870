@@ -44,6 +44,9 @@ properties:
 
   cpu-amp:
     type: object
+    description:
+      Optional auxiliary AP amplifier link. Boards whose primary speaker path
+      is provided by the COD3026X codec can omit this link.
     additionalProperties: false
     properties:
       sound-dai:
@@ -78,7 +81,6 @@ required:
   - audio-routing
   - cpu
   - cpu-secondary
-  - cpu-amp
   - mixer
   - codec
 
