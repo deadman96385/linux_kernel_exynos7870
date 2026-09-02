@@ -49,6 +49,7 @@ struct s1402x_priv {
 	struct regmap *pmu;
 	struct clk_bulk_data clks[S1402X_NUM_CLKS];
 	struct reset_control *reset;
+	struct reset_control *i2s_reset;
 	struct pinctrl *pinctrl;
 	struct pinctrl_state *pins_default;
 	struct pinctrl_state *pins_idle;
@@ -328,6 +329,19 @@ static int s1402x_runtime_resume(struct device *dev)
 	if (ret)
 		goto err_alive;
 	dev_info(dev, "runtime resume: clocks complete\n");
+
+	/*
+	 * Exynos7870 has a second, active-low reset for the shared I2S core in
+	 * the LPASS register block.  Samsung's downstream LPASS driver pulses
+	 * it after the audio domain and clocks are enabled.  Both I2S
+	 * controllers depend on this initialization, so do it here before
+	 * their device links allow either controller to probe.
+	 */
+	dev_info(dev, "runtime resume: LPASS I2S reset begin\n");
+	ret = reset_control_reset(s1402x->i2s_reset);
+	if (ret)
+		goto err_reset;
+	dev_info(dev, "runtime resume: LPASS I2S reset complete\n");
 
 	dev_info(dev, "runtime resume: default pins begin\n");
 	s1402x_select_state(s1402x, s1402x->pins_default);
@@ -1098,6 +1112,11 @@ static int s1402x_probe(struct platform_device *pdev)
 	if (IS_ERR(s1402x->reset))
 		return dev_err_probe(dev, PTR_ERR(s1402x->reset),
 				     "failed to get reset\n");
+
+	s1402x->i2s_reset = devm_reset_control_get_exclusive(dev, "i2s-core");
+	if (IS_ERR(s1402x->i2s_reset))
+		return dev_err_probe(dev, PTR_ERR(s1402x->i2s_reset),
+				     "failed to get LPASS I2S reset\n");
 
 	s1402x->pmu = syscon_regmap_lookup_by_phandle(dev->of_node,
 						      "samsung,pmu-syscon");

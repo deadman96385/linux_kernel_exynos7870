@@ -140,6 +140,13 @@ static const struct reset_simple_devdata reset_simple_exynos7870_dispaud = {
 	.reset_us = 100,
 };
 
+static const struct reset_simple_devdata reset_simple_exynos7870_lpass = {
+	.nr_resets = 12,
+	.active_low = true,
+	.status_active_low = true,
+	.reset_us = 100,
+};
+
 static const struct of_device_id reset_simple_dt_ids[] = {
 	{ .compatible = "altr,stratix10-rst-mgr",
 		.data = &reset_simple_socfpga },
@@ -164,6 +171,8 @@ static const struct of_device_id reset_simple_dt_ids[] = {
 		.data = &reset_simple_active_low },
 	{ .compatible = "samsung,exynos7870-dispaud-reset",
 		.data = &reset_simple_exynos7870_dispaud },
+	{ .compatible = "samsung,exynos7870-lpass-reset",
+		.data = &reset_simple_exynos7870_lpass },
 	{ /* sentinel */ },
 };
 

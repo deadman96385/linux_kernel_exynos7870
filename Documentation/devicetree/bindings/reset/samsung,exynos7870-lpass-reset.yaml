@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/reset/samsung,exynos7870-lpass-reset.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Samsung Exynos7870 Low Power Audio Subsystem Reset Controller
+
+maintainers:
+  - Sean Hoyt <seanhoyt963@gmail.com>
+
+description:
+  The Exynos7870 LPASS core software reset register contains active-low reset
+  bits for the audio DMA, memory, timer, I2S, PCM, UART, and Slimbus blocks.
+
+properties:
+  compatible:
+    const: samsung,exynos7870-lpass-reset
+
+  reg:
+    maxItems: 1
+
+  '#reset-cells':
+    const: 1
+
+  reset-controller: true
+
+required:
+  - compatible
+  - reg
+  - '#reset-cells'
+
+additionalProperties: false
+
+examples:
+  - |
+    reset-controller@148f0008 {
+        compatible = "samsung,exynos7870-lpass-reset";
+        reg = <0x148f0008 0x4>;
+        #reset-cells = <1>;
+    };
