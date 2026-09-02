@@ -25,7 +25,7 @@
 #define S1402X_SYSCLK_192KHZ	49152100
 #define S1402X_AUTOSUSPEND_MS	500
 #define S1402X_NUM_CLKS		8
-#define S1402X_NUM_RESETS	4
+#define S1402X_NUM_RESETS	3
 
 #define S1402X_PMU_GPIO_MODE_AUD			0x1340
 #define S1402X_PMU_DISPAUD_SYS_PWR		0x1404
@@ -292,10 +292,9 @@ static int s1402x_pulse_resets(struct s1402x_priv *s1402x)
 	int ret;
 
 	/*
-	 * Match the Exynos7870 LPASS power-on sequence exactly.  These are
-	 * active-high bits in DISPAUD_CFG, and the amplifier must be reset
-	 * before the shared I2S block.  Owning all four resets here also avoids
-	 * child probes resetting one another after the audio island is live.
+	 * These are active-high bits in DISPAUD_CFG, and the amplifier must be
+	 * reset before the shared I2S block.  ADMA owns its reset so its PrimeCell
+	 * configuration registers are valid independently of mixer probe order.
 	 */
 	for (i = 0; i < ARRAY_SIZE(s1402x->resets); i++) {
 		dev_info(s1402x->dev, "runtime resume: %s reset pulse begin\n",
@@ -1078,7 +1077,7 @@ static int s1402x_probe(struct platform_device *pdev)
 	unsigned int i;
 	int ret;
 	static const char * const reset_names[] = {
-		"mixer", "amplifier", "i2s", "dma",
+		"mixer", "amplifier", "i2s",
 	};
 
 	s1402x = devm_kzalloc(dev, sizeof(*s1402x), GFP_KERNEL);
