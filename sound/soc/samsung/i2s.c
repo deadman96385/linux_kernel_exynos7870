@@ -950,6 +950,22 @@ static int i2s_trigger(struct snd_pcm_substream *substream,
 			else
 				i2s_txctrl(i2s, 1);
 		}
+		dev_info(&i2s->pdev->dev,
+			 "audio-debug start dai=%d stream=%s src=%luHz frame=%uHz rfs=%u bfs=%u CON=%#010x MOD=%#010x FIC=%#010x PSR=%#010x\n",
+			 i2s->drv->id, capture ? "capture" : "playback",
+			 priv->rclk_srcrate, i2s->frmclk, i2s->rfs, i2s->bfs,
+			 readl_relaxed(priv->addr + I2SCON),
+			 readl_relaxed(priv->addr + I2SMOD),
+			 readl_relaxed(priv->addr + I2SFIC),
+			 readl_relaxed(priv->addr + I2SPSR));
+		dev_info(&i2s->pdev->dev,
+			 "audio-debug start FICS=%#010x AHB=%#010x STR0=%#010x SIZE=%#010x TRNCNT=%#010x VER=%#010x\n",
+			 readl_relaxed(priv->addr + I2SFICS),
+			 readl_relaxed(priv->addr + I2SAHB),
+			 readl_relaxed(priv->addr + I2SSTR0),
+			 readl_relaxed(priv->addr + I2SSIZE),
+			 readl_relaxed(priv->addr + I2STRNCNT),
+			 readl_relaxed(priv->addr + I2SVER));
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
@@ -963,6 +979,14 @@ static int i2s_trigger(struct snd_pcm_substream *substream,
 				i2s_fifo(i2s, FIC_TXFLUSH);
 			}
 		}
+		dev_info(&i2s->pdev->dev,
+			 "audio-debug stop dai=%d stream=%s CON=%#010x MOD=%#010x FIC=%#010x PSR=%#010x AHB=%#010x\n",
+			 i2s->drv->id, capture ? "capture" : "playback",
+			 readl_relaxed(priv->addr + I2SCON),
+			 readl_relaxed(priv->addr + I2SMOD),
+			 readl_relaxed(priv->addr + I2SFIC),
+			 readl_relaxed(priv->addr + I2SPSR),
+			 readl_relaxed(priv->addr + I2SAHB));
 		pm_runtime_put(dai->dev);
 		break;
 	}
@@ -1783,13 +1807,13 @@ static const struct samsung_i2s_dai_data i2sv5_dai_type_i2s1 __maybe_unused = {
 static const struct samsung_i2s_dai_data exynos7870_i2s_dai_type = {
 	.quirks = QUIRK_PRI_6CHAN | QUIRK_SEC_DAI | QUIRK_NEED_RSTCLR,
 	.pcm_rates = SNDRV_PCM_RATE_8000_192000,
-	.i2s_variant_regs = &i2sv5_i2s1_regs,
+	.i2s_variant_regs = &i2sv3_regs,
 };
 
 static const struct samsung_i2s_dai_data exynos7870_i2s1_dai_type = {
 	.quirks = QUIRK_PRI_6CHAN | QUIRK_NEED_RSTCLR,
 	.pcm_rates = SNDRV_PCM_RATE_8000_192000,
-	.i2s_variant_regs = &i2sv5_i2s1_regs,
+	.i2s_variant_regs = &i2sv3_regs,
 };
 
 static const struct samsung_i2s_dai_data fsd_dai_type __maybe_unused = {
