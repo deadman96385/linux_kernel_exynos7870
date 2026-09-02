@@ -25,6 +25,7 @@
 #define S1402X_SYSCLK_192KHZ	49152100
 #define S1402X_AUTOSUSPEND_MS	500
 #define S1402X_NUM_CLKS		8
+#define S1402X_NUM_RESETS	4
 
 #define S1402X_PMU_GPIO_MODE_AUD			0x1340
 #define S1402X_PMU_DISPAUD_SYS_PWR		0x1404
@@ -48,8 +49,7 @@ struct s1402x_priv {
 	struct regmap *regmap;
 	struct regmap *pmu;
 	struct clk_bulk_data clks[S1402X_NUM_CLKS];
-	struct reset_control *reset;
-	struct reset_control *i2s_reset;
+	struct reset_control_bulk_data resets[S1402X_NUM_RESETS];
 	struct pinctrl *pinctrl;
 	struct pinctrl_state *pins_default;
 	struct pinctrl_state *pins_idle;
@@ -286,17 +286,30 @@ static int s1402x_set_mixer_alive(struct s1402x_priv *s1402x, bool active)
 				  active ? 0 : S1402X_PMU_MIXER_ALIVE);
 }
 
-static int s1402x_pulse_system_reset(struct s1402x_priv *s1402x)
+static int s1402x_pulse_resets(struct s1402x_priv *s1402x)
 {
+	unsigned int i;
 	int ret;
 
-	ret = reset_control_assert(s1402x->reset);
-	if (ret)
-		return ret;
+	/*
+	 * Match the Exynos7870 LPASS power-on sequence exactly.  These are
+	 * active-high bits in DISPAUD_CFG, and the amplifier must be reset
+	 * before the shared I2S block.  Owning all four resets here also avoids
+	 * child probes resetting one another after the audio island is live.
+	 */
+	for (i = 0; i < ARRAY_SIZE(s1402x->resets); i++) {
+		dev_info(s1402x->dev, "runtime resume: %s reset pulse begin\n",
+			 s1402x->resets[i].id);
+		ret = reset_control_reset(s1402x->resets[i].rstc);
+		if (ret)
+			return dev_err_probe(s1402x->dev, ret,
+					     "failed to pulse %s reset\n",
+					     s1402x->resets[i].id);
+		dev_info(s1402x->dev, "runtime resume: %s reset pulse complete\n",
+			 s1402x->resets[i].id);
+	}
 
-	usleep_range(100, 200);
-
-	return reset_control_deassert(s1402x->reset);
+	return 0;
 }
 
 static int s1402x_runtime_resume(struct device *dev)
@@ -311,13 +324,6 @@ static int s1402x_runtime_resume(struct device *dev)
 				     "failed to power on DISPAUD domain\n");
 	dev_info(dev, "runtime resume: DISPAUD power complete\n");
 
-	dev_info(dev, "runtime resume: system reset pulse begin\n");
-	ret = s1402x_pulse_system_reset(s1402x);
-	if (ret)
-		return dev_err_probe(dev, ret,
-				     "failed to pulse mixer system reset\n");
-	dev_info(dev, "runtime resume: system reset pulse complete\n");
-
 	dev_info(dev, "runtime resume: mixer path begin\n");
 	ret = s1402x_set_mixer_alive(s1402x, true);
 	if (ret)
@@ -330,18 +336,11 @@ static int s1402x_runtime_resume(struct device *dev)
 		goto err_alive;
 	dev_info(dev, "runtime resume: clocks complete\n");
 
-	/*
-	 * Exynos7870 has a second, active-low reset for the shared I2S core in
-	 * the LPASS register block.  Samsung's downstream LPASS driver pulses
-	 * it after the audio domain and clocks are enabled.  Both I2S
-	 * controllers depend on this initialization, so do it here before
-	 * their device links allow either controller to probe.
-	 */
-	dev_info(dev, "runtime resume: LPASS I2S reset begin\n");
-	ret = reset_control_reset(s1402x->i2s_reset);
+	dev_info(dev, "runtime resume: DISPAUD reset sequence begin\n");
+	ret = s1402x_pulse_resets(s1402x);
 	if (ret)
 		goto err_reset;
-	dev_info(dev, "runtime resume: LPASS I2S reset complete\n");
+	dev_info(dev, "runtime resume: DISPAUD reset sequence complete\n");
 
 	dev_info(dev, "runtime resume: default pins begin\n");
 	s1402x_select_state(s1402x, s1402x->pins_default);
@@ -1076,7 +1075,11 @@ static int s1402x_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct s1402x_priv *s1402x;
 	void __iomem *base;
+	unsigned int i;
 	int ret;
+	static const char * const reset_names[] = {
+		"mixer", "amplifier", "i2s", "dma",
+	};
 
 	s1402x = devm_kzalloc(dev, sizeof(*s1402x), GFP_KERNEL);
 	if (!s1402x)
@@ -1108,15 +1111,13 @@ static int s1402x_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to get clocks\n");
 
-	s1402x->reset = devm_reset_control_get_exclusive(dev, "mixer");
-	if (IS_ERR(s1402x->reset))
-		return dev_err_probe(dev, PTR_ERR(s1402x->reset),
-				     "failed to get reset\n");
-
-	s1402x->i2s_reset = devm_reset_control_get_exclusive(dev, "i2s-core");
-	if (IS_ERR(s1402x->i2s_reset))
-		return dev_err_probe(dev, PTR_ERR(s1402x->i2s_reset),
-				     "failed to get LPASS I2S reset\n");
+	for (i = 0; i < ARRAY_SIZE(s1402x->resets); i++)
+		s1402x->resets[i].id = reset_names[i];
+	ret = devm_reset_control_bulk_get_exclusive(dev,
+						    ARRAY_SIZE(s1402x->resets),
+						    s1402x->resets);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to get DISPAUD resets\n");
 
 	s1402x->pmu = syscon_regmap_lookup_by_phandle(dev->of_node,
 						      "samsung,pmu-syscon");
@@ -1147,10 +1148,6 @@ static int s1402x_probe(struct platform_device *pdev)
 	s1402x->pins_fm_idle = s1402x_lookup_state(s1402x, "fm-idle");
 
 	regcache_cache_only(s1402x->regmap, true);
-	ret = reset_control_assert(s1402x->reset);
-	if (ret)
-		return dev_err_probe(dev, ret, "failed to assert reset\n");
-
 	pm_runtime_set_autosuspend_delay(dev, S1402X_AUTOSUSPEND_MS);
 	pm_runtime_use_autosuspend(dev);
 	pm_runtime_set_suspended(dev);
@@ -1189,7 +1186,6 @@ err_pm:
 	pm_runtime_disable(dev);
 	if (!pm_runtime_status_suspended(dev))
 		s1402x_runtime_suspend(dev);
-	reset_control_assert(s1402x->reset);
 	return ret;
 }
 
@@ -1206,7 +1202,6 @@ static void s1402x_remove(struct platform_device *pdev)
 	pm_runtime_disable(dev);
 	if (!pm_runtime_status_suspended(dev))
 		s1402x_runtime_suspend(dev);
-	reset_control_assert(s1402x->reset);
 }
 
 static int s1402x_suspend(struct device *dev)

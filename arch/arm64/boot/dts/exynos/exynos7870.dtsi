@@ -9,7 +9,6 @@
 #include <dt-bindings/clock/samsung,exynos7870-cmu.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/reset/samsung,exynos7870-dispaud.h>
-#include <dt-bindings/reset/samsung,exynos7870-lpass.h>
 
 / {
 	compatible = "samsung,exynos7870";
@@ -866,8 +865,10 @@
 				      "fm-bclk", "mixer", "dout", "apb",
 				      "audio-apb";
 			resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_MIXER>,
-				 <&lpass_reset EXYNOS7870_LPASS_RESET_I2S>;
-			reset-names = "mixer", "i2s-core";
+				 <&dispaud_reset EXYNOS7870_DISPAUD_RESET_AMP>,
+				 <&dispaud_reset EXYNOS7870_DISPAUD_RESET_I2S>,
+				 <&dispaud_reset EXYNOS7870_DISPAUD_RESET_ADMA>;
+			reset-names = "mixer", "amplifier", "i2s", "dma";
 			power-domains = <&pd_dispaud>;
 			samsung,pmu-syscon = <&pmu_system_controller>;
 			#sound-dai-cells = <1>;
@@ -882,8 +883,6 @@
 			clocks = <&cmu_dispaud CLK_GOUT_DISPAUD_APB_AUD_AMP>;
 			clock-names = "apb_pclk";
 			memory-region = <&adma_mcode>;
-			resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_ADMA>;
-			reset-names = "dma";
 			power-domains = <&pd_dispaud>;
 			dma-channels = <4>;
 			dma-requests = <4>;
@@ -905,8 +904,6 @@
 				 <&cmu_dispaud CLK_DOUT_DISPAUD_MI2S>,
 				 <&cmu_dispaud CLK_DOUT_DISPAUD_MI2S>;
 			clock-names = "iis", "pclk", "i2s_opclk0", "i2s_opclk1";
-			resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_I2S>;
-			reset-names = "i2s";
 			power-domains = <&pd_dispaud>;
 			#clock-cells = <1>;
 			#sound-dai-cells = <1>;
@@ -926,8 +923,6 @@
 				 <&cmu_dispaud CLK_DOUT_DISPAUD_MI2S>,
 				 <&cmu_dispaud CLK_DOUT_DISPAUD_MI2S>;
 			clock-names = "iis", "pclk", "i2s_opclk0", "i2s_opclk1";
-			resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_AMP>;
-			reset-names = "i2s";
 			power-domains = <&pd_dispaud>;
 			#clock-cells = <1>;
 			#sound-dai-cells = <1>;
@@ -952,12 +947,6 @@
 				 <&cmu_mif CLK_GOUT_MIF_CMU_DISPAUD_BUS>,
 				 <&cmu_mif CLK_GOUT_MIF_CMU_DISPAUD_DECON_ECLK>,
 				 <&cmu_mif CLK_GOUT_MIF_CMU_DISPAUD_DECON_VCLK>;
-		};
-
-		lpass_reset: reset-controller@148f0008 {
-			compatible = "samsung,exynos7870-lpass-reset";
-			reg = <0x148f0008 0x4>;
-			#reset-cells = <1>;
 		};
 
 		dispaud_reset: reset-controller@148f1000 {
