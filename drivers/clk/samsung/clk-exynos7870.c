@@ -842,10 +842,15 @@ static const struct samsung_fixed_rate_clock dispaud_fixed_clks[] __initconst = 
 	FRATE(0, "frat_dispaud_mipiphy_txbyteclkhs", NULL, 0, 188000000),
 };
 
+static const struct samsung_pll_rate_table dispaud_aud_pll_rates[] __initconst = {
+	PLL_36XX_RATE(26 * MHZ, 98304003U, 91, 3, 3, -16898),
+	{ },
+};
+
 static const struct samsung_pll_clock dispaud_pll_clks[] __initconst = {
-	PLL(pll_1417x, CLK_FOUT_DISPAUD_AUD_PLL, "fout_dispaud_aud_pll",
+	PLL(pll_1431x, CLK_FOUT_DISPAUD_AUD_PLL, "fout_dispaud_aud_pll",
 	    "oscclk", PLL_LOCKTIME_DISPAUD_AUD_PLL, PLL_CON0_DISPAUD_AUD_PLL,
-	    NULL),
+	    dispaud_aud_pll_rates),
 	PLL(pll_1417x, CLK_FOUT_DISPAUD_PLL, "fout_dispaud_pll", "oscclk",
 	    PLL_LOCKTIME_DISPAUD_PLL, PLL_CON0_DISPAUD_PLL, NULL),
 };

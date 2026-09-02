@@ -268,6 +268,11 @@
 				 <&cmu_g3d CLK_GOUT_G3D_MUX_SWITCH_USER>;
 };
 
+&cmu_dispaud {
+	assigned-clocks = <&cmu_dispaud CLK_FOUT_DISPAUD_AUD_PLL>;
+	assigned-clock-rates = <98304003>;
+};
+
 &cmu_mif {
 	assigned-clocks = <&cmu_mif CLK_DOUT_MIF_CMU_G3D_SWITCH>;
 	assigned-clock-rates = <799500000>;

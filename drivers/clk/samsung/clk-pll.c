@@ -317,6 +317,7 @@ static const struct clk_ops samsung_pll35xx_clk_min_ops = {
 
 #define PLL36XX_KDIV_MASK	(0xFFFF)
 #define PLL36XX_MDIV_MASK	(0x1FF)
+#define PLL1431X_MDIV_MASK	(0x3FF)
 #define PLL36XX_PDIV_MASK	(0x3F)
 #define PLL36XX_SDIV_MASK	(0x7)
 #define PLL36XX_MDIV_SHIFT	(16)
@@ -325,6 +326,12 @@ static const struct clk_ops samsung_pll35xx_clk_min_ops = {
 #define PLL36XX_KDIV_SHIFT	(0)
 #define PLL36XX_LOCK_STAT_SHIFT	(29)
 #define PLL36XX_ENABLE_SHIFT	(31)
+
+static u32 samsung_pll36xx_mdiv_mask(struct samsung_clk_pll *pll)
+{
+	return pll->type == pll_1431x ? PLL1431X_MDIV_MASK :
+		PLL36XX_MDIV_MASK;
+}
 
 static unsigned long samsung_pll36xx_recalc_rate(struct clk_hw *hw,
 				unsigned long parent_rate)
@@ -336,7 +343,8 @@ static unsigned long samsung_pll36xx_recalc_rate(struct clk_hw *hw,
 
 	pll_con0 = readl_relaxed(pll->con_reg);
 	pll_con1 = readl_relaxed(pll->con_reg + 4);
-	mdiv = (pll_con0 >> PLL36XX_MDIV_SHIFT) & PLL36XX_MDIV_MASK;
+	mdiv = (pll_con0 >> PLL36XX_MDIV_SHIFT) &
+		samsung_pll36xx_mdiv_mask(pll);
 	pdiv = (pll_con0 >> PLL36XX_PDIV_SHIFT) & PLL36XX_PDIV_MASK;
 	sdiv = (pll_con0 >> PLL36XX_SDIV_SHIFT) & PLL36XX_SDIV_MASK;
 	kdiv = (s16)(pll_con1 & PLL36XX_KDIV_MASK);
@@ -348,17 +356,20 @@ static unsigned long samsung_pll36xx_recalc_rate(struct clk_hw *hw,
 	return (unsigned long)fvco;
 }
 
-static inline bool samsung_pll36xx_mpk_change(
-	const struct samsung_pll_rate_table *rate, u32 pll_con0, u32 pll_con1)
+static inline bool
+samsung_pll36xx_mpk_change(struct samsung_clk_pll *pll,
+			   const struct samsung_pll_rate_table *rate,
+			   u32 pll_con0, u32 pll_con1)
 {
 	u32 old_mdiv, old_pdiv, old_kdiv;
 
-	old_mdiv = (pll_con0 >> PLL36XX_MDIV_SHIFT) & PLL36XX_MDIV_MASK;
+	old_mdiv = (pll_con0 >> PLL36XX_MDIV_SHIFT) &
+		samsung_pll36xx_mdiv_mask(pll);
 	old_pdiv = (pll_con0 >> PLL36XX_PDIV_SHIFT) & PLL36XX_PDIV_MASK;
 	old_kdiv = (pll_con1 >> PLL36XX_KDIV_SHIFT) & PLL36XX_KDIV_MASK;
 
 	return (rate->mdiv != old_mdiv || rate->pdiv != old_pdiv ||
-		rate->kdiv != old_kdiv);
+		(u16)rate->kdiv != old_kdiv);
 }
 
 static int samsung_pll36xx_set_rate(struct clk_hw *hw, unsigned long drate,
@@ -378,7 +389,7 @@ static int samsung_pll36xx_set_rate(struct clk_hw *hw, unsigned long drate,
 	pll_con0 = readl_relaxed(pll->con_reg);
 	pll_con1 = readl_relaxed(pll->con_reg + 4);
 
-	if (!(samsung_pll36xx_mpk_change(rate, pll_con0, pll_con1))) {
+	if (!(samsung_pll36xx_mpk_change(pll, rate, pll_con0, pll_con1))) {
 		/* If only s change, change just s value only*/
 		pll_con0 &= ~(PLL36XX_SDIV_MASK << PLL36XX_SDIV_SHIFT);
 		pll_con0 |= (rate->sdiv << PLL36XX_SDIV_SHIFT);
@@ -391,20 +402,35 @@ static int samsung_pll36xx_set_rate(struct clk_hw *hw, unsigned long drate,
 	writel_relaxed(rate->pdiv * PLL36XX_LOCK_FACTOR, pll->lock_reg);
 
 	 /* Change PLL PMS values */
-	pll_con0 &= ~((PLL36XX_MDIV_MASK << PLL36XX_MDIV_SHIFT) |
+	pll_con0 &= ~((samsung_pll36xx_mdiv_mask(pll) << PLL36XX_MDIV_SHIFT) |
 			(PLL36XX_PDIV_MASK << PLL36XX_PDIV_SHIFT) |
 			(PLL36XX_SDIV_MASK << PLL36XX_SDIV_SHIFT));
 	pll_con0 |= (rate->mdiv << PLL36XX_MDIV_SHIFT) |
 			(rate->pdiv << PLL36XX_PDIV_SHIFT) |
 			(rate->sdiv << PLL36XX_SDIV_SHIFT);
+	if (pll->type == pll_1431x) {
+		pll_con0 &= ~BIT(26);
+		pll_con0 |= BIT(5);
+	}
 	writel_relaxed(pll_con0, pll->con_reg);
 
 	pll_con1 &= ~(PLL36XX_KDIV_MASK << PLL36XX_KDIV_SHIFT);
-	pll_con1 |= rate->kdiv << PLL36XX_KDIV_SHIFT;
+	pll_con1 |= (u16)rate->kdiv << PLL36XX_KDIV_SHIFT;
 	writel_relaxed(pll_con1, pll->con_reg + 4);
 
-	if (pll_con0 & BIT(pll->enable_offs))
-		return samsung_pll_lock_wait(pll, BIT(pll->lock_offs));
+	if (pll_con0 & BIT(pll->enable_offs)) {
+		int ret = samsung_pll_lock_wait(pll, BIT(pll->lock_offs));
+
+		if (ret)
+			return ret;
+	}
+
+	if (pll->type == pll_1431x)
+		pr_info("%s: rate=%lu parent=%lu con0=%#010x con1=%#010x m=%u p=%u s=%u k=%d\n",
+			clk_hw_get_name(hw), drate, parent_rate,
+			readl_relaxed(pll->con_reg),
+			readl_relaxed(pll->con_reg + 4), rate->mdiv,
+			rate->pdiv, rate->sdiv, (s16)rate->kdiv);
 
 	return 0;
 }
@@ -1673,6 +1699,7 @@ static void __init _samsung_clk_register_pll(struct samsung_clk_provider *ctx,
 		break;
 	/* clk_ops for 36xx and 2650 are similar */
 	case pll_36xx:
+	case pll_1431x:
 	case pll_2650:
 		pll->enable_offs = PLL36XX_ENABLE_SHIFT;
 		pll->lock_offs = PLL36XX_LOCK_STAT_SHIFT;
