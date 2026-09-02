@@ -11,6 +11,7 @@
 #include <linux/cleanup.h>
 #include <linux/clk.h>
 #include <linux/clk-provider.h>
+#include <linux/clk-provider.h>
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -1547,6 +1548,12 @@ static int samsung_i2s_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "failed to enable clock: %d\n", ret);
 		goto err_disable_pclk;
 	}
+
+	if (of_device_is_compatible(np, "samsung,exynos7870-i2s1"))
+		dev_info(&pdev->dev,
+			 "audio-debug probe clocks iis=%d/%luHz pclk=%d/%luHz\n",
+			 __clk_is_enabled(priv->clk), clk_get_rate(priv->clk),
+			 __clk_is_enabled(priv->pclk), clk_get_rate(priv->pclk));
 
 	priv->rstc = devm_reset_control_get_optional_exclusive(&pdev->dev,
 							       "i2s");

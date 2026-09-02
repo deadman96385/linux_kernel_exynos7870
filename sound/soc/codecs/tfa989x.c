@@ -39,6 +39,7 @@
 #define TFA989X_SYS_CTRL_SBSL		5	/* DSP configured */
 #define TFA989X_SYS_CTRL_AMPC		6	/* amplifier enabled by DSP */
 #define TFA989X_I2S_SEL_REG		0x0a
+#define TFA989X_I2S_SEL_REG_DOLS_MSK	GENMASK(2, 0) /* data output left source */
 #define TFA989X_I2S_SEL_REG_SPKR_MSK	GENMASK(10, 9)	/* speaker impedance */
 #define TFA989X_I2S_SEL_REG_DCFG_MSK	GENMASK(14, 11)	/* DCDC compensation */
 #define TFA989X_HIDE_UNHIDE_KEY	0x40
@@ -278,9 +279,45 @@ static int tfa9890_init(struct regmap *regmap)
 	return regmap_write(regmap, TFA989X_CURRENTSENSE2, 0x7BE1);
 }
 
+static int tfa9890_j7y17lte_init(struct regmap *regmap)
+{
+	int ret;
+
+	ret = tfa9890_init(regmap);
+	if (ret)
+		return ret;
+
+	/* Values encoded by the stock J7 Pro Tfa9890.cnt device section. */
+	ret = regmap_update_bits(regmap, TFA989X_SPKR_CALIBRATION,
+				 GENMASK(9, 0), 0x33);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(regmap, TFA989X_I2S_SEL_REG,
+				 TFA989X_I2S_SEL_REG_DOLS_MSK, 2);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(regmap, TFA989X_HIDE_UNHIDE_KEY, 0x5a6b);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(regmap, 0x60, GENMASK(7, 0), 0x5a);
+	if (!ret)
+		ret = regmap_update_bits(regmap, 0x50, GENMASK(7, 0), 0xfd);
+
+	regmap_write(regmap, TFA989X_HIDE_UNHIDE_KEY, 0x0000);
+	return ret;
+}
+
 static const struct tfa989x_rev tfa9890_rev = {
 	.rev	= TFA9890_REVISION,
 	.init	= tfa9890_init,
+};
+
+static const struct tfa989x_rev tfa9890_j7y17lte_rev = {
+	.rev	= TFA9890_REVISION,
+	.init	= tfa9890_j7y17lte_init,
 };
 
 static const struct reg_sequence tfa9895_reg_init[] = {
@@ -472,6 +509,7 @@ static int tfa989x_i2c_probe(struct i2c_client *i2c)
 }
 
 static const struct of_device_id tfa989x_of_match[] = {
+	{ .compatible = "samsung,j7y17lte-tfa9890", .data = &tfa9890_j7y17lte_rev },
 	{ .compatible = "nxp,tfa9890", .data = &tfa9890_rev },
 	{ .compatible = "nxp,tfa9895", .data = &tfa9895_rev },
 	{ .compatible = "nxp,tfa9897", .data = &tfa9897_rev },

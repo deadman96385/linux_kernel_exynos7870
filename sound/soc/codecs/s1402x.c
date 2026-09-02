@@ -24,7 +24,7 @@
 #define S1402X_SYSCLK_48KHZ	24576100
 #define S1402X_SYSCLK_192KHZ	49152100
 #define S1402X_AUTOSUSPEND_MS	500
-#define S1402X_NUM_RESETS	3
+#define S1402X_NUM_RESETS	2
 
 enum s1402x_clk_id {
 	S1402X_CLK_AP_BCLK,
@@ -302,11 +302,7 @@ static int s1402x_pulse_resets(struct s1402x_priv *s1402x)
 	unsigned int i;
 	int ret;
 
-	/*
-	 * These are active-high bits in DISPAUD_CFG, and the amplifier must be
-	 * reset before the shared I2S block.  ADMA owns its reset so its PrimeCell
-	 * configuration registers are valid independently of mixer probe order.
-	 */
+	/* ADMA owns its reset; the I2S DAIs perform their internal FIFO reset. */
 	for (i = 0; i < ARRAY_SIZE(s1402x->resets); i++) {
 		dev_info(s1402x->dev, "runtime resume: %s reset pulse begin\n",
 			 s1402x->resets[i].id);
@@ -1129,7 +1125,7 @@ static int s1402x_probe(struct platform_device *pdev)
 	unsigned int i;
 	int ret;
 	static const char * const reset_names[] = {
-		"mixer", "amplifier", "i2s",
+		"mixer", "i2s",
 	};
 
 	s1402x = devm_kzalloc(dev, sizeof(*s1402x), GFP_KERNEL);
