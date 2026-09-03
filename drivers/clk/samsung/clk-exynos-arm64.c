@@ -42,6 +42,18 @@
 #define GATE_OFF_START		0x2000
 #define GATE_OFF_END		0x2fff
 
+/*
+ * Legacy Q-Channel HWACG control register bit (pre-2019 CMUCAL generation,
+ * e.g. Exynos9810/Exynos9610). Unlike GATE_ENABLE_HWACG above, this lives in
+ * its own per-IP register (QCH_CON_*) at a different offset than the plain
+ * gate register for the same IP, packed together with clock-request/expire/
+ * force-PM sub-fields this driver does not touch. Bit 0 (enable) is confirmed
+ * identical across Exynos8890/9810/9610 downstream sources; the remaining
+ * sub-field layout differs between those generations and is out of scope
+ * here, so @qch_regs is only ever populated with the bit-0-compatible ones.
+ */
+#define QCH_LEGACY_ENABLE	BIT(0)
+
 struct exynos_arm64_cmu_data {
 	struct samsung_clk_reg_dump *clk_save;
 	unsigned int nr_clk_save;
@@ -128,6 +140,21 @@ static void __init exynos_arm64_init_clocks(struct device_node *np,
 			val &= ~GATE_ENABLE_HWACG;
 			writel(val, reg);
 		}
+	}
+
+	/*
+	 * Disable legacy Q-Channel HWACG on SoCs that supply @qch_regs (see
+	 * QCH_LEGACY_ENABLE). These live outside the GATE_OFF_START/END
+	 * range above, so they're walked separately rather than folded into
+	 * the loop above.
+	 */
+	for (i = 0; i < cmu->nr_qch_regs; ++i) {
+		void __iomem *reg = reg_base + cmu->qch_regs[i];
+		u32 val;
+
+		val = readl(reg);
+		val &= ~QCH_LEGACY_ENABLE;
+		writel(val, reg);
 	}
 
 	iounmap(reg_base);

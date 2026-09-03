@@ -354,6 +354,10 @@ struct samsung_clock_reg_cache {
  * @clk_name: name of the parent clock needed for CMU register access
  * @sysreg_clk_regs: list of sysreg clock registers
  * @nr_sysreg_clk_regs: count of clock registers in @sysreg_clk_regs
+ * @qch_regs: list of legacy Q-Channel HWACG control registers (separate
+ *            per-IP registers, distinct from @clk_regs gates; used by
+ *            pre-2019 CMUCAL-generation SoCs such as Exynos9810/Exynos9610)
+ * @nr_qch_regs: count of clock registers in @qch_regs
  * @manual_plls: Enable manual control for PLL clocks
  * @auto_clock_gate: enable auto clock mode for all components in CMU
  * @gate_dbg_offset: gate debug reg offset. Used by all gates in auto clk mode
@@ -387,6 +391,9 @@ struct samsung_cmu_info {
 
 	const unsigned long *sysreg_clk_regs;
 	unsigned int nr_sysreg_clk_regs;
+
+	const unsigned long *qch_regs;
+	unsigned int nr_qch_regs;
 
 	/* ARM64 Exynos CMUs */
 	bool manual_plls;
