@@ -75,6 +75,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x0>;
 			enable-method = "psci";
+			clocks = <&cmu_cpucl0 CLK_CLUSTER0_SCLK>;
+			clock-names = "cpu";
 		};
 
 		cpu1: cpu@1 {
@@ -82,6 +84,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x1>;
 			enable-method = "psci";
+			clocks = <&cmu_cpucl0 CLK_CLUSTER0_SCLK>;
+			clock-names = "cpu";
 		};
 
 		cpu2: cpu@2 {
@@ -89,6 +93,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x2>;
 			enable-method = "psci";
+			clocks = <&cmu_cpucl0 CLK_CLUSTER0_SCLK>;
+			clock-names = "cpu";
 		};
 
 		cpu3: cpu@3 {
@@ -96,6 +102,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x3>;
 			enable-method = "psci";
+			clocks = <&cmu_cpucl0 CLK_CLUSTER0_SCLK>;
+			clock-names = "cpu";
 		};
 
 		cpu4: cpu@100 {
@@ -103,6 +111,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x100>;
 			enable-method = "psci";
+			clocks = <&cmu_cpucl1 CLK_CLUSTER1_SCLK>;
+			clock-names = "cpu";
 		};
 
 		cpu5: cpu@101 {
@@ -110,6 +120,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x101>;
 			enable-method = "psci";
+			clocks = <&cmu_cpucl1 CLK_CLUSTER1_SCLK>;
+			clock-names = "cpu";
 		};
 
 		cpu6: cpu@102 {
@@ -117,6 +129,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x102>;
 			enable-method = "psci";
+			clocks = <&cmu_cpucl1 CLK_CLUSTER1_SCLK>;
+			clock-names = "cpu";
 		};
 
 		cpu7: cpu@103 {
@@ -124,6 +138,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x103>;
 			enable-method = "psci";
+			clocks = <&cmu_cpucl1 CLK_CLUSTER1_SCLK>;
+			clock-names = "cpu";
 		};
 	};
 
@@ -186,6 +202,24 @@
 		cmu_mif: clock-controller@10460000 {
 			compatible = "samsung,exynos7870-cmu-mif";
 			reg = <0x10460000 0x1000>;
+			#clock-cells = <1>;
+
+			clock-names = "oscclk";
+			clocks = <&oscclk>;
+		};
+
+		cmu_cpucl1: clock-controller@10800000 {
+			compatible = "samsung,exynos7870-cmu-cpucl1";
+			reg = <0x10800000 0x1000>;
+			#clock-cells = <1>;
+
+			clock-names = "oscclk";
+			clocks = <&oscclk>;
+		};
+
+		cmu_cpucl0: clock-controller@10900000 {
+			compatible = "samsung,exynos7870-cmu-cpucl0";
+			reg = <0x10900000 0x1000>;
 			#clock-cells = <1>;
 
 			clock-names = "oscclk";

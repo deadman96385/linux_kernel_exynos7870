@@ -146,6 +146,120 @@
 		};
 	};
 
+	/*
+	 * CPUCL0 (cpu0-3). Frequency steps and voltages were read back from
+	 * this exact chip's live hardware (BUCK1, stock TWRP/LineageOS
+	 * kernel) -- see the rate-table comment in clk-exynos7870.c.
+	 */
+	cluster0_opp_table: opp-table-cluster0 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-546000000 {
+			opp-hz = /bits/ 64 <546000000>;
+			opp-microvolt = <650000>;
+		};
+		opp-676000000 {
+			opp-hz = /bits/ 64 <676000000>;
+			opp-microvolt = <693750>;
+		};
+		opp-757000000 {
+			opp-hz = /bits/ 64 <757000000>;
+			opp-microvolt = <718750>;
+		};
+		opp-839000000 {
+			opp-hz = /bits/ 64 <839000000>;
+			opp-microvolt = <737500>;
+		};
+		opp-902000000 {
+			opp-hz = /bits/ 64 <902000000>;
+			opp-microvolt = <762500>;
+		};
+		opp-1014000000 {
+			opp-hz = /bits/ 64 <1014000000>;
+			opp-microvolt = <806250>;
+		};
+		opp-1144000000 {
+			opp-hz = /bits/ 64 <1144000000>;
+			opp-microvolt = <856250>;
+		};
+		opp-1248000000 {
+			opp-hz = /bits/ 64 <1248000000>;
+			opp-microvolt = <900000>;
+		};
+		opp-1352000000 {
+			opp-hz = /bits/ 64 <1352000000>;
+			opp-microvolt = <943750>;
+		};
+		opp-1482000000 {
+			opp-hz = /bits/ 64 <1482000000>;
+			opp-microvolt = <993750>;
+		};
+		opp-1586000000 {
+			opp-hz = /bits/ 64 <1586000000>;
+			opp-microvolt = <1043750>;
+		};
+	};
+
+	/*
+	 * CPUCL1 (cpu4-7). Same silicon/PLL design and the same frequency
+	 * steps were confirmed live (cluster1_freq_table), but cluster1
+	 * could not be brought online in the TWRP build used for the
+	 * capture, so its voltage curve is inferred from CPUCL0's measured
+	 * curve above rather than independently measured. Revisit with a
+	 * real capture (e.g. from a full Lineage boot) if instability shows
+	 * up specifically on cpu4-7.
+	 */
+	cluster1_opp_table: opp-table-cluster1 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-546000000 {
+			opp-hz = /bits/ 64 <546000000>;
+			opp-microvolt = <650000>;
+		};
+		opp-676000000 {
+			opp-hz = /bits/ 64 <676000000>;
+			opp-microvolt = <693750>;
+		};
+		opp-757000000 {
+			opp-hz = /bits/ 64 <757000000>;
+			opp-microvolt = <718750>;
+		};
+		opp-839000000 {
+			opp-hz = /bits/ 64 <839000000>;
+			opp-microvolt = <737500>;
+		};
+		opp-902000000 {
+			opp-hz = /bits/ 64 <902000000>;
+			opp-microvolt = <762500>;
+		};
+		opp-1014000000 {
+			opp-hz = /bits/ 64 <1014000000>;
+			opp-microvolt = <806250>;
+		};
+		opp-1144000000 {
+			opp-hz = /bits/ 64 <1144000000>;
+			opp-microvolt = <856250>;
+		};
+		opp-1248000000 {
+			opp-hz = /bits/ 64 <1248000000>;
+			opp-microvolt = <900000>;
+		};
+		opp-1352000000 {
+			opp-hz = /bits/ 64 <1352000000>;
+			opp-microvolt = <943750>;
+		};
+		opp-1482000000 {
+			opp-hz = /bits/ 64 <1482000000>;
+			opp-microvolt = <993750>;
+		};
+		opp-1586000000 {
+			opp-hz = /bits/ 64 <1586000000>;
+			opp-microvolt = <1043750>;
+		};
+	};
+
 	pwrseq_mmc1: pwrseq-mmc1 {
 		compatible = "mmc-pwrseq-simple";
 		pinctrl-names = "default";
@@ -287,6 +401,46 @@
 	mali-supply = <&vdd_buck2>;
 	operating-points-v2 = <&gpu_opp_table>;
 	status = "okay";
+};
+
+&cpu0 {
+	cpu-supply = <&vdd_buck1>;
+	operating-points-v2 = <&cluster0_opp_table>;
+};
+
+&cpu1 {
+	cpu-supply = <&vdd_buck1>;
+	operating-points-v2 = <&cluster0_opp_table>;
+};
+
+&cpu2 {
+	cpu-supply = <&vdd_buck1>;
+	operating-points-v2 = <&cluster0_opp_table>;
+};
+
+&cpu3 {
+	cpu-supply = <&vdd_buck1>;
+	operating-points-v2 = <&cluster0_opp_table>;
+};
+
+&cpu4 {
+	cpu-supply = <&vdd_buck3>;
+	operating-points-v2 = <&cluster1_opp_table>;
+};
+
+&cpu5 {
+	cpu-supply = <&vdd_buck3>;
+	operating-points-v2 = <&cluster1_opp_table>;
+};
+
+&cpu6 {
+	cpu-supply = <&vdd_buck3>;
+	operating-points-v2 = <&cluster1_opp_table>;
+};
+
+&cpu7 {
+	cpu-supply = <&vdd_buck3>;
+	operating-points-v2 = <&cluster1_opp_table>;
 };
 
 &hsi2c0 {

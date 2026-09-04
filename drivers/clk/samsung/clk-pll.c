@@ -488,7 +488,19 @@ static unsigned long samsung_pll0822x_recalc_rate(struct clk_hw *hw,
 	sdiv = (pll_con3 >> PLL0822X_SDIV_SHIFT) & PLL0822X_SDIV_MASK;
 
 	fvco *= mdiv;
-	if (pll->type == pll_0516x)
+	/*
+	 * pll_1419x (Exynos8890 PLL_MIF, the memory-controller PLL) has a
+	 * fixed x2 output multiplier beyond the plain P/M/S formula.
+	 * Confirmed symmetrically in the downstream S5E8890-pll.c source on
+	 * both the read side (_clk_pll1419x_get_rate() literally computes
+	 * FIN * 2 * mdiv / (pdiv << sdiv)) and the write side
+	 * (_clk_pll1419x_find_pms() halves the target rate, with an explicit
+	 * vendor comment marking it as intentional, before solving for
+	 * P/M/S), so the divider bits it writes reproduce the halved value
+	 * and the PLL's real output is double that. This is the same kind
+	 * of per-type quirk pll_0516x already has here.
+	 */
+	if (pll->type == pll_0516x || pll->type == pll_1419x)
 		fvco *= 2;
 
 	do_div(fvco, (pdiv << sdiv));
@@ -1659,7 +1671,23 @@ static void __init _samsung_clk_register_pll(struct samsung_clk_provider *ctx,
 	case pll_1451x:
 	case pll_1452x:
 	case pll_142xx:
+	/*
+	 * pll_1016x/1018x/1019x/1050x (Exynos9810 PLL_MIF_S2D, PLL_SHARED2-4/
+	 * PLL_G3D, PLL_CPUCL1, PLL_CPUCL0/PLL_MIF respectively) and
+	 * pll_1054x (Exynos9610 PLL_CPUCL1) share the exact same
+	 * P/M/S/ENABLE/STABLE bit-field layout as pll_1017x, confirmed
+	 * against the downstream CMUCAL SFR_ACCESS tables for every
+	 * instance checked: DIV_P at [8:14), DIV_M at [16:26), DIV_S at
+	 * [0:3), ENABLE at bit 31, STABLE at bit 29. Samsung just assigns a
+	 * new internal part number per SoC tapeout even when the PLL IP
+	 * block itself is unchanged.
+	 */
+	case pll_1016x:
 	case pll_1017x:
+	case pll_1018x:
+	case pll_1019x:
+	case pll_1050x:
+	case pll_1054x:
 	case pll_a9fracm:
 		pll->enable_offs = PLL35XX_ENABLE_SHIFT;
 		pll->lock_offs = PLL35XX_LOCK_STAT_SHIFT;
@@ -1668,8 +1696,19 @@ static void __init _samsung_clk_register_pll(struct samsung_clk_provider *ctx,
 		else
 			init.ops = &samsung_pll35xx_clk_ops;
 		break;
+	/*
+	 * pll_1416x (Exynos8890 MNGS_PLL, the big-cluster CPU PLL) shares
+	 * pll_1417x/1418x's exact PLL0822X_* bit layout -- confirmed directly
+	 * from the downstream S5E8890-pll.c constants (MDIV [16:26)/0x3FF,
+	 * PDIV [8:14)/0x3F, SDIV [0:3)/0x7, ENABLE bit 31, LOCKED bit 29),
+	 * and from the vendor's own code reusing one "pll141xx_ops" C
+	 * implementation across MNGS_PLL/APOLLO_PLL/G3D_PLL/BUS0-3_PLL/etc.
+	 * (types 14160/14170/14180) rather than separate per-type functions.
+	 */
+	case pll_1416x:
 	case pll_1417x:
 	case pll_1418x:
+	case pll_1419x:
 	case pll_1051x:
 	case pll_1052x:
 	case pll_0818x:
@@ -1757,7 +1796,14 @@ static void __init _samsung_clk_register_pll(struct samsung_clk_provider *ctx,
 	case pll_4311:
 		init.ops = &samsung_pll531x_clk_ops;
 		break;
+	/*
+	 * pll_1061x (Exynos9610 PLL_MMC/PLL_AUD) shares pll_1031x's P/M/S/K
+	 * bit layout exactly (same [8:14)/[16:26)/[0:3) DIV fields plus a
+	 * 16-bit fractional DIV_K at PLL_CON3[0:16)), confirmed against the
+	 * downstream CMUCAL SFR_ACCESS tables.
+	 */
 	case pll_1031x:
+	case pll_1061x:
 		if (!pll->rate_count)
 			init.ops = &samsung_pll1031x_clk_min_ops;
 		else
