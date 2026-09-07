@@ -8,6 +8,7 @@
 
 #include <dt-bindings/clock/samsung,exynos7870-cmu.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/reset/samsung,exynos7870-dispaud.h>
 
 / {
 	compatible = "samsung,exynos7870";
@@ -74,6 +75,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x0>;
 			enable-method = "psci";
+			clocks = <&cmu_cpucl0 CLK_CLUSTER0_SCLK>;
+			clock-names = "cpu";
 		};
 
 		cpu1: cpu@1 {
@@ -81,6 +84,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x1>;
 			enable-method = "psci";
+			clocks = <&cmu_cpucl0 CLK_CLUSTER0_SCLK>;
+			clock-names = "cpu";
 		};
 
 		cpu2: cpu@2 {
@@ -88,6 +93,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x2>;
 			enable-method = "psci";
+			clocks = <&cmu_cpucl0 CLK_CLUSTER0_SCLK>;
+			clock-names = "cpu";
 		};
 
 		cpu3: cpu@3 {
@@ -95,6 +102,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x3>;
 			enable-method = "psci";
+			clocks = <&cmu_cpucl0 CLK_CLUSTER0_SCLK>;
+			clock-names = "cpu";
 		};
 
 		cpu4: cpu@100 {
@@ -102,6 +111,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x100>;
 			enable-method = "psci";
+			clocks = <&cmu_cpucl1 CLK_CLUSTER1_SCLK>;
+			clock-names = "cpu";
 		};
 
 		cpu5: cpu@101 {
@@ -109,6 +120,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x101>;
 			enable-method = "psci";
+			clocks = <&cmu_cpucl1 CLK_CLUSTER1_SCLK>;
+			clock-names = "cpu";
 		};
 
 		cpu6: cpu@102 {
@@ -116,6 +129,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x102>;
 			enable-method = "psci";
+			clocks = <&cmu_cpucl1 CLK_CLUSTER1_SCLK>;
+			clock-names = "cpu";
 		};
 
 		cpu7: cpu@103 {
@@ -123,6 +138,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x103>;
 			enable-method = "psci";
+			clocks = <&cmu_cpucl1 CLK_CLUSTER1_SCLK>;
+			clock-names = "cpu";
 		};
 	};
 
@@ -137,6 +154,18 @@
 		cpu_suspend = <0xc4000001>;
 		cpu_off = <0x84000002>;
 		cpu_on = <0xc4000003>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <1>;
+		ranges;
+
+		adma_mcode: dma-pool@3002000 {
+			compatible = "shared-dma-pool";
+			reg = <0x0 0x03002000 0x1000>;
+			no-map;
+		};
 	};
 
 	soc: soc@0 {
@@ -173,6 +202,24 @@
 		cmu_mif: clock-controller@10460000 {
 			compatible = "samsung,exynos7870-cmu-mif";
 			reg = <0x10460000 0x1000>;
+			#clock-cells = <1>;
+
+			clock-names = "oscclk";
+			clocks = <&oscclk>;
+		};
+
+		cmu_cpucl1: clock-controller@10800000 {
+			compatible = "samsung,exynos7870-cmu-cpucl1";
+			reg = <0x10800000 0x1000>;
+			#clock-cells = <1>;
+
+			clock-names = "oscclk";
+			clocks = <&oscclk>;
+		};
+
+		cmu_cpucl0: clock-controller@10900000 {
+			compatible = "samsung,exynos7870-cmu-cpucl0";
+			reg = <0x10900000 0x1000>;
 			#clock-cells = <1>;
 
 			clock-names = "oscclk";
@@ -235,6 +282,29 @@
 			compatible = "samsung,exynos7870-pinctrl";
 			reg = <0x10530000 0x1000>;
 			interrupts = <GIC_SPI 392 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		adc: adc@10550000 {
+			compatible = "samsung,exynos7870-adc";
+			reg = <0x10550000 0x1000>;
+			interrupts = <GIC_SPI 395 IRQ_TYPE_LEVEL_HIGH>;
+			#io-channel-cells = <1>;
+
+			clock-names = "pclk-s0", "pclk-s1", "osc";
+			clocks = <&cmu_mif CLK_GOUT_MIF_WRAP_ADC_IF_PCLK_S0>,
+				 <&cmu_mif CLK_GOUT_MIF_WRAP_ADC_IF_PCLK_S1>,
+				 <&cmu_mif CLK_GOUT_MIF_WRAP_ADC_IF_OSC_SYS>;
+
+			status = "disabled";
+		};
+
+		mailbox_gnss: mailbox@10570000 {
+			compatible = "samsung,exynos7870-mbox", "syscon";
+			reg = <0x10570000 0x180>;
+			interrupts = <GIC_SPI 373 IRQ_TYPE_LEVEL_HIGH>;
+			#mbox-cells = <1>;
+
+			status = "disabled";
 		};
 
 		gpu: gpu@11400000 {
@@ -334,7 +404,7 @@
 
 			status = "disabled";
 
-			usb@0 {
+			usbdrd_dwc3: usb@0 {
 				compatible = "snps,dwc3";
 				reg = <0x0 0x10000>;
 				interrupts = <GIC_SPI 230 IRQ_TYPE_LEVEL_HIGH>;
@@ -807,6 +877,83 @@
 			clock-names = "sysmmu";
 		};
 
+		s1402x: audio-mixer@14880000 {
+			compatible = "samsung,s1402x";
+			reg = <0x14880000 0x200>;
+			clocks = <&cmu_dispaud CLK_GOUT_DISPAUD_CON_EXT2AUD_BCK_GPIO_I2S>,
+				 <&cmu_dispaud CLK_GOUT_DISPAUD_CON_AUD_I2S_BCLK_BT_IN>,
+				 <&cmu_dispaud CLK_GOUT_DISPAUD_CON_CP2AUD_BCK>,
+				 <&cmu_dispaud CLK_GOUT_DISPAUD_CON_AUD_I2S_BCLK_FM_IN>,
+				 <&cmu_dispaud CLK_GOUT_DISPAUD_MIXER_AUD_SYSCLK>,
+				 <&cmu_dispaud CLK_DOUT_DISPAUD_MIXER>,
+				 <&cmu_dispaud CLK_GOUT_DISPAUD_APB>,
+				 <&cmu_dispaud CLK_GOUT_DISPAUD_APB_AUD>;
+			clock-names = "ap-bclk", "bt-bclk", "cp-bclk",
+				      "fm-bclk", "mixer", "dout", "apb",
+				      "audio-apb";
+			resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_MIXER>,
+				 <&dispaud_reset EXYNOS7870_DISPAUD_RESET_I2S>;
+			reset-names = "mixer", "i2s";
+			samsung,pmu-syscon = <&pmu_system_controller>;
+			#sound-dai-cells = <1>;
+
+			status = "disabled";
+		};
+
+		adma: dma-controller@14890000 {
+			compatible = "arm,pl330", "arm,primecell";
+			reg = <0x14890000 0x1000>;
+			interrupts = <GIC_SPI 73 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&cmu_dispaud CLK_GOUT_DISPAUD_APB_AUD_AMP>,
+				 <&cmu_dispaud CLK_GOUT_DISPAUD_MI2S_AMP_I2SCODCLKI>;
+			clock-names = "apb_pclk", "core";
+			memory-region = <&adma_mcode>;
+			resets = <&dispaud_reset EXYNOS7870_DISPAUD_RESET_ADMA>;
+			reset-names = "dma";
+			dma-channels = <4>;
+			dma-requests = <4>;
+			arm,primecell-periphid = <0x341330>;
+			#dma-cells = <1>;
+
+			status = "disabled";
+		};
+
+		i2s0: i2s@148a0000 {
+			compatible = "samsung,exynos7870-i2s";
+			reg = <0x148a0000 0x100>;
+			samsung,audio-mixer = <&s1402x>;
+			interrupts = <GIC_SPI 69 IRQ_TYPE_LEVEL_HIGH>;
+			dmas = <&adma 0>, <&adma 2>, <&adma 1>;
+			dma-names = "tx", "rx", "tx-sec";
+			clocks = <&cmu_dispaud CLK_GOUT_DISPAUD_MI2S_AUD_I2SCODCLKI>,
+				 <&cmu_dispaud CLK_GOUT_DISPAUD_APB_AUD>,
+				 <&cmu_dispaud CLK_DOUT_DISPAUD_MI2S>,
+				 <&cmu_dispaud CLK_DOUT_DISPAUD_MI2S>;
+			clock-names = "iis", "pclk", "i2s_opclk0", "i2s_opclk1";
+			#clock-cells = <1>;
+			#sound-dai-cells = <1>;
+
+			status = "disabled";
+		};
+
+		i2s1: i2s@148b0000 {
+			compatible = "samsung,exynos7870-i2s1";
+			reg = <0x148b0000 0x100>;
+			samsung,audio-mixer = <&s1402x>;
+			interrupts = <GIC_SPI 71 IRQ_TYPE_LEVEL_HIGH>;
+			dmas = <&adma 3>;
+			dma-names = "rx";
+			clocks = <&cmu_dispaud CLK_GOUT_DISPAUD_MI2S_AMP_I2SCODCLKI>,
+				 <&cmu_dispaud CLK_GOUT_DISPAUD_APB_AUD_AMP>,
+				 <&cmu_dispaud CLK_DOUT_DISPAUD_MI2S>,
+				 <&cmu_dispaud CLK_DOUT_DISPAUD_MI2S>;
+			clock-names = "iis", "pclk", "i2s_opclk0", "i2s_opclk1";
+			#clock-cells = <1>;
+			#sound-dai-cells = <1>;
+
+			status = "disabled";
+		};
+
 		pinctrl_dispaud: pinctrl@148c0000 {
 			compatible = "samsung,exynos7870-pinctrl";
 			reg = <0x148c0000 0x1000>;
@@ -817,12 +964,17 @@
 			compatible = "samsung,exynos7870-cmu-dispaud";
 			reg = <0x148d0000 0x1000>;
 			#clock-cells = <1>;
-
 			clock-names = "oscclk", "bus", "decon_eclk", "decon_vclk";
 			clocks = <&oscclk>,
 				 <&cmu_mif CLK_GOUT_MIF_CMU_DISPAUD_BUS>,
 				 <&cmu_mif CLK_GOUT_MIF_CMU_DISPAUD_DECON_ECLK>,
 				 <&cmu_mif CLK_GOUT_MIF_CMU_DISPAUD_DECON_VCLK>;
+		};
+
+		dispaud_reset: reset-controller@148f1000 {
+			compatible = "samsung,exynos7870-dispaud-reset";
+			reg = <0x148f1000 0x4>;
+			#reset-cells = <1>;
 		};
 
 		syscon_disp: system-controller@148f100c {
