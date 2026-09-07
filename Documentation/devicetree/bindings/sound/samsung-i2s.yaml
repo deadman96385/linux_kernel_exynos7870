@@ -10,9 +10,6 @@ maintainers:
   - Krzysztof Kozlowski <krzk@kernel.org>
   - Sylwester Nawrocki <s.nawrocki@samsung.com>
 
-allOf:
-  - $ref: dai-common.yaml#
-
 properties:
   compatible:
     description: |
@@ -38,6 +35,13 @@ properties:
       stereo channels. Exynos7 I2S1 upgraded to 5.1 multichannel with
       slightly modified bit offsets.
 
+      samsung,exynos7870-i2s: for the primary Exynos7870 MI2S interface with
+      six-channel playback, secondary transmit FIFO, software reset control,
+      and the stream-mode register layout.
+
+      samsung,exynos7870-i2s1: for the capture-only Exynos7870 amplifier MI2S
+      interface using the stream-mode register layout.
+
       tesla,fsd-i2s: for 8/16/24bit stereo channel I2S for playback and
       capture, secondary FIFO using external DMA, s/w reset control,
       internal mux for root clock source with all root clock sampling
@@ -51,6 +55,8 @@ properties:
           - samsung,exynos5420-i2s
           - samsung,exynos7-i2s
           - samsung,exynos7-i2s1
+          - samsung,exynos7870-i2s
+          - samsung,exynos7870-i2s1
           - tesla,fsd-i2s
       - items:
           - enum:
@@ -67,11 +73,13 @@ properties:
     maxItems: 1
 
   dmas:
-    minItems: 2
+    minItems: 1
     maxItems: 3
 
   dma-names:
     oneOf:
+      - items:
+          - const: rx
       - items:
           - const: tx
           - const: rx
@@ -82,7 +90,7 @@ properties:
 
   clocks:
     minItems: 1
-    maxItems: 3
+    maxItems: 4
 
   clock-names:
     oneOf:
@@ -92,13 +100,20 @@ properties:
           - const: iis
           - const: i2s_opclk0
           - const: i2s_opclk1
+      - items: # for Exynos7870 I2S0 and I2S1
+          - const: iis
+          - const: pclk
+          - const: i2s_opclk0
+          - const: i2s_opclk1
       - items: # for I2S1 and I2S2
           - const: iis
           - const: i2s_opclk0
     description: |
-      "iis" is the I2S bus clock and i2s_opclk0, i2s_opclk1 are sources
-      of the root clock. I2S0 has internal mux to select the source
-      of root clock and I2S1 and I2S2 doesn't have any such mux.
+      "iis" is the I2S functional clock, optional "pclk" is a separate bus
+      clock, and i2s_opclk0, i2s_opclk1 are sources of the root clock. I2S0
+      has an internal mux to select the source of root clock and I2S1 and I2S2
+      do not normally have such a mux. Exynos7870 provides both sources to its
+      stream-mode I2S interfaces.
 
   "#clock-cells":
     const: 1
@@ -123,8 +138,21 @@ properties:
       Internal DMA register base address of the audio
       subsystem (used in secondary sound source).
 
+  samsung,audio-mixer:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      S1402X mixer which initializes and supplies the shared Exynos7870 audio
+      island. The operating-system device link orders I2S register access after
+      mixer initialization and keeps the mixer active while I2S is active.
+
   power-domains:
     maxItems: 1
+
+  resets:
+    maxItems: 1
+
+  reset-names:
+    const: i2s
 
   "#sound-dai-cells":
     const: 1
@@ -136,6 +164,34 @@ required:
   - dma-names
   - clocks
   - clock-names
+
+allOf:
+  - $ref: dai-common.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - samsung,exynos7870-i2s
+              - samsung,exynos7870-i2s1
+    then:
+      required:
+        - samsung,audio-mixer
+  - if:
+      properties:
+        compatible:
+          const: samsung,exynos7870-i2s1
+    then:
+      properties:
+        dmas:
+          maxItems: 1
+        dma-names:
+          items:
+            - const: rx
+    else:
+      properties:
+        dmas:
+          minItems: 2
 
 unevaluatedProperties: false
 

@@ -14,7 +14,9 @@
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/pm_runtime.h>
+#include <linux/reset.h>
 
 #include <sound/soc.h>
 #include <sound/pcm_params.h>
@@ -101,6 +103,8 @@ struct samsung_i2s_priv {
 
 	/* The I2S controller's core clock */
 	struct clk *clk;
+	struct clk *pclk;
+	struct reset_control *rstc;
 
 	/* Clock for generating I2S signals */
 	struct clk *op_clk;
@@ -946,6 +950,22 @@ static int i2s_trigger(struct snd_pcm_substream *substream,
 			else
 				i2s_txctrl(i2s, 1);
 		}
+		dev_info(&i2s->pdev->dev,
+			 "audio-debug start dai=%d stream=%s src=%luHz frame=%uHz rfs=%u bfs=%u CON=%#010x MOD=%#010x FIC=%#010x PSR=%#010x\n",
+			 i2s->drv->id, capture ? "capture" : "playback",
+			 priv->rclk_srcrate, i2s->frmclk, i2s->rfs, i2s->bfs,
+			 readl_relaxed(priv->addr + I2SCON),
+			 readl_relaxed(priv->addr + I2SMOD),
+			 readl_relaxed(priv->addr + I2SFIC),
+			 readl_relaxed(priv->addr + I2SPSR));
+		dev_info(&i2s->pdev->dev,
+			 "audio-debug start FICS=%#010x AHB=%#010x STR0=%#010x SIZE=%#010x TRNCNT=%#010x VER=%#010x\n",
+			 readl_relaxed(priv->addr + I2SFICS),
+			 readl_relaxed(priv->addr + I2SAHB),
+			 readl_relaxed(priv->addr + I2SSTR0),
+			 readl_relaxed(priv->addr + I2SSIZE),
+			 readl_relaxed(priv->addr + I2STRNCNT),
+			 readl_relaxed(priv->addr + I2SVER));
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
@@ -959,6 +979,14 @@ static int i2s_trigger(struct snd_pcm_substream *substream,
 				i2s_fifo(i2s, FIC_TXFLUSH);
 			}
 		}
+		dev_info(&i2s->pdev->dev,
+			 "audio-debug stop dai=%d stream=%s CON=%#010x MOD=%#010x FIC=%#010x PSR=%#010x AHB=%#010x\n",
+			 i2s->drv->id, capture ? "capture" : "playback",
+			 readl_relaxed(priv->addr + I2SCON),
+			 readl_relaxed(priv->addr + I2SMOD),
+			 readl_relaxed(priv->addr + I2SFIC),
+			 readl_relaxed(priv->addr + I2SPSR),
+			 readl_relaxed(priv->addr + I2SAHB));
 		pm_runtime_put(dai->dev);
 		break;
 	}
@@ -1217,6 +1245,7 @@ static int i2s_runtime_suspend(struct device *dev)
 
 	clk_disable_unprepare(priv->op_clk);
 	clk_disable_unprepare(priv->clk);
+	clk_disable_unprepare(priv->pclk);
 
 	return 0;
 }
@@ -1226,15 +1255,19 @@ static int i2s_runtime_resume(struct device *dev)
 	struct samsung_i2s_priv *priv = dev_get_drvdata(dev);
 	int ret;
 
-	ret = clk_prepare_enable(priv->clk);
+	ret = clk_prepare_enable(priv->pclk);
 	if (ret)
 		return ret;
+
+	ret = clk_prepare_enable(priv->clk);
+	if (ret)
+		goto err_disable_pclk;
 
 	if (priv->op_clk) {
 		ret = clk_prepare_enable(priv->op_clk);
 		if (ret) {
 			clk_disable_unprepare(priv->clk);
-			return ret;
+			goto err_disable_pclk;
 		}
 	}
 
@@ -1243,6 +1276,10 @@ static int i2s_runtime_resume(struct device *dev)
 	writel(priv->suspend_i2spsr, priv->addr + I2SPSR);
 
 	return 0;
+
+err_disable_pclk:
+	clk_disable_unprepare(priv->pclk);
+	return ret;
 }
 
 static void i2s_unregister_clocks(struct samsung_i2s_priv *priv)
@@ -1381,6 +1418,36 @@ static void i2s_delete_secondary_device(struct samsung_i2s_priv *priv)
 	priv->pdev_sec = NULL;
 }
 
+static int samsung_i2s_add_mixer_link(struct device *dev)
+{
+	struct platform_device *mixer_pdev;
+	struct device_node *mixer_np;
+	struct device_link *link;
+	u32 flags = DL_FLAG_PM_RUNTIME | DL_FLAG_RPM_ACTIVE |
+		    DL_FLAG_AUTOREMOVE_CONSUMER;
+
+	mixer_np = of_parse_phandle(dev->of_node, "samsung,audio-mixer", 0);
+	if (!mixer_np)
+		return 0;
+
+	mixer_pdev = of_find_device_by_node(mixer_np);
+	of_node_put(mixer_np);
+	if (!mixer_pdev)
+		return -EPROBE_DEFER;
+
+	if (!device_is_bound(&mixer_pdev->dev)) {
+		put_device(&mixer_pdev->dev);
+		return -EPROBE_DEFER;
+	}
+
+	link = device_link_add(dev, &mixer_pdev->dev, flags);
+	put_device(&mixer_pdev->dev);
+	if (!link)
+		return -ENOMEM;
+
+	return 0;
+}
+
 static int samsung_i2s_probe(struct platform_device *pdev)
 {
 	struct i2s_dai *pri_dai, *sec_dai = NULL;
@@ -1395,6 +1462,11 @@ static int samsung_i2s_probe(struct platform_device *pdev)
 
 	if (IS_ENABLED(CONFIG_OF) && pdev->dev.of_node) {
 		i2s_dai_data = of_device_get_match_data(&pdev->dev);
+
+		ret = samsung_i2s_add_mixer_link(&pdev->dev);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret,
+					     "waiting for audio mixer\n");
 	} else {
 		id = platform_get_device_id(pdev);
 
@@ -1461,11 +1533,41 @@ static int samsung_i2s_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, PTR_ERR(priv->clk),
 				     "Failed to get iis clock\n");
 
+	priv->pclk = devm_clk_get_optional(&pdev->dev, "pclk");
+	if (IS_ERR(priv->pclk))
+		return dev_err_probe(&pdev->dev, PTR_ERR(priv->pclk),
+				     "Failed to get pclk\n");
+
+	ret = clk_prepare_enable(priv->pclk);
+	if (ret)
+		return ret;
 
 	ret = clk_prepare_enable(priv->clk);
 	if (ret != 0) {
 		dev_err(&pdev->dev, "failed to enable clock: %d\n", ret);
-		return ret;
+		goto err_disable_pclk;
+	}
+
+	if (of_device_is_compatible(np, "samsung,exynos7870-i2s1"))
+		dev_info(&pdev->dev,
+			 "audio-debug probe clocks iis=%d/%luHz pclk=%d/%luHz\n",
+			 __clk_is_enabled(priv->clk), clk_get_rate(priv->clk),
+			 __clk_is_enabled(priv->pclk), clk_get_rate(priv->pclk));
+
+	priv->rstc = devm_reset_control_get_optional_exclusive(&pdev->dev,
+							       "i2s");
+	if (IS_ERR(priv->rstc)) {
+		ret = dev_err_probe(&pdev->dev, PTR_ERR(priv->rstc),
+				    "Failed to get reset\n");
+		goto err_disable_clk;
+	}
+
+	if (priv->rstc) {
+		ret = reset_control_reset(priv->rstc);
+		if (ret) {
+			dev_err(&pdev->dev, "Failed to reset I2S: %d\n", ret);
+			goto err_disable_clk;
+		}
 	}
 	pri_dai->dma_playback.addr = regs_base + I2STXD;
 	pri_dai->dma_capture.addr = regs_base + I2SRXD;
@@ -1533,16 +1635,44 @@ static int samsung_i2s_probe(struct platform_device *pdev)
 	if (ret < 0)
 		goto err_disable_pm;
 
-	priv->op_clk = clk_get_parent(priv->clk_table[CLK_I2S_RCLK_SRC]);
+	if (priv->clk_table[CLK_I2S_RCLK_SRC]) {
+		const char *op_clk_name;
+		u32 mod;
+
+		mod = readl(priv->addr + I2SMOD);
+		op_clk_name = mod & BIT(priv->variant_regs->rclksrc_off) ?
+				      "i2s_opclk1" : "i2s_opclk0";
+		priv->op_clk = clk_get(&pdev->dev, op_clk_name);
+		if (IS_ERR(priv->op_clk)) {
+			ret = dev_err_probe(&pdev->dev, PTR_ERR(priv->op_clk),
+					    "Failed to get operation clock\n");
+			priv->op_clk = NULL;
+			goto err_unregister_clocks;
+		}
+
+		ret = clk_prepare_enable(priv->op_clk);
+		if (ret) {
+			dev_err(&pdev->dev,
+				"Failed to enable operation clock: %d\n", ret);
+			goto err_put_op_clk;
+		}
+	}
 
 	return 0;
 
+err_put_op_clk:
+	clk_put(priv->op_clk);
+	priv->op_clk = NULL;
+err_unregister_clocks:
+	i2s_unregister_clock_provider(priv);
 err_disable_pm:
 	pm_runtime_disable(&pdev->dev);
 err_del_sec:
 	i2s_delete_secondary_device(priv);
 err_disable_clk:
 	clk_disable_unprepare(priv->clk);
+err_disable_pclk:
+	clk_disable_unprepare(priv->pclk);
 	return ret;
 }
 
@@ -1559,7 +1689,10 @@ static void samsung_i2s_remove(struct platform_device *pdev)
 
 	i2s_unregister_clock_provider(priv);
 	i2s_delete_secondary_device(priv);
+	clk_disable_unprepare(priv->op_clk);
+	clk_put(priv->op_clk);
 	clk_disable_unprepare(priv->clk);
+	clk_disable_unprepare(priv->pclk);
 
 	pm_runtime_put_noidle(&pdev->dev);
 }
@@ -1677,6 +1810,18 @@ static const struct samsung_i2s_dai_data i2sv5_dai_type_i2s1 __maybe_unused = {
 	.i2s_variant_regs = &i2sv5_i2s1_regs,
 };
 
+static const struct samsung_i2s_dai_data exynos7870_i2s_dai_type = {
+	.quirks = QUIRK_PRI_6CHAN | QUIRK_SEC_DAI | QUIRK_NEED_RSTCLR,
+	.pcm_rates = SNDRV_PCM_RATE_8000_192000,
+	.i2s_variant_regs = &i2sv3_regs,
+};
+
+static const struct samsung_i2s_dai_data exynos7870_i2s1_dai_type = {
+	.quirks = QUIRK_PRI_6CHAN | QUIRK_NEED_RSTCLR,
+	.pcm_rates = SNDRV_PCM_RATE_8000_192000,
+	.i2s_variant_regs = &i2sv3_regs,
+};
+
 static const struct samsung_i2s_dai_data fsd_dai_type __maybe_unused = {
 	.quirks = QUIRK_SEC_DAI | QUIRK_NEED_RSTCLR | QUIRK_SUPPORTS_TDM,
 	.pcm_rates = SNDRV_PCM_RATE_8000_192000,
@@ -1711,6 +1856,12 @@ static const struct of_device_id exynos_i2s_match[] = {
 	}, {
 		.compatible = "samsung,exynos7-i2s1",
 		.data = &i2sv5_dai_type_i2s1,
+	}, {
+		.compatible = "samsung,exynos7870-i2s",
+		.data = &exynos7870_i2s_dai_type,
+	}, {
+		.compatible = "samsung,exynos7870-i2s1",
+		.data = &exynos7870_i2s1_dai_type,
 	}, {
 		.compatible = "tesla,fsd-i2s",
 		.data = &fsd_dai_type,

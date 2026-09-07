@@ -1,0 +1,143 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/samsung,exynos7870-cod3026x.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Samsung Exynos7870 audio complex with COD3026X codec
+
+maintainers:
+  - Sean Hoyt <seanhoyt963@gmail.com>
+
+description: |
+  The Exynos7870 application-processor I2S interface feeds the on-chip S1402X
+  audio mixer. The mixer routes and converts the stream before driving the
+  COD3026X analog codec and, on boards that provide one, an external speaker
+  amplifier. The card also describes the board-level microphone, earpiece,
+  speaker, and headset connections.
+
+allOf:
+  - $ref: sound-card-common.yaml#
+
+properties:
+  compatible:
+    const: samsung,exynos7870-cod3026x
+
+  cpu:
+    type: object
+    additionalProperties: false
+    properties:
+      sound-dai:
+        maxItems: 1
+        description: Exynos7870 application-processor I2S DAI.
+    required:
+      - sound-dai
+
+  cpu-secondary:
+    type: object
+    additionalProperties: false
+    properties:
+      sound-dai:
+        maxItems: 1
+        description: Exynos7870 secondary playback DAI.
+    required:
+      - sound-dai
+
+  cpu-amp:
+    type: object
+    description:
+      Optional auxiliary AP1 capture link. This monitor path is independent
+      of an external speaker amplifier attached to the primary stream.
+    additionalProperties: false
+    properties:
+      sound-dai:
+        maxItems: 1
+        description: Exynos7870 amplifier-path I2S DAI.
+    required:
+      - sound-dai
+
+  mixer:
+    type: object
+    additionalProperties: false
+    properties:
+      sound-dai:
+        maxItems: 1
+        description: S1402X application-processor DAI.
+    required:
+      - sound-dai
+
+  codec:
+    type: object
+    additionalProperties: false
+    properties:
+      sound-dai:
+        maxItems: 1
+        description: COD3026X primary audio DAI.
+    required:
+      - sound-dai
+
+  amplifier:
+    type: object
+    description: Optional external speaker amplifier on the primary stream.
+    additionalProperties: false
+    properties:
+      sound-dai:
+        maxItems: 1
+        description: External speaker-amplifier DAI.
+    required:
+      - sound-dai
+
+required:
+  - compatible
+  - model
+  - audio-routing
+  - cpu
+  - cpu-secondary
+  - mixer
+  - codec
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/sound/samsung,s1402x.h>
+
+    sound {
+        compatible = "samsung,exynos7870-cod3026x";
+        model = "Samsung Galaxy J7 Pro";
+
+        audio-routing =
+            "Headphone", "HPOUTLN",
+            "Earpiece", "EPOUTN",
+            "Speaker", "Speaker Amp OUT",
+            "IN1L", "Main Mic",
+            "Main Mic", "MICBIAS1",
+            "IN2L", "Sub Mic",
+            "Sub Mic", "MICBIAS1",
+            "IN3L", "Headset Mic",
+            "Headset Mic", "MICBIAS2";
+
+        cpu {
+            sound-dai = <&i2s0 0>;
+        };
+
+        cpu-secondary {
+            sound-dai = <&i2s0 1>;
+        };
+
+        cpu-amp {
+            sound-dai = <&i2s1 0>;
+        };
+
+        mixer {
+            sound-dai = <&s1402x S1402X_DAI_AP0>;
+        };
+
+        codec {
+            sound-dai = <&cod3026x 0>;
+        };
+
+        amplifier {
+            sound-dai = <&speaker_amp>;
+        };
+    };
