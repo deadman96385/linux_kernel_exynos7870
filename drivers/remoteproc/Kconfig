@@ -23,6 +23,18 @@ config REMOTEPROC_CDEV
 
 	  It's safe to say N if you don't want to use this interface.
 
+config EXYNOS7870_KEPLER_REMOTEPROC
+	tristate "Samsung Exynos7870 KEPLER GNSS remote processor"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on OF
+	depends on MAILBOX
+	select MFD_SYSCON
+	help
+	  Say y or m here to support the KEPLER GNSS processor integrated in
+	  Exynos7870 SoCs. The driver loads the raw GNSS firmware into reserved
+	  memory and controls the processor through the PMU and mailbox blocks.
+	  The GNSS transport driver can then exchange receiver data with it.
+
 config AMD_MBV_BRAM_REMOTEPROC
 	tristate "AMD MicroBlaze/V BRAM-based remoteproc support"
 	depends on OF && COMMON_CLK && (GPIOLIB || COMPILE_TEST)

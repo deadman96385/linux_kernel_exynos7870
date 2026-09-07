@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/gnss/samsung,exynos7870-kepler-gnss.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Samsung Exynos7870 KEPLER GNSS Shared-Memory Transport
+
+maintainers:
+  - Johan Hovold <johan@kernel.org>
+
+properties:
+  compatible:
+    const: samsung,exynos7870-kepler-gnss
+
+  memory-region:
+    maxItems: 1
+    description: Reserved region shared with the KEPLER remote processor.
+
+  remoteproc:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Phandle to the KEPLER remote processor.
+
+  mboxes:
+    maxItems: 1
+
+  mbox-names:
+    items:
+      - const: ipc
+
+  samsung,mailbox-syscon:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Phandle to the GNSS mailbox shared registers.
+
+required:
+  - compatible
+  - memory-region
+  - remoteproc
+  - mboxes
+  - mbox-names
+  - samsung,mailbox-syscon
+
+additionalProperties: false
+
+examples:
+  - |
+    gnss {
+        compatible = "samsung,exynos7870-kepler-gnss";
+        mbox-names = "ipc";
+        mboxes = <&mailbox_gnss 2>;
+        memory-region = <&gnss_mem>;
+        remoteproc = <&kepler>;
+        samsung,mailbox-syscon = <&mailbox_gnss>;
+    };
