@@ -1,0 +1,137 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/samsung,cod3026x.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Samsung COD3026X audio codec
+
+maintainers:
+  - Sean Hoyt <seanhoyt963@gmail.com>
+
+description: |
+  COD3026X is a low-power stereo codec with three microphone inputs,
+  headphone, earpiece and speaker outputs, and headset/button detection.
+
+allOf:
+  - $ref: dai-common.yaml#
+
+properties:
+  compatible:
+    const: samsung,cod3026x
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  vdd-supply:
+    description: Codec analog and digital supply.
+
+  samsung,audio-mixer:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      S1402X mixer which supplies the codec serial clock. The operating-system
+      device link keeps the mixer powered whenever the codec is active.
+
+  io-channels:
+    maxItems: 1
+    description: ADC channel used for headset microphone and button detection.
+
+  io-channel-names:
+    const: jack
+
+  samsung,mic-bias1-microvolt:
+    enum: [2600000, 2800000, 3000000]
+    default: 3000000
+
+  samsung,mic-bias2-microvolt:
+    enum: [2600000, 2800000, 3000000]
+    default: 3000000
+
+  samsung,mic-bias-ldo-microvolt:
+    enum: [2500000, 2800000, 3000000, 3300000]
+    default: 3300000
+
+  samsung,mic-detect-threshold:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Raw ADC threshold separating three-pole headphones from four-pole
+      headsets. Values above the threshold indicate a microphone.
+    default: 1120
+
+  samsung,mic-detect-delay-ms:
+    description: Delay before sampling the ADC after headset insertion.
+    default: 550
+
+  samsung,button-release-threshold:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Raw ADC value at or above which all headset buttons are up.
+    default: 1100
+
+  samsung,button-press-delay-ms:
+    description: Delay before sampling the ADC after a button interrupt.
+    default: 30
+
+  samsung,headset-button-zones:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: |
+      Headset button zones. Each row contains the Linux key code followed by
+      the inclusive low and high raw ADC values for that button.
+    minItems: 1
+    maxItems: 4
+    items:
+      minItems: 3
+      maxItems: 3
+
+  '#sound-dai-cells':
+    const: 1
+    description: 0 selects the primary AIF and 1 selects the secondary AIF.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - vdd-supply
+  - samsung,audio-mixer
+  - '#sound-dai-cells'
+
+dependencies:
+  io-channel-names: [io-channels]
+  samsung,headset-button-zones: [io-channels]
+  samsung,mic-detect-threshold: [io-channels]
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/i2c/i2c.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        audio-codec@80000004 {
+            compatible = "samsung,cod3026x";
+            reg = <(I2C_TEN_BIT_ADDRESS | 0x04)>;
+            interrupt-parent = <&gpa0>;
+            interrupts = <4 IRQ_TYPE_LEVEL_LOW>;
+            vdd-supply = <&ldo25>;
+            samsung,audio-mixer = <&s1402x>;
+            io-channels = <&adc 2>;
+            io-channel-names = "jack";
+            samsung,mic-bias1-microvolt = <2800000>;
+            samsung,mic-bias2-microvolt = <2800000>;
+            samsung,mic-bias-ldo-microvolt = <3300000>;
+            samsung,mic-detect-threshold = <1390>;
+            samsung,mic-detect-delay-ms = <550>;
+            samsung,headset-button-zones =
+                <226 0 275>,
+                <582 276 356>,
+                <115 357 562>,
+                <114 563 1000>;
+            #sound-dai-cells = <1>;
+        };
+    };
