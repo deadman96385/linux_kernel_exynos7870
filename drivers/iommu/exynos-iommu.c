@@ -293,6 +293,7 @@ struct sysmmu_drvdata {
 	struct clk *aclk;		/* SYSMMU's aclk clock */
 	struct clk *pclk;		/* SYSMMU's pclk clock */
 	struct clk *clk_master;		/* master's device clock */
+	struct clk *clk_ppmu;		/* shared fabric monitoring gate */
 	spinlock_t lock;		/* lock for modifying state */
 	bool active;			/* current status */
 	struct exynos_iommu_domain *domain; /* domain we belong to */
@@ -485,6 +486,7 @@ static void __sysmmu_set_ptbase(struct sysmmu_drvdata *data, phys_addr_t pgd)
 
 static void __sysmmu_enable_clocks(struct sysmmu_drvdata *data)
 {
+	BUG_ON(clk_prepare_enable(data->clk_ppmu));
 	BUG_ON(clk_prepare_enable(data->clk_master));
 	BUG_ON(clk_prepare_enable(data->clk));
 	BUG_ON(clk_prepare_enable(data->pclk));
@@ -497,6 +499,7 @@ static void __sysmmu_disable_clocks(struct sysmmu_drvdata *data)
 	clk_disable_unprepare(data->pclk);
 	clk_disable_unprepare(data->clk);
 	clk_disable_unprepare(data->clk_master);
+	clk_disable_unprepare(data->clk_ppmu);
 }
 
 static bool __sysmmu_has_capa1(struct sysmmu_drvdata *data)
@@ -517,9 +520,11 @@ static void __sysmmu_get_version(struct sysmmu_drvdata *data)
 {
 	u32 ver;
 
+	dev_info(data->sysmmu, "enabling clocks for version read\n");
 	__sysmmu_enable_clocks(data);
-
+	dev_info(data->sysmmu, "clocks enabled, reading version\n");
 	ver = readl(data->sfrbase + REG_MMU_VERSION);
+	dev_info(data->sysmmu, "version raw %#x\n", ver);
 
 	/* controllers on some SoCs don't report proper version */
 	if (ver == 0x80000001u)
@@ -543,7 +548,9 @@ static void __sysmmu_get_version(struct sysmmu_drvdata *data)
 			data->variant = &sysmmu_v7_variant;
 	}
 
+	dev_info(data->sysmmu, "releasing version clocks\n");
 	__sysmmu_disable_clocks(data);
+	dev_info(data->sysmmu, "version clocks released\n");
 }
 
 static void show_fault_information(struct sysmmu_drvdata *data,
@@ -771,6 +778,10 @@ static int exynos_sysmmu_probe(struct platform_device *pdev)
 	data->clk_master = devm_clk_get_optional(dev, "master");
 	if (IS_ERR(data->clk_master))
 		return PTR_ERR(data->clk_master);
+
+	data->clk_ppmu = devm_clk_get_optional(dev, "ppmu");
+	if (IS_ERR(data->clk_ppmu))
+		return PTR_ERR(data->clk_ppmu);
 
 	data->sysmmu = dev;
 	spin_lock_init(&data->lock);

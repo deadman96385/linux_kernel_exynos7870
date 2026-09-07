@@ -49,7 +49,7 @@ properties:
 
   clocks:
     minItems: 1
-    maxItems: 2
+    maxItems: 3
 
   clock-names:
     oneOf:
@@ -58,6 +58,10 @@ properties:
       - items:
           - const: sysmmu
           - const: master
+      - items:
+          - const: sysmmu
+          - const: master
+          - const: ppmu
       - items:
           - const: aclk
           - const: pclk
