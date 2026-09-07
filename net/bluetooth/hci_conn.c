@@ -282,6 +282,7 @@ static int hci_enhanced_setup_sync(struct hci_dev *hdev, void *data)
 	__u16 handle = conn_handle->handle;
 	struct hci_cp_enhanced_setup_sync_conn cp;
 	const struct sco_param *param;
+	int err;
 
 	if (!hci_conn_valid(hdev, conn))
 		return -ECANCELED;
@@ -393,6 +394,12 @@ static int hci_enhanced_setup_sync(struct hci_dev *hdev, void *data)
 	cp.pkt_type = __cpu_to_le16(param->pkt_type);
 	cp.max_latency = __cpu_to_le16(param->max_latency);
 
+	if (hdev->prepare_sco) {
+		err = hdev->prepare_sco(hdev, &conn->codec, conn->setting);
+		if (err)
+			return err;
+	}
+
 	if (hci_send_cmd(hdev, HCI_OP_ENHANCED_SETUP_SYNC_CONN, sizeof(cp), &cp) < 0)
 		return -EIO;
 
@@ -404,6 +411,7 @@ static bool hci_setup_sync_conn(struct hci_conn *conn, __u16 handle)
 	struct hci_dev *hdev = conn->hdev;
 	struct hci_cp_setup_sync_conn cp;
 	const struct sco_param *param;
+	int err;
 
 	bt_dev_dbg(hdev, "hcon %p", conn);
 
@@ -444,6 +452,12 @@ static bool hci_setup_sync_conn(struct hci_conn *conn, __u16 handle)
 	cp.retrans_effort = param->retrans_effort;
 	cp.pkt_type = __cpu_to_le16(param->pkt_type);
 	cp.max_latency = __cpu_to_le16(param->max_latency);
+
+	if (hdev->prepare_sco) {
+		err = hdev->prepare_sco(hdev, &conn->codec, conn->setting);
+		if (err)
+			return false;
+	}
 
 	if (hci_send_cmd(hdev, HCI_OP_SETUP_SYNC_CONN, sizeof(cp), &cp) < 0)
 		return false;

@@ -106,6 +106,8 @@ struct bcm_device_data {
  * @drive_rts_on_open: drive RTS signal on ->open() when platform requires it
  * @no_uart_clock_set: UART clock set command for >3Mbps mode is unavailable
  * @pcm_int_params: keep the initial PCM configuration
+ * @i2spcm_int_params: keep the initial I2S/PCM interface configuration
+ * @i2spcm_wbs_params: keep the wideband I2S/PCM interface configuration
  * @use_autobaud_mode: start Bluetooth device in autobaud mode
  * @max_autobaud_speed: max baudrate supported by device in autobaud mode
  */
@@ -148,6 +150,8 @@ struct bcm_device {
 	bool			no_uart_clock_set;
 	bool			use_autobaud_mode;
 	u8			pcm_int_params[5];
+	u8			i2spcm_int_params[4];
+	u8			i2spcm_wbs_params[4];
 	u32			max_autobaud_speed;
 };
 
@@ -437,6 +441,34 @@ static int bcm_set_diag(struct hci_dev *hdev, bool enable)
 	return 0;
 }
 
+static int bcm_prepare_sco(struct hci_dev *hdev, const struct bt_codec *codec,
+			   __u16 setting)
+{
+	struct hci_uart *hu = hci_get_drvdata(hdev);
+	struct bcm_data *bcm = hu->priv;
+	struct bcm_set_i2spcm_int_params params;
+	const u8 *source;
+	u8 codec_id = codec->id;
+
+	if ((setting & SCO_AIRMODE_MASK) == SCO_AIRMODE_TRANSP)
+		codec_id = BT_CODEC_TRANSPARENT;
+
+	switch (codec_id) {
+	case BT_CODEC_CVSD:
+		source = bcm->dev->i2spcm_int_params;
+		break;
+	case BT_CODEC_MSBC:
+	case BT_CODEC_TRANSPARENT:
+		source = bcm->dev->i2spcm_wbs_params;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	memcpy(&params, source, sizeof(params));
+	return btbcm_set_sco_codec(hdev, codec_id, &params);
+}
+
 static int bcm_open(struct hci_uart *hu)
 {
 	struct bcm_data *bcm;
@@ -590,6 +622,8 @@ static int bcm_setup(struct hci_uart *hu)
 
 	hu->hdev->set_diag = bcm_set_diag;
 	hu->hdev->set_bdaddr = btbcm_set_bdaddr;
+	if (bcm->dev && bcm->dev->i2spcm_wbs_params[0] != 0xff)
+		hu->hdev->prepare_sco = bcm_prepare_sco;
 
 	err = btbcm_initialize(hu->hdev, &fw_load_done, use_autobaud_mode);
 	if (err)
@@ -633,6 +667,16 @@ static int bcm_setup(struct hci_uart *hu)
 
 		memcpy(&params, bcm->dev->pcm_int_params, 5);
 		btbcm_write_pcm_int_params(hu->hdev, &params);
+	}
+
+	/* I2S/PCM interface parameters if provided */
+	if (bcm->dev && bcm->dev->i2spcm_int_params[0] != 0xff) {
+		struct bcm_set_i2spcm_int_params params;
+
+		memcpy(&params, bcm->dev->i2spcm_int_params, sizeof(params));
+		err = btbcm_write_i2spcm_int_params(hu->hdev, &params);
+		if (err)
+			return err;
 	}
 
 	err = btbcm_finalize(hu->hdev, &fw_load_done, use_autobaud_mode);
@@ -1229,6 +1273,10 @@ static int bcm_of_probe(struct bcm_device *bdev)
 	device_property_read_u32(bdev->dev, "max-speed", &bdev->oper_speed);
 	device_property_read_u8_array(bdev->dev, "brcm,bt-pcm-int-params",
 				      bdev->pcm_int_params, 5);
+	device_property_read_u8_array(bdev->dev, "brcm,bt-i2spcm-int-params",
+				      bdev->i2spcm_int_params, 4);
+	device_property_read_u8_array(bdev->dev, "brcm,bt-i2spcm-wbs-params",
+				      bdev->i2spcm_wbs_params, 4);
 	bdev->irq = of_irq_get_byname(bdev->dev->of_node, "host-wakeup");
 	bdev->irq_active_low = irq_get_trigger_type(bdev->irq)
 			     & (IRQ_TYPE_EDGE_FALLING | IRQ_TYPE_LEVEL_LOW);
@@ -1252,8 +1300,10 @@ static int bcm_probe(struct platform_device *pdev)
 
 	dev->irq = ret;
 
-	/* Initialize routing field to an unused value */
+	/* Initialize audio configuration fields to an unused value */
 	dev->pcm_int_params[0] = 0xff;
+	dev->i2spcm_int_params[0] = 0xff;
+	dev->i2spcm_wbs_params[0] = 0xff;
 
 	if (has_acpi_companion(&pdev->dev)) {
 		ret = bcm_acpi_probe(dev);
@@ -1520,8 +1570,10 @@ static int bcm_serdev_probe(struct serdev_device *serdev)
 	bcmdev->serdev_hu.serdev = serdev;
 	serdev_device_set_drvdata(serdev, bcmdev);
 
-	/* Initialize routing field to an unused value */
+	/* Initialize audio configuration fields to an unused value */
 	bcmdev->pcm_int_params[0] = 0xff;
+	bcmdev->i2spcm_int_params[0] = 0xff;
+	bcmdev->i2spcm_wbs_params[0] = 0xff;
 
 	if (has_acpi_companion(&serdev->dev))
 		err = bcm_acpi_probe(bcmdev);
