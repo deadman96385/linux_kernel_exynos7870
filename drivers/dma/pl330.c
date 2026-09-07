@@ -22,6 +22,7 @@
 #include <linux/scatterlist.h>
 #include <linux/of.h>
 #include <linux/of_dma.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/err.h>
 #include <linux/pm_runtime.h>
 #include <linux/bug.h>
@@ -485,6 +486,8 @@ struct pl330_dmac {
 	dma_addr_t		mcode_bus;
 	/* CPU address of MicroCode buffer */
 	void			*mcode_cpu;
+	/* MicroCode buffer is a fixed reserved-memory mapping. */
+	bool			mcode_reserved;
 	/* List of all Channel threads */
 	struct pl330_thread	*channels;
 	/* Pointer to the MANAGER thread */
@@ -503,6 +506,7 @@ struct pl330_dmac {
 	int quirks;
 
 	struct dentry		*dbgfs;
+	struct clk		*core_clk;
 	struct reset_control	*rstc;
 	struct reset_control	*rstc_ocp;
 };
@@ -1913,31 +1917,54 @@ static int dmac_alloc_threads(struct pl330_dmac *pl330)
 
 static int dmac_alloc_resources(struct pl330_dmac *pl330)
 {
+	struct device *dev = pl330->ddma.dev;
+	struct device_node *np = dev->of_node;
+	struct resource res;
 	int chans = pl330->pcfg.num_chan;
+	size_t mcode_size = chans * pl330->mcbufsz;
 	int ret;
 
 	/*
 	 * Alloc MicroCode buffer for 'chans' Channel threads.
 	 * A channel's buffer offset is (Channel_Id * MCODE_BUFF_PERCHAN)
 	 */
-	pl330->mcode_cpu = dma_alloc_attrs(pl330->ddma.dev,
-				chans * pl330->mcbufsz,
-				&pl330->mcode_bus, GFP_KERNEL,
-				DMA_ATTR_PRIVILEGED);
-	if (!pl330->mcode_cpu) {
-		dev_err(pl330->ddma.dev, "%s:%d Can't allocate memory!\n",
-			__func__, __LINE__);
-		return -ENOMEM;
+	if (np && of_property_present(np, "memory-region")) {
+		ret = of_reserved_mem_region_to_resource(np, 0, &res);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "failed to get microcode memory\n");
+
+		if (resource_size(&res) < mcode_size)
+			return dev_err_probe(dev, -EINVAL,
+					     "microcode memory is too small\n");
+
+		pl330->mcode_cpu = devm_memremap(dev, res.start, mcode_size,
+						 MEMREMAP_WC);
+		if (IS_ERR(pl330->mcode_cpu))
+			return dev_err_probe(dev, PTR_ERR(pl330->mcode_cpu),
+					     "failed to map microcode memory\n");
+
+		pl330->mcode_bus = res.start;
+		pl330->mcode_reserved = true;
+	} else {
+		pl330->mcode_cpu = dma_alloc_attrs(dev, mcode_size,
+						   &pl330->mcode_bus, GFP_KERNEL,
+						   DMA_ATTR_PRIVILEGED);
+		if (!pl330->mcode_cpu) {
+			dev_err(dev, "%s:%d Can't allocate memory!\n",
+				__func__, __LINE__);
+			return -ENOMEM;
+		}
 	}
 
 	ret = dmac_alloc_threads(pl330);
 	if (ret) {
 		dev_err(pl330->ddma.dev, "%s:%d Can't to create channels for DMAC!\n",
 			__func__, __LINE__);
-		dma_free_attrs(pl330->ddma.dev,
-				chans * pl330->mcbufsz,
-				pl330->mcode_cpu, pl330->mcode_bus,
-				DMA_ATTR_PRIVILEGED);
+		if (!pl330->mcode_reserved)
+			dma_free_attrs(dev, mcode_size, pl330->mcode_cpu,
+				       pl330->mcode_bus,
+				       DMA_ATTR_PRIVILEGED);
 		return ret;
 	}
 
@@ -1946,6 +1973,8 @@ static int dmac_alloc_resources(struct pl330_dmac *pl330)
 
 static int pl330_add(struct pl330_dmac *pl330)
 {
+	struct device_node *np = pl330->ddma.dev->of_node;
+	u32 expected;
 	int i, ret;
 
 	/* Check if we can handle this DMAC */
@@ -1957,6 +1986,29 @@ static int pl330_add(struct pl330_dmac *pl330)
 
 	/* Read the configuration of the DMAC */
 	read_dmac_config(pl330);
+
+	/*
+	 * Some integrations describe the implemented channel and request counts.
+	 * Treat those values as a probe-time sanity check instead of registering a
+	 * controller whose configuration registers were read while it was still in
+	 * reset. A zero-filled configuration can otherwise survive probe and fault
+	 * later when a client releases the unusable channel.
+	 */
+	if (np && !of_property_read_u32(np, "dma-channels", &expected) &&
+	    pl330->pcfg.num_chan != expected) {
+		dev_err(pl330->ddma.dev,
+			"configuration reports %u channels, expected %u\n",
+			pl330->pcfg.num_chan, expected);
+		return -ENODEV;
+	}
+
+	if (np && !of_property_read_u32(np, "dma-requests", &expected) &&
+	    pl330->pcfg.num_peri != expected) {
+		dev_err(pl330->ddma.dev,
+			"configuration reports %u peripheral requests, expected %u\n",
+			pl330->pcfg.num_peri, expected);
+		return -ENODEV;
+	}
 
 	if (pl330->pcfg.num_events == 0) {
 		dev_err(pl330->ddma.dev, "%s:%d Can't work without events!\n",
@@ -2016,9 +2068,11 @@ static void pl330_del(struct pl330_dmac *pl330)
 	/* Free DMAC resources */
 	dmac_free_threads(pl330);
 
-	dma_free_attrs(pl330->ddma.dev,
-		pl330->pcfg.num_chan * pl330->mcbufsz, pl330->mcode_cpu,
-		pl330->mcode_bus, DMA_ATTR_PRIVILEGED);
+	if (!pl330->mcode_reserved)
+		dma_free_attrs(pl330->ddma.dev,
+			       pl330->pcfg.num_chan * pl330->mcbufsz,
+			       pl330->mcode_cpu, pl330->mcode_bus,
+			       DMA_ATTR_PRIVILEGED);
 }
 
 /* forward declaration */
@@ -2973,17 +3027,38 @@ static inline void deinit_pl330_debugfs(struct pl330_dmac *pl330)
 }
 #endif
 
-/*
- * Runtime PM callbacks are provided by amba/bus.c driver.
- *
- * It is assumed here that IRQ safe runtime PM is chosen in probe and amba
- * bus driver will only disable/enable the clock in runtime PM callbacks.
- */
+static int __maybe_unused pl330_runtime_suspend(struct device *dev)
+{
+	struct pl330_dmac *pl330 = dev_get_drvdata(dev);
+
+	if (pl330->core_clk)
+		clk_disable(pl330->core_clk);
+
+	return 0;
+}
+
+static int __maybe_unused pl330_runtime_resume(struct device *dev)
+{
+	struct pl330_dmac *pl330 = dev_get_drvdata(dev);
+
+	if (pl330->core_clk)
+		return clk_enable(pl330->core_clk);
+
+	return 0;
+}
+
 static int __maybe_unused pl330_suspend(struct device *dev)
 {
 	struct amba_device *pcdev = to_amba_device(dev);
+	struct pl330_dmac *pl330 = dev_get_drvdata(dev);
+	int ret;
 
-	pm_runtime_force_suspend(dev);
+	ret = pm_runtime_force_suspend(dev);
+	if (ret)
+		return ret;
+
+	if (pl330->core_clk)
+		clk_unprepare(pl330->core_clk);
 	clk_unprepare(pcdev->pclk);
 
 	return 0;
@@ -2992,18 +3067,35 @@ static int __maybe_unused pl330_suspend(struct device *dev)
 static int __maybe_unused pl330_resume(struct device *dev)
 {
 	struct amba_device *pcdev = to_amba_device(dev);
+	struct pl330_dmac *pl330 = dev_get_drvdata(dev);
 	int ret;
 
 	ret = clk_prepare(pcdev->pclk);
 	if (ret)
 		return ret;
 
-	pm_runtime_force_resume(dev);
+	if (pl330->core_clk) {
+		ret = clk_prepare(pl330->core_clk);
+		if (ret)
+			goto err_unprepare_pclk;
+	}
 
+	ret = pm_runtime_force_resume(dev);
+	if (ret)
+		goto err_unprepare_core;
+
+	return 0;
+
+err_unprepare_core:
+	if (pl330->core_clk)
+		clk_unprepare(pl330->core_clk);
+err_unprepare_pclk:
+	clk_unprepare(pcdev->pclk);
 	return ret;
 }
 
 static const struct dev_pm_ops pl330_pm = {
+	SET_RUNTIME_PM_OPS(pl330_runtime_suspend, pl330_runtime_resume, NULL)
 	SET_LATE_SYSTEM_SLEEP_PM_OPS(pl330_suspend, pl330_resume)
 };
 
@@ -3045,26 +3137,54 @@ pl330_probe(struct amba_device *adev, const struct amba_id *id)
 
 	amba_set_drvdata(adev, pl330);
 
+	/*
+	 * Some integrations have a functional clock in addition to the AMBA
+	 * APB clock.  Keep it prepared for IRQ-safe runtime PM and enable it
+	 * before reset or register access.
+	 */
+	pl330->core_clk = devm_clk_get_optional_prepared(&adev->dev, "core");
+	if (IS_ERR(pl330->core_clk))
+		return dev_err_probe(&adev->dev, PTR_ERR(pl330->core_clk),
+				     "Failed to get core clock\n");
+
+	if (pl330->core_clk) {
+		ret = clk_enable(pl330->core_clk);
+		if (ret)
+			return dev_err_probe(&adev->dev, ret,
+					     "Failed to enable core clock\n");
+	}
+
 	pl330->rstc = devm_reset_control_get_optional(&adev->dev, "dma");
 	if (IS_ERR(pl330->rstc)) {
-		return dev_err_probe(&adev->dev, PTR_ERR(pl330->rstc), "Failed to get reset!\n");
+		ret = dev_err_probe(&adev->dev, PTR_ERR(pl330->rstc),
+				    "Failed to get reset!\n");
+		goto probe_err_clk;
 	} else {
-		ret = reset_control_deassert(pl330->rstc);
+		/*
+		 * Exynos7870 ADMA requires an active-high reset pulse before its
+		 * PrimeCell configuration registers become valid. Prefer the reset
+		 * controller's pulse operation and retain deassert-only behavior for
+		 * older reset providers that do not implement it.
+		 */
+		ret = reset_control_reset(pl330->rstc);
+		if (ret == -ENOTSUPP)
+			ret = reset_control_deassert(pl330->rstc);
 		if (ret) {
-			dev_err(&adev->dev, "Couldn't deassert the device from reset!\n");
-			return ret;
+			dev_err(&adev->dev, "Couldn't reset the device!\n");
+			goto probe_err_clk;
 		}
 	}
 
 	pl330->rstc_ocp = devm_reset_control_get_optional(&adev->dev, "dma-ocp");
 	if (IS_ERR(pl330->rstc_ocp)) {
-		return dev_err_probe(&adev->dev, PTR_ERR(pl330->rstc_ocp),
-				     "Failed to get OCP reset!\n");
+		ret = dev_err_probe(&adev->dev, PTR_ERR(pl330->rstc_ocp),
+				    "Failed to get OCP reset!\n");
+		goto probe_err_clk;
 	} else {
 		ret = reset_control_deassert(pl330->rstc_ocp);
 		if (ret) {
 			dev_err(&adev->dev, "Couldn't deassert the device from OCP reset!\n");
-			return ret;
+			goto probe_err_clk;
 		}
 	}
 
@@ -3075,7 +3195,7 @@ pl330_probe(struct amba_device *adev, const struct amba_id *id)
 					       pl330_irq_handler, 0,
 					       dev_name(&adev->dev), pl330);
 			if (ret)
-				return ret;
+				goto probe_err_clk;
 		} else {
 			break;
 		}
@@ -3086,7 +3206,7 @@ pl330_probe(struct amba_device *adev, const struct amba_id *id)
 	pcfg->periph_id = adev->periphid;
 	ret = pl330_add(pl330);
 	if (ret)
-		return ret;
+		goto probe_err_clk;
 
 	INIT_LIST_HEAD(&pl330->desc_pool);
 	spin_lock_init(&pl330->pool_lock);
@@ -3206,6 +3326,9 @@ probe_err2:
 
 	if (pl330->rstc)
 		reset_control_assert(pl330->rstc);
+probe_err_clk:
+	if (pl330->core_clk)
+		clk_disable(pl330->core_clk);
 	return ret;
 }
 
@@ -3251,6 +3374,9 @@ static void pl330_remove(struct amba_device *adev)
 
 	if (pl330->rstc)
 		reset_control_assert(pl330->rstc);
+
+	if (pl330->core_clk)
+		clk_disable(pl330->core_clk);
 }
 
 static const struct amba_id pl330_ids[] = {
