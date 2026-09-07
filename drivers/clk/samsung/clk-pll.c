@@ -317,6 +317,7 @@ static const struct clk_ops samsung_pll35xx_clk_min_ops = {
 
 #define PLL36XX_KDIV_MASK	(0xFFFF)
 #define PLL36XX_MDIV_MASK	(0x1FF)
+#define PLL1431X_MDIV_MASK	(0x3FF)
 #define PLL36XX_PDIV_MASK	(0x3F)
 #define PLL36XX_SDIV_MASK	(0x7)
 #define PLL36XX_MDIV_SHIFT	(16)
@@ -325,6 +326,12 @@ static const struct clk_ops samsung_pll35xx_clk_min_ops = {
 #define PLL36XX_KDIV_SHIFT	(0)
 #define PLL36XX_LOCK_STAT_SHIFT	(29)
 #define PLL36XX_ENABLE_SHIFT	(31)
+
+static u32 samsung_pll36xx_mdiv_mask(struct samsung_clk_pll *pll)
+{
+	return pll->type == pll_1431x ? PLL1431X_MDIV_MASK :
+		PLL36XX_MDIV_MASK;
+}
 
 static unsigned long samsung_pll36xx_recalc_rate(struct clk_hw *hw,
 				unsigned long parent_rate)
@@ -336,7 +343,8 @@ static unsigned long samsung_pll36xx_recalc_rate(struct clk_hw *hw,
 
 	pll_con0 = readl_relaxed(pll->con_reg);
 	pll_con1 = readl_relaxed(pll->con_reg + 4);
-	mdiv = (pll_con0 >> PLL36XX_MDIV_SHIFT) & PLL36XX_MDIV_MASK;
+	mdiv = (pll_con0 >> PLL36XX_MDIV_SHIFT) &
+		samsung_pll36xx_mdiv_mask(pll);
 	pdiv = (pll_con0 >> PLL36XX_PDIV_SHIFT) & PLL36XX_PDIV_MASK;
 	sdiv = (pll_con0 >> PLL36XX_SDIV_SHIFT) & PLL36XX_SDIV_MASK;
 	kdiv = (s16)(pll_con1 & PLL36XX_KDIV_MASK);
@@ -348,17 +356,20 @@ static unsigned long samsung_pll36xx_recalc_rate(struct clk_hw *hw,
 	return (unsigned long)fvco;
 }
 
-static inline bool samsung_pll36xx_mpk_change(
-	const struct samsung_pll_rate_table *rate, u32 pll_con0, u32 pll_con1)
+static inline bool
+samsung_pll36xx_mpk_change(struct samsung_clk_pll *pll,
+			   const struct samsung_pll_rate_table *rate,
+			   u32 pll_con0, u32 pll_con1)
 {
 	u32 old_mdiv, old_pdiv, old_kdiv;
 
-	old_mdiv = (pll_con0 >> PLL36XX_MDIV_SHIFT) & PLL36XX_MDIV_MASK;
+	old_mdiv = (pll_con0 >> PLL36XX_MDIV_SHIFT) &
+		samsung_pll36xx_mdiv_mask(pll);
 	old_pdiv = (pll_con0 >> PLL36XX_PDIV_SHIFT) & PLL36XX_PDIV_MASK;
 	old_kdiv = (pll_con1 >> PLL36XX_KDIV_SHIFT) & PLL36XX_KDIV_MASK;
 
 	return (rate->mdiv != old_mdiv || rate->pdiv != old_pdiv ||
-		rate->kdiv != old_kdiv);
+		(u16)rate->kdiv != old_kdiv);
 }
 
 static int samsung_pll36xx_set_rate(struct clk_hw *hw, unsigned long drate,
@@ -378,7 +389,7 @@ static int samsung_pll36xx_set_rate(struct clk_hw *hw, unsigned long drate,
 	pll_con0 = readl_relaxed(pll->con_reg);
 	pll_con1 = readl_relaxed(pll->con_reg + 4);
 
-	if (!(samsung_pll36xx_mpk_change(rate, pll_con0, pll_con1))) {
+	if (!(samsung_pll36xx_mpk_change(pll, rate, pll_con0, pll_con1))) {
 		/* If only s change, change just s value only*/
 		pll_con0 &= ~(PLL36XX_SDIV_MASK << PLL36XX_SDIV_SHIFT);
 		pll_con0 |= (rate->sdiv << PLL36XX_SDIV_SHIFT);
@@ -391,20 +402,35 @@ static int samsung_pll36xx_set_rate(struct clk_hw *hw, unsigned long drate,
 	writel_relaxed(rate->pdiv * PLL36XX_LOCK_FACTOR, pll->lock_reg);
 
 	 /* Change PLL PMS values */
-	pll_con0 &= ~((PLL36XX_MDIV_MASK << PLL36XX_MDIV_SHIFT) |
+	pll_con0 &= ~((samsung_pll36xx_mdiv_mask(pll) << PLL36XX_MDIV_SHIFT) |
 			(PLL36XX_PDIV_MASK << PLL36XX_PDIV_SHIFT) |
 			(PLL36XX_SDIV_MASK << PLL36XX_SDIV_SHIFT));
 	pll_con0 |= (rate->mdiv << PLL36XX_MDIV_SHIFT) |
 			(rate->pdiv << PLL36XX_PDIV_SHIFT) |
 			(rate->sdiv << PLL36XX_SDIV_SHIFT);
+	if (pll->type == pll_1431x) {
+		pll_con0 &= ~BIT(26);
+		pll_con0 |= BIT(5);
+	}
 	writel_relaxed(pll_con0, pll->con_reg);
 
 	pll_con1 &= ~(PLL36XX_KDIV_MASK << PLL36XX_KDIV_SHIFT);
-	pll_con1 |= rate->kdiv << PLL36XX_KDIV_SHIFT;
+	pll_con1 |= (u16)rate->kdiv << PLL36XX_KDIV_SHIFT;
 	writel_relaxed(pll_con1, pll->con_reg + 4);
 
-	if (pll_con0 & BIT(pll->enable_offs))
-		return samsung_pll_lock_wait(pll, BIT(pll->lock_offs));
+	if (pll_con0 & BIT(pll->enable_offs)) {
+		int ret = samsung_pll_lock_wait(pll, BIT(pll->lock_offs));
+
+		if (ret)
+			return ret;
+	}
+
+	if (pll->type == pll_1431x)
+		pr_info("%s: rate=%lu parent=%lu con0=%#010x con1=%#010x m=%u p=%u s=%u k=%d\n",
+			clk_hw_get_name(hw), drate, parent_rate,
+			readl_relaxed(pll->con_reg),
+			readl_relaxed(pll->con_reg + 4), rate->mdiv,
+			rate->pdiv, rate->sdiv, (s16)rate->kdiv);
 
 	return 0;
 }
@@ -462,7 +488,19 @@ static unsigned long samsung_pll0822x_recalc_rate(struct clk_hw *hw,
 	sdiv = (pll_con3 >> PLL0822X_SDIV_SHIFT) & PLL0822X_SDIV_MASK;
 
 	fvco *= mdiv;
-	if (pll->type == pll_0516x)
+	/*
+	 * pll_1419x (Exynos8890 PLL_MIF, the memory-controller PLL) has a
+	 * fixed x2 output multiplier beyond the plain P/M/S formula.
+	 * Confirmed symmetrically in the downstream S5E8890-pll.c source on
+	 * both the read side (_clk_pll1419x_get_rate() literally computes
+	 * FIN * 2 * mdiv / (pdiv << sdiv)) and the write side
+	 * (_clk_pll1419x_find_pms() halves the target rate, with an explicit
+	 * vendor comment marking it as intentional, before solving for
+	 * P/M/S), so the divider bits it writes reproduce the halved value
+	 * and the PLL's real output is double that. This is the same kind
+	 * of per-type quirk pll_0516x already has here.
+	 */
+	if (pll->type == pll_0516x || pll->type == pll_1419x)
 		fvco *= 2;
 
 	do_div(fvco, (pdiv << sdiv));
@@ -1633,7 +1671,23 @@ static void __init _samsung_clk_register_pll(struct samsung_clk_provider *ctx,
 	case pll_1451x:
 	case pll_1452x:
 	case pll_142xx:
+	/*
+	 * pll_1016x/1018x/1019x/1050x (Exynos9810 PLL_MIF_S2D, PLL_SHARED2-4/
+	 * PLL_G3D, PLL_CPUCL1, PLL_CPUCL0/PLL_MIF respectively) and
+	 * pll_1054x (Exynos9610 PLL_CPUCL1) share the exact same
+	 * P/M/S/ENABLE/STABLE bit-field layout as pll_1017x, confirmed
+	 * against the downstream CMUCAL SFR_ACCESS tables for every
+	 * instance checked: DIV_P at [8:14), DIV_M at [16:26), DIV_S at
+	 * [0:3), ENABLE at bit 31, STABLE at bit 29. Samsung just assigns a
+	 * new internal part number per SoC tapeout even when the PLL IP
+	 * block itself is unchanged.
+	 */
+	case pll_1016x:
 	case pll_1017x:
+	case pll_1018x:
+	case pll_1019x:
+	case pll_1050x:
+	case pll_1054x:
 	case pll_a9fracm:
 		pll->enable_offs = PLL35XX_ENABLE_SHIFT;
 		pll->lock_offs = PLL35XX_LOCK_STAT_SHIFT;
@@ -1642,8 +1696,19 @@ static void __init _samsung_clk_register_pll(struct samsung_clk_provider *ctx,
 		else
 			init.ops = &samsung_pll35xx_clk_ops;
 		break;
+	/*
+	 * pll_1416x (Exynos8890 MNGS_PLL, the big-cluster CPU PLL) shares
+	 * pll_1417x/1418x's exact PLL0822X_* bit layout -- confirmed directly
+	 * from the downstream S5E8890-pll.c constants (MDIV [16:26)/0x3FF,
+	 * PDIV [8:14)/0x3F, SDIV [0:3)/0x7, ENABLE bit 31, LOCKED bit 29),
+	 * and from the vendor's own code reusing one "pll141xx_ops" C
+	 * implementation across MNGS_PLL/APOLLO_PLL/G3D_PLL/BUS0-3_PLL/etc.
+	 * (types 14160/14170/14180) rather than separate per-type functions.
+	 */
+	case pll_1416x:
 	case pll_1417x:
 	case pll_1418x:
+	case pll_1419x:
 	case pll_1051x:
 	case pll_1052x:
 	case pll_0818x:
@@ -1673,6 +1738,7 @@ static void __init _samsung_clk_register_pll(struct samsung_clk_provider *ctx,
 		break;
 	/* clk_ops for 36xx and 2650 are similar */
 	case pll_36xx:
+	case pll_1431x:
 	case pll_2650:
 		pll->enable_offs = PLL36XX_ENABLE_SHIFT;
 		pll->lock_offs = PLL36XX_LOCK_STAT_SHIFT;
@@ -1730,7 +1796,14 @@ static void __init _samsung_clk_register_pll(struct samsung_clk_provider *ctx,
 	case pll_4311:
 		init.ops = &samsung_pll531x_clk_ops;
 		break;
+	/*
+	 * pll_1061x (Exynos9610 PLL_MMC/PLL_AUD) shares pll_1031x's P/M/S/K
+	 * bit layout exactly (same [8:14)/[16:26)/[0:3) DIV fields plus a
+	 * 16-bit fractional DIV_K at PLL_CON3[0:16)), confirmed against the
+	 * downstream CMUCAL SFR_ACCESS tables.
+	 */
 	case pll_1031x:
+	case pll_1061x:
 		if (!pll->rate_count)
 			init.ops = &samsung_pll1031x_clk_min_ops;
 		else

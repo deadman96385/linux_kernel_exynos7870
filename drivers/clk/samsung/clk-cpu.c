@@ -403,6 +403,110 @@ static int exynos5433_cpuclk_post_rate_change(struct clk_notifier_data *ndata,
 	return 0;
 }
 
+/* ---- Exynos7870 ------------------------------------------------------------
+ *
+ * CPUCL0/CPUCL1 on Exynos7870 report divider-in-progress status in bit 25 of
+ * the same CON register that holds the 3-bit divider value (DIV_MASK), not in
+ * a separate DIV_STAT register as on E4210/E5433. div_stat_cpu0/div_stat_cpu1
+ * therefore alias div_cpu0/div_cpu1, and only E7870_DIV_BUSY may be used to
+ * poll them -- polling with DIV_MASK would spin on the divider value itself.
+ */
+
+#define E7870_DIV_BUSY		BIT(25)
+#define E7870_MUX_SWITCH	BIT(12)
+
+static const struct exynos_cpuclk_regs e7870_cpuclk_regs = {
+	.mux_sel	= 0x208,
+	.mux_stat	= 0x608,
+	.div_cpu0	= 0x400,
+	.div_cpu1	= 0x404,
+	.div_stat_cpu0	= 0x400,
+	.div_stat_cpu1	= 0x404,
+};
+
+/* handler for pre-rate change notification from parent clock */
+static int exynos7870_cpuclk_pre_rate_change(struct clk_notifier_data *ndata,
+					     struct exynos_cpuclk *cpuclk)
+{
+	const struct exynos_cpuclk_cfg_data *cfg_data = cpuclk->cfg;
+	const struct exynos_cpuclk_regs * const regs = cpuclk->chip->regs;
+	void __iomem *base = cpuclk->base;
+	unsigned long alt_prate = clk_hw_get_rate(cpuclk->alt_parent);
+	unsigned long div0, div1, mux_reg, tmp;
+	unsigned long flags;
+
+	/* find out the divider values to use for clock data */
+	while ((cfg_data->prate * 1000) != ndata->new_rate) {
+		if (cfg_data->prate == 0)
+			return -EINVAL;
+		cfg_data++;
+	}
+
+	spin_lock_irqsave(cpuclk->lock, flags);
+
+	div0 = cfg_data->div0;
+	div1 = cfg_data->div1;
+
+	/*
+	 * If the old parent clock speed is less than the clock speed of
+	 * the alternate parent, then it should be ensured that at no point
+	 * the armclk speed is more than the old_prate until the dividers are
+	 * set. Also workaround the issue of the dividers being set to lower
+	 * values before the parent clock speed is set to new lower speed
+	 * (this can result in too high speed of armclk output clocks).
+	 */
+	if (alt_prate > ndata->old_rate || ndata->old_rate > ndata->new_rate) {
+		unsigned long tmp_rate = min(ndata->old_rate, ndata->new_rate);
+		unsigned long alt_div;
+
+		alt_div = DIV_ROUND_UP(alt_prate, tmp_rate) - 1;
+		WARN_ON(alt_div >= MAX_DIV);
+
+		tmp = readl(base + regs->div_cpu0);
+		tmp = (tmp & ~DIV_MASK) | (alt_div & DIV_MASK);
+		writel(tmp, base + regs->div_cpu0);
+		wait_until_divider_stable(base + regs->div_stat_cpu0,
+					  E7870_DIV_BUSY);
+
+		div0 |= alt_div;
+	}
+
+	/* select clkcmu_cpuclX_switch_user as the alternate parent */
+	mux_reg = readl(base + regs->mux_sel);
+	writel(mux_reg | E7870_MUX_SWITCH, base + regs->mux_sel);
+	wait_until_mux_stable(base + regs->mux_stat, 12, MUX_MASK, 2);
+
+	/* alternate parent is active now, set the steady-state dividers */
+	writel(div0, base + regs->div_cpu0);
+	wait_until_divider_stable(base + regs->div_stat_cpu0, E7870_DIV_BUSY);
+
+	writel(div1, base + regs->div_cpu1);
+	wait_until_divider_stable(base + regs->div_stat_cpu1, E7870_DIV_BUSY);
+
+	spin_unlock_irqrestore(cpuclk->lock, flags);
+	return 0;
+}
+
+/* handler for post-rate change notification from parent clock */
+static int exynos7870_cpuclk_post_rate_change(struct clk_notifier_data *ndata,
+					      struct exynos_cpuclk *cpuclk)
+{
+	const struct exynos_cpuclk_regs * const regs = cpuclk->chip->regs;
+	void __iomem *base = cpuclk->base;
+	unsigned long mux_reg;
+	unsigned long flags;
+
+	spin_lock_irqsave(cpuclk->lock, flags);
+
+	/* select the CPUCLx PLL path as the parent again */
+	mux_reg = readl(base + regs->mux_sel);
+	writel(mux_reg & ~E7870_MUX_SWITCH, base + regs->mux_sel);
+	wait_until_mux_stable(base + regs->mux_stat, 12, MUX_MASK, 1);
+
+	spin_unlock_irqrestore(cpuclk->lock, flags);
+	return 0;
+}
+
 /* ---- Exynos850 ----------------------------------------------------------- */
 
 #define E850_DIV_RATIO_MASK	GENMASK(3, 0)
@@ -637,6 +741,11 @@ static const struct exynos_cpuclk_chip exynos_clkcpu_chips[] = {
 		.regs		= &e850cl1_cpuclk_regs,
 		.pre_rate_cb	= exynos850_cpuclk_pre_rate_change,
 		.post_rate_cb	= exynos850_cpuclk_post_rate_change,
+	},
+	[CPUCLK_LAYOUT_E7870] = {
+		.regs		= &e7870_cpuclk_regs,
+		.pre_rate_cb	= exynos7870_cpuclk_pre_rate_change,
+		.post_rate_cb	= exynos7870_cpuclk_post_rate_change,
 	},
 };
 

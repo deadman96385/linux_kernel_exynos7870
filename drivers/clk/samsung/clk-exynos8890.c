@@ -1,0 +1,7758 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Common Clock Framework support for Exynos8890 SoC.
+ *
+ * Register data mechanically extracted from the downstream PWRCAL tables
+ * (jcadduono/android_kernel_samsung_universal8890, stock-6.0,
+ * drivers/soc/samsung/pwrcal/S5E8890/{S5E8890-cmu,S5E8890-cmusfr,S5E8890-pll}.c),
+ * covering every CMU domain reachable from that source's clock tables.
+ *
+ * Exynos8890 predates the CMUCAL generation used by Exynos9810/9610 (also in
+ * this tree) -- it uses an older, differently-shaped "PWRCAL" macro system
+ * (CLK_MUX/CLK_DIV/CLK_GATE/CLK_PLL/FIXEDRATE with literal offset/bit args,
+ * not the SFR/SFR_ACCESS indirection cmucal uses), so this required a
+ * separate extraction pass rather than reusing the Exynos9810/9610 pipeline
+ * directly, though the underlying method (parse the vendor's own clock
+ * tables, don't hand-transcribe) is the same.
+ *
+ * NOT modeled here: PLL_MIF (the memory-controller PLL, downstream type
+ * pll_1419x). Its enable/disable register bit layout matches pll_1417x/1418x
+ * exactly (verified against S5E8890-pll.c), but its recalc-rate formula
+ * includes an extra factor of 2 (fout = FIN * 2 * mdiv / (pdiv << sdiv)) that
+ * mainline's existing PLL0822X-family implementation does not apply. Aliasing
+ * it into that bucket would silently misreport the DRAM controller's actual
+ * clock rate by 2x -- given how hardware-sensitive a wrong MIF rate is, this
+ * needs a real dedicated PLL type (or confirmation the x2 is a downstream-only
+ * quirk) before it's safe to add, not a guess.
+ *
+ * Also not modeled: Q-Channel/HWACG register disabling. Unlike Exynos9810/9610,
+ * this SoC's QCH_CTRL_* registers are not driven from a clean declarative
+ * table -- they're touched ad-hoc from power-domain-sequencing code
+ * (S5E8890-pmu.c) and DFS switching code (S5E8890-dfs.c), sometimes as part of
+ * a specific on/off sequence. Forcing them all to a fixed state at CMU-init
+ * time via the qch_regs mechanism added earlier in this effort (for 9810/9610)
+ * would not be a like-for-like port and could fight with that sequencing --
+ * this is very likely why the real in-review upstream Exynos8890 clock driver
+ * patch (Ivaylo Ivanov, LKML, Oct 2025) implements bespoke HWACG handling
+ * rather than reusing the shared arm64 helper.
+ *
+ * All PLLs in the downstream source pass a NULL rate table (no DVFS operating
+ * points provided), so every PLL here runs at whatever rate the bootloader
+ * configured -- consistent with this project's existing "preserve
+ * bootloader-configured PLL rates" bring-up convention.
+ *
+ * NONE of this has been verified against real hardware yet. A real Galaxy S7
+ * (SM-G930FD) is available for this effort; this driver has not been tested
+ * on it.
+ */
+
+#include <linux/clk-provider.h>
+#include <linux/of.h>
+#include <linux/platform_device.h>
+
+#include <dt-bindings/clock/samsung,exynos8890.h>
+
+#include "clk.h"
+#include "clk-pll.h"
+#include "clk-exynos-arm64.h"
+
+/* NOTE: Must be equal to the last clock ID for this CMU, increased by one. */
+#define CLKS_NR_PERIS	(CLK_GOUT_PERIS_HWACG_PROMISE_PERIS + 1)
+#define CLKS_NR_TOP	(CLK_PHYCLK_UFS_LINK_SDCARD_REFCLK_OUT_SOC_PHY + 1)
+#define CLKS_NR_CCORE	(CLK_GOUT_CCORE_GATE_SCLK_PROMISE + 1)
+#define CLKS_NR_MIF0	(CLK_GOUT_MIF0_GATE_RCLK_DREX + 1)
+#define CLKS_NR_MIF1	(CLK_GOUT_MIF1_GATE_RCLK_DREX + 1)
+#define CLKS_NR_MIF2	(CLK_GOUT_MIF2_GATE_RCLK_DREX + 1)
+#define CLKS_NR_MIF3	(CLK_GOUT_MIF3_GATE_RCLK_DREX + 1)
+#define CLKS_NR_FSYS0	(CLK_PHYCLK_USBHOST20_PHYCLOCK_PHY + 1)
+#define CLKS_NR_IMEM	(CLK_GOUT_IMEM_HWACG_ASYNCAHBM_SSS_ATLAS + 1)
+#define CLKS_NR_AUD	(CLK_IOCLK_I2S_BCLK + 1)
+#define CLKS_NR_MNGS	(CLK_GOUT_MNGS_GATE_SCLK_PROMISE0_MNGS + 1)
+#define CLKS_NR_APOLLO	(CLK_GOUT_APOLLO_GATE_SCLK_PROMISE_APOLLO + 1)
+#define CLKS_NR_BUS0	(CLK_GOUT_BUS0_GATE_ACLK_TREX_P_BUS0 + 1)
+#define CLKS_NR_BUS1	(CLK_GOUT_BUS1_GATE_ACLK_TREX_P_BUS1 + 1)
+#define CLKS_NR_PERIC0	(CLK_GOUT_PERIC0_HWACG_HSI2C11 + 1)
+#define CLKS_NR_DISP0	(CLK_PHYCLK_DPPHY_CH3_TXD_CLK_PHY + 1)
+#define CLKS_NR_DISP1	(CLK_PHYCLK_DISP1_HDMIPHY_PIXEL_CLKO_PHY + 1)
+#define CLKS_NR_CAM0_LOCAL	(CLK_GOUT_CAM0_LOCAL_GATE_PCLK_CSIS0 + 1)
+#define CLKS_NR_CAM0	(CLK_PHYCLK_RXBYTECLKHS1_CSIS1 + 1)
+#define CLKS_NR_CAM1_LOCAL	(CLK_GOUT_CAM1_LOCAL_GATE_ACLK_MC_SC + 1)
+#define CLKS_NR_CAM1	(CLK_PHYCLK_RXBYTECLKHS0_CSIS3 + 1)
+#define CLKS_NR_ISP0_LOCAL	(CLK_GOUT_ISP0_LOCAL_GATE_PCLK_TREX_C + 1)
+#define CLKS_NR_ISP0	(CLK_GOUT_ISP0_GATE_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D + 1)
+#define CLKS_NR_ISP1_LOCAL	(CLK_GOUT_ISP1_LOCAL_GATE_PCLK_FIMC_ISP1 + 1)
+#define CLKS_NR_ISP1	(CLK_GOUT_ISP1_GATE_SCLK_PROMISE_ISP1 + 1)
+#define CLKS_NR_G3D	(CLK_GOUT_G3D_GATE_SCLK_ASYNCAXI_G3D + 1)
+#define CLKS_NR_PERIC1	(CLK_GOUT_PERIC1_HWACG_HSI2C14 + 1)
+#define CLKS_NR_MSCL	(CLK_GOUT_MSCL_GATE_PCLK_SFW_MSCL_1 + 1)
+#define CLKS_NR_MFC	(CLK_GOUT_MFC_HWACG_PROMISE_MFC + 1)
+#define CLKS_NR_FSYS1	(CLK_PHYCLK_PCIE_WIFI1_DIG_REFCLK_PHY + 1)
+
+/* ---- CMU_PERIS -------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_PERIS (0x10040000) */
+#define PERIS_MUX_ACLK_PERIS_66_USER			0x0200
+#define PERIS_GATE_PCLK_SFR_APBIF_HDMI_CEC			0x0800
+#define PERIS_GATE_PCLK_HPM_APBIF_PERIS			0x0804
+#define PERIS_GATE_PCLK_TZPC_15			0x0808
+#define PERIS_GATE_PCLK_TOP_RTC			0x080c
+#define PERIS_GATE_PCLK_SFR_APBIF_CHIPID			0x0814
+#define PERIS_GATE_SCLK_OTP_CON_TOP			0x0844
+#define PERIS_GATE_SCLK_CHIPID			0x0848
+#define PERIS_GATE_SCLK_TMU			0x084c
+#define PERIS_GATE_SCLK_PROMISE_PERIS			0x0850
+#define PERIS_HWACG_MCT			0x240c
+#define PERIS_HWACG_WDT_MNGS			0x2410
+#define PERIS_HWACG_WDT_APOLLO			0x2414
+#define PERIS_HWACG_RTC_APBIF			0x2418
+#define PERIS_HWACG_SFR_APBIF_TMU			0x241c
+#define PERIS_HWACG_SFR_APBIF_HDMI_CEC			0x2420
+#define PERIS_HWACG_HPM_APBIF_PERIS			0x2424
+#define PERIS_HWACG_TZPC_0			0x2428
+#define PERIS_HWACG_TZPC_1			0x242c
+#define PERIS_HWACG_TZPC_2			0x2430
+#define PERIS_HWACG_TZPC_3			0x2434
+#define PERIS_HWACG_TZPC_4			0x2438
+#define PERIS_HWACG_TZPC_5			0x243c
+#define PERIS_HWACG_TZPC_6			0x2440
+#define PERIS_HWACG_TZPC_7			0x2444
+#define PERIS_HWACG_TZPC_8			0x2448
+#define PERIS_HWACG_TZPC_9			0x244c
+#define PERIS_HWACG_TZPC_10			0x2450
+#define PERIS_HWACG_TZPC_11			0x2454
+#define PERIS_HWACG_TZPC_12			0x2458
+#define PERIS_HWACG_TZPC_13			0x245c
+#define PERIS_HWACG_TZPC_14			0x2460
+#define PERIS_HWACG_TZPC_15			0x2464
+#define PERIS_HWACG_TOP_RTC			0x2468
+#define PERIS_HWACG_OTP_CON_TOP			0x246c
+#define PERIS_HWACG_SFR_APBIF_CHIPID			0x2470
+#define PERIS_HWACG_TMU			0x2474
+#define PERIS_HWACG_CHIPID			0x2484
+#define PERIS_HWACG_PROMISE_PERIS			0x2488
+
+static const unsigned long peris_clk_regs[] __initconst = {
+	PERIS_MUX_ACLK_PERIS_66_USER,
+	PERIS_GATE_PCLK_SFR_APBIF_HDMI_CEC,
+	PERIS_GATE_PCLK_HPM_APBIF_PERIS,
+	PERIS_GATE_PCLK_TZPC_15,
+	PERIS_GATE_PCLK_TOP_RTC,
+	PERIS_GATE_PCLK_SFR_APBIF_CHIPID,
+	PERIS_GATE_SCLK_OTP_CON_TOP,
+	PERIS_GATE_SCLK_CHIPID,
+	PERIS_GATE_SCLK_TMU,
+	PERIS_GATE_SCLK_PROMISE_PERIS,
+	PERIS_HWACG_MCT,
+	PERIS_HWACG_WDT_MNGS,
+	PERIS_HWACG_WDT_APOLLO,
+	PERIS_HWACG_RTC_APBIF,
+	PERIS_HWACG_SFR_APBIF_TMU,
+	PERIS_HWACG_SFR_APBIF_HDMI_CEC,
+	PERIS_HWACG_HPM_APBIF_PERIS,
+	PERIS_HWACG_TZPC_0,
+	PERIS_HWACG_TZPC_1,
+	PERIS_HWACG_TZPC_2,
+	PERIS_HWACG_TZPC_3,
+	PERIS_HWACG_TZPC_4,
+	PERIS_HWACG_TZPC_5,
+	PERIS_HWACG_TZPC_6,
+	PERIS_HWACG_TZPC_7,
+	PERIS_HWACG_TZPC_8,
+	PERIS_HWACG_TZPC_9,
+	PERIS_HWACG_TZPC_10,
+	PERIS_HWACG_TZPC_11,
+	PERIS_HWACG_TZPC_12,
+	PERIS_HWACG_TZPC_13,
+	PERIS_HWACG_TZPC_14,
+	PERIS_HWACG_TZPC_15,
+	PERIS_HWACG_TOP_RTC,
+	PERIS_HWACG_OTP_CON_TOP,
+	PERIS_HWACG_SFR_APBIF_CHIPID,
+	PERIS_HWACG_TMU,
+	PERIS_HWACG_CHIPID,
+	PERIS_HWACG_PROMISE_PERIS,
+};
+
+/* List of parent clocks for Muxes in CMU_PERIS */
+PNAME(mout_peris_mux_aclk_peris_66_user_p) = { "oscclk", "gout_top_gate_aclk_peris_66" };
+
+static const struct samsung_mux_clock peris_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_PERIS_MUX_ACLK_PERIS_66_USER, "mout_peris_mux_aclk_peris_66_user",
+	    mout_peris_mux_aclk_peris_66_user_p,
+	    PERIS_MUX_ACLK_PERIS_66_USER, 12, 1),
+};
+
+static const struct samsung_gate_clock peris_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_SFR_APBIF_HDMI_CEC, "gout_peris_gate_pclk_sfr_apbif_hdmi_cec",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_SFR_APBIF_HDMI_CEC, 13, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_SFR_APBIF_TMU, "gout_peris_gate_pclk_sfr_apbif_tmu",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_SFR_APBIF_HDMI_CEC, 12, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_RTC_APBIF, "gout_peris_gate_pclk_rtc_apbif",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_SFR_APBIF_HDMI_CEC, 11, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_MONOCNT_APBIF, "gout_peris_gate_pclk_monocnt_apbif",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_SFR_APBIF_HDMI_CEC, 10, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_WDT_APOLLO, "gout_peris_gate_pclk_wdt_apollo",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_SFR_APBIF_HDMI_CEC, 9, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_WDT_MNGS, "gout_peris_gate_pclk_wdt_mngs",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_SFR_APBIF_HDMI_CEC, 8, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_MCT, "gout_peris_gate_pclk_mct",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_SFR_APBIF_HDMI_CEC, 7, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_SYSREG_PERIS, "gout_peris_gate_pclk_sysreg_peris",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_SFR_APBIF_HDMI_CEC, 6, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_PMU_PERIS, "gout_peris_gate_pclk_pmu_peris",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_SFR_APBIF_HDMI_CEC, 5, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_CMU_PERIS, "gout_peris_gate_pclk_cmu_peris",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_SFR_APBIF_HDMI_CEC, 4, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_PERIS_GATE_ACLK_AXI2APB_PERIS1, "gout_peris_gate_aclk_axi2apb_peris1",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_SFR_APBIF_HDMI_CEC, 3, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_ACLK_AXI2APB_PERIS0, "gout_peris_gate_aclk_axi2apb_peris0",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_SFR_APBIF_HDMI_CEC, 2, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_ACLK_XIU_PERIS, "gout_peris_gate_aclk_xiu_peris",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_SFR_APBIF_HDMI_CEC, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_ACLK_AXI_LH_ASYNC, "gout_peris_gate_aclk_axi_lh_async",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_SFR_APBIF_HDMI_CEC, 0, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_HPM_APBIF_PERIS, "gout_peris_gate_pclk_hpm_apbif_peris",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_HPM_APBIF_PERIS, 0, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_TZPC_15, "gout_peris_gate_pclk_tzpc_15",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_TZPC_15, 15, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_TZPC_14, "gout_peris_gate_pclk_tzpc_14",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_TZPC_15, 14, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_TZPC_13, "gout_peris_gate_pclk_tzpc_13",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_TZPC_15, 13, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_TZPC_12, "gout_peris_gate_pclk_tzpc_12",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_TZPC_15, 12, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_TZPC_11, "gout_peris_gate_pclk_tzpc_11",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_TZPC_15, 11, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_TZPC_10, "gout_peris_gate_pclk_tzpc_10",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_TZPC_15, 10, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_TZPC_9, "gout_peris_gate_pclk_tzpc_9",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_TZPC_15, 9, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_TZPC_8, "gout_peris_gate_pclk_tzpc_8",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_TZPC_15, 8, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_TZPC_7, "gout_peris_gate_pclk_tzpc_7",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_TZPC_15, 7, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_TZPC_6, "gout_peris_gate_pclk_tzpc_6",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_TZPC_15, 6, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_TZPC_5, "gout_peris_gate_pclk_tzpc_5",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_TZPC_15, 5, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_TZPC_4, "gout_peris_gate_pclk_tzpc_4",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_TZPC_15, 4, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_TZPC_3, "gout_peris_gate_pclk_tzpc_3",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_TZPC_15, 3, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_TZPC_2, "gout_peris_gate_pclk_tzpc_2",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_TZPC_15, 2, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_TZPC_1, "gout_peris_gate_pclk_tzpc_1",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_TZPC_15, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_TZPC_0, "gout_peris_gate_pclk_tzpc_0",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_TZPC_15, 0, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_TOP_RTC, "gout_peris_gate_pclk_top_rtc",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_TOP_RTC, 0, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_PCLK_SFR_APBIF_CHIPID, "gout_peris_gate_pclk_sfr_apbif_chipid",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_GATE_PCLK_SFR_APBIF_CHIPID, 0, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_SCLK_OTP_CON_TOP, "gout_peris_gate_sclk_otp_con_top", "oscclk",
+	     PERIS_GATE_SCLK_OTP_CON_TOP, 0, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_SCLK_CHIPID, "gout_peris_gate_sclk_chipid", "oscclk",
+	     PERIS_GATE_SCLK_CHIPID, 0, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_SCLK_TMU, "gout_peris_gate_sclk_tmu", "oscclk",
+	     PERIS_GATE_SCLK_TMU, 0, 0, 0),
+	GATE(CLK_GOUT_PERIS_GATE_SCLK_PROMISE_PERIS, "gout_peris_gate_sclk_promise_peris",
+	     "gout_top_gate_sclk_promise_int",
+	     PERIS_GATE_SCLK_PROMISE_PERIS, 0, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_MCT, "gout_peris_hwacg_mct", "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_MCT, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_WDT_MNGS, "gout_peris_hwacg_wdt_mngs",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_WDT_MNGS, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_WDT_APOLLO, "gout_peris_hwacg_wdt_apollo",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_WDT_APOLLO, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_RTC_APBIF, "gout_peris_hwacg_rtc_apbif",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_RTC_APBIF, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_SFR_APBIF_TMU, "gout_peris_hwacg_sfr_apbif_tmu",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_SFR_APBIF_TMU, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_SFR_APBIF_HDMI_CEC, "gout_peris_hwacg_sfr_apbif_hdmi_cec",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_SFR_APBIF_HDMI_CEC, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_HPM_APBIF_PERIS, "gout_peris_hwacg_hpm_apbif_peris",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_HPM_APBIF_PERIS, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_TZPC_0, "gout_peris_hwacg_tzpc_0",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_TZPC_0, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_TZPC_1, "gout_peris_hwacg_tzpc_1",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_TZPC_1, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_TZPC_2, "gout_peris_hwacg_tzpc_2",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_TZPC_2, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_TZPC_3, "gout_peris_hwacg_tzpc_3",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_TZPC_3, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_TZPC_4, "gout_peris_hwacg_tzpc_4",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_TZPC_4, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_TZPC_5, "gout_peris_hwacg_tzpc_5",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_TZPC_5, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_TZPC_6, "gout_peris_hwacg_tzpc_6",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_TZPC_6, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_TZPC_7, "gout_peris_hwacg_tzpc_7",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_TZPC_7, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_TZPC_8, "gout_peris_hwacg_tzpc_8",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_TZPC_8, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_TZPC_9, "gout_peris_hwacg_tzpc_9",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_TZPC_9, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_TZPC_10, "gout_peris_hwacg_tzpc_10",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_TZPC_10, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_TZPC_11, "gout_peris_hwacg_tzpc_11",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_TZPC_11, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_TZPC_12, "gout_peris_hwacg_tzpc_12",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_TZPC_12, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_TZPC_13, "gout_peris_hwacg_tzpc_13",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_TZPC_13, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_TZPC_14, "gout_peris_hwacg_tzpc_14",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_TZPC_14, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_TZPC_15, "gout_peris_hwacg_tzpc_15",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_TZPC_15, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_TOP_RTC, "gout_peris_hwacg_top_rtc",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_TOP_RTC, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_OTP_CON_TOP, "gout_peris_hwacg_otp_con_top",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_OTP_CON_TOP, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_SFR_APBIF_CHIPID, "gout_peris_hwacg_sfr_apbif_chipid",
+	     "mout_peris_mux_aclk_peris_66_user",
+	     PERIS_HWACG_SFR_APBIF_CHIPID, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_TMU, "gout_peris_hwacg_tmu", "oscclk",
+	     PERIS_HWACG_TMU, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_CHIPID, "gout_peris_hwacg_chipid", "oscclk",
+	     PERIS_HWACG_CHIPID, 1, 0, 0),
+	GATE(CLK_GOUT_PERIS_HWACG_PROMISE_PERIS, "gout_peris_hwacg_promise_peris",
+	     "gout_top_gate_sclk_promise_int",
+	     PERIS_HWACG_PROMISE_PERIS, 1, 0, 0),
+};
+
+static const struct samsung_cmu_info peris_cmu_info __initconst = {
+	.mux_clks		= peris_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(peris_mux_clks),
+	.gate_clks		= peris_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(peris_gate_clks),
+	.nr_clk_ids		= CLKS_NR_PERIS,
+	.clk_regs		= peris_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(peris_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_peris_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &peris_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_peris, "samsung,exynos8890-cmu-peris",
+	       exynos8890_cmu_peris_init);
+
+/* ---- CMU_TOP ---------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_TOP (0x10570000) */
+#define BUS0_PLL_LOCK			0x0000
+#define BUS1_PLL_LOCK			0x0020
+#define BUS2_PLL_LOCK			0x0040
+#define BUS3_PLL_LOCK			0x0060
+#define MFC_PLL_LOCK			0x0080
+#define ISP_PLL_LOCK			0x00a0
+#define AUD_PLL_LOCK			0x00c0
+#define G3D_PLL_LOCK			0x00e0
+#define BUS0_PLL_CON0			0x0100
+#define BUS1_PLL_CON0			0x0120
+#define BUS2_PLL_CON0			0x0140
+#define BUS3_PLL_CON0			0x0160
+#define MFC_PLL_CON0			0x0180
+#define ISP_PLL_CON0			0x01a0
+#define AUD_PLL_CON0			0x01c0
+#define G3D_PLL_CON0			0x01e0
+#define TOP_MUX_BUS0_PLL			0x0200
+#define TOP_MUX_BUS1_PLL			0x0204
+#define TOP_MUX_BUS2_PLL			0x0208
+#define TOP_MUX_BUS3_PLL			0x020c
+#define TOP_MUX_MFC_PLL			0x0210
+#define TOP_MUX_ISP_PLL			0x0214
+#define TOP_MUX_AUD_PLL			0x0218
+#define TOP_MUX_G3D_PLL			0x021c
+#define TOP_MUX_SCLK_BUS0_PLL			0x0220
+#define TOP_MUX_SCLK_BUS1_PLL			0x0224
+#define TOP_MUX_SCLK_BUS2_PLL			0x0228
+#define TOP_MUX_SCLK_BUS3_PLL			0x022c
+#define TOP_MUX_SCLK_MFC_PLL			0x0230
+#define TOP_MUX_SCLK_ISP_PLL			0x0234
+#define TOP_MUX_ACLK_CCORE_800			0x0240
+#define TOP_MUX_ACLK_CCORE_264			0x0244
+#define TOP_MUX_ACLK_CCORE_G3D_800			0x0248
+#define TOP_MUX_ACLK_CCORE_528			0x024c
+#define TOP_MUX_ACLK_CCORE_132			0x0250
+#define TOP_MUX_PCLK_CCORE_66			0x0254
+#define TOP_MUX_ACLK_BUS0_528			0x0258
+#define TOP_MUX_ACLK_BUS0_200			0x025c
+#define TOP_MUX_PCLK_BUS0_132			0x0260
+#define TOP_MUX_ACLK_BUS1_528			0x0264
+#define TOP_MUX_PCLK_BUS1_132			0x0268
+#define TOP_MUX_ACLK_DISP0_0_400			0x026c
+#define TOP_MUX_ACLK_DISP0_1_400			0x0270
+#define TOP_MUX_ACLK_DISP1_0_400			0x0274
+#define TOP_MUX_ACLK_DISP1_1_400			0x0278
+#define TOP_MUX_ACLK_MFC_600			0x027c
+#define TOP_MUX_ACLK_MSCL0_528			0x0280
+#define TOP_MUX_ACLK_MSCL1_528			0x0284
+#define TOP_MUX_ACLK_IMEM_266			0x0288
+#define TOP_MUX_ACLK_IMEM_200			0x028c
+#define TOP_MUX_ACLK_IMEM_100			0x0290
+#define TOP_MUX_ACLK_FSYS0_200			0x0294
+#define TOP_MUX_ACLK_FSYS1_200			0x0298
+#define TOP_MUX_ACLK_PERIS_66			0x029c
+#define TOP_MUX_ACLK_PERIC0_66			0x02a0
+#define TOP_MUX_ACLK_PERIC1_66			0x02a4
+#define TOP_MUX_ACLK_ISP0_ISP0_528			0x02a8
+#define TOP_MUX_ACLK_ISP0_TPU_400			0x02ac
+#define TOP_MUX_ACLK_ISP0_TREX_528			0x02b0
+#define TOP_MUX_ACLK_ISP1_ISP1_468			0x02b4
+#define TOP_MUX_ACLK_CAM0_CSIS0_414			0x02b8
+#define TOP_MUX_ACLK_CAM0_CSIS1_168			0x02bc
+#define TOP_MUX_ACLK_CAM0_CSIS2_234			0x02c0
+#define TOP_MUX_ACLK_CAM0_3AA0_414			0x02c4
+#define TOP_MUX_ACLK_CAM0_3AA1_414			0x02c8
+#define TOP_MUX_ACLK_CAM0_CSIS3_132			0x02cc
+#define TOP_MUX_ACLK_CAM0_TREX_528			0x02d0
+#define TOP_MUX_ACLK_CAM1_ARM_672			0x02d4
+#define TOP_MUX_ACLK_CAM1_TREX_VRA_528			0x02d8
+#define TOP_MUX_ACLK_CAM1_TREX_B_528			0x02dc
+#define TOP_MUX_ACLK_CAM1_BUS_264			0x02e0
+#define TOP_MUX_ACLK_CAM1_PERI_84			0x02e4
+#define TOP_MUX_ACLK_CAM1_CSIS2_414			0x02e8
+#define TOP_MUX_ACLK_CAM1_CSIS3_132			0x02ec
+#define TOP_MUX_ACLK_CAM1_SCL_566			0x02f0
+#define TOP_MUX_SCLK_DISP0_DECON0_ECLK0			0x02f4
+#define TOP_MUX_SCLK_DISP0_DECON0_VCLK0			0x02f8
+#define TOP_MUX_SCLK_DISP0_DECON0_VCLK1			0x02fc
+#define TOP_MUX_SCLK_DISP0_HDMI_AUDIO			0x0300
+#define TOP_MUX_SCLK_DISP1_DECON1_ECLK0			0x0304
+#define TOP_MUX_SCLK_DISP1_DECON1_ECLK1			0x0308
+#define TOP_MUX_SCLK_FSYS0_USBDRD30			0x030c
+#define TOP_MUX_SCLK_FSYS0_MMC0			0x0310
+#define TOP_MUX_SCLK_FSYS0_UFSUNIPRO20			0x0314
+#define TOP_MUX_SCLK_FSYS0_PHY_24M			0x0318
+#define TOP_MUX_SCLK_FSYS0_UFSUNIPRO_CFG			0x031c
+#define TOP_MUX_SCLK_FSYS1_MMC2			0x0320
+#define TOP_MUX_SCLK_FSYS1_UFSUNIPRO20			0x0324
+#define TOP_MUX_SCLK_FSYS1_PCIE_PHY			0x0328
+#define TOP_MUX_SCLK_FSYS1_UFSUNIPRO_CFG			0x032c
+#define TOP_MUX_SCLK_PERIC0_UART0			0x0330
+#define TOP_MUX_SCLK_PERIC1_SPI0			0x0334
+#define TOP_MUX_SCLK_PERIC1_SPI1			0x0338
+#define TOP_MUX_SCLK_PERIC1_SPI2			0x033c
+#define TOP_MUX_SCLK_PERIC1_SPI3			0x0340
+#define TOP_MUX_SCLK_PERIC1_SPI4			0x0344
+#define TOP_MUX_SCLK_PERIC1_SPI5			0x0348
+#define TOP_MUX_SCLK_PERIC1_SPI6			0x034c
+#define TOP_MUX_SCLK_PERIC1_SPI7			0x0350
+#define TOP_MUX_SCLK_PERIC1_UART1			0x0354
+#define TOP_MUX_SCLK_PERIC1_UART2			0x0358
+#define TOP_MUX_SCLK_PERIC1_UART3			0x035c
+#define TOP_MUX_SCLK_PERIC1_UART4			0x0360
+#define TOP_MUX_SCLK_PERIC1_UART5			0x0364
+#define TOP_MUX_SCLK_CAM1_ISP_SPI0			0x0368
+#define TOP_MUX_SCLK_CAM1_ISP_SPI1			0x036c
+#define TOP_MUX_SCLK_CAM1_ISP_UART			0x0370
+#define TOP_MUX_SCLK_AP2CP_MIF_PLL_OUT			0x0374
+#define TOP_MUX_ACLK_PSCDC_400			0x0378
+#define TOP_MUX_SCLK_BUS_PLL_MNGS			0x0380
+#define TOP_MUX_SCLK_BUS_PLL_APOLLO			0x0384
+#define TOP_MUX_SCLK_BUS_PLL_MIF			0x0388
+#define TOP_MUX_SCLK_BUS_PLL_G3D			0x038c
+#define TOP_MUX_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D	0x0390
+#define TOP_DIV_ACLK_CCORE_800			0x03a0
+#define TOP_DIV_ACLK_CCORE_264			0x03a4
+#define TOP_DIV_ACLK_CCORE_G3D_800			0x03a8
+#define TOP_DIV_ACLK_CCORE_528			0x03ac
+#define TOP_DIV_ACLK_CCORE_132			0x03b0
+#define TOP_DIV_PCLK_CCORE_66			0x03b4
+#define TOP_DIV_ACLK_BUS0_528			0x03b8
+#define TOP_DIV_ACLK_BUS0_200			0x03bc
+#define TOP_DIV_PCLK_BUS0_132			0x03c0
+#define TOP_DIV_ACLK_BUS1_528			0x03c4
+#define TOP_DIV_PCLK_BUS1_132			0x03c8
+#define TOP_DIV_ACLK_DISP0_0_400			0x03cc
+#define TOP_DIV_ACLK_DISP0_1_400			0x03d0
+#define TOP_DIV_ACLK_DISP1_0_400			0x03d4
+#define TOP_DIV_ACLK_DISP1_1_400			0x03d8
+#define TOP_DIV_ACLK_MFC_600			0x03dc
+#define TOP_DIV_ACLK_MSCL0_528			0x03e0
+#define TOP_DIV_ACLK_MSCL1_528			0x03e4
+#define TOP_DIV_ACLK_IMEM_266			0x03e8
+#define TOP_DIV_ACLK_IMEM_200			0x03ec
+#define TOP_DIV_ACLK_IMEM_100			0x03f0
+#define TOP_DIV_ACLK_FSYS0_200			0x03f4
+#define TOP_DIV_ACLK_FSYS1_200			0x03f8
+#define TOP_DIV_ACLK_PERIS_66			0x03fc
+#define TOP_DIV_ACLK_PERIC0_66			0x0400
+#define TOP_DIV_ACLK_PERIC1_66			0x0404
+#define TOP_DIV_ACLK_ISP0_ISP0_528			0x0408
+#define TOP_DIV_ACLK_ISP0_TPU_400			0x040c
+#define TOP_DIV_ACLK_ISP0_TREX_528			0x0410
+#define TOP_DIV_ACLK_ISP1_ISP1_468			0x0414
+#define TOP_DIV_ACLK_CAM0_CSIS0_414			0x0418
+#define TOP_DIV_ACLK_CAM0_CSIS1_168			0x041c
+#define TOP_DIV_ACLK_CAM0_CSIS2_234			0x0420
+#define TOP_DIV_ACLK_CAM0_3AA0_414			0x0424
+#define TOP_DIV_ACLK_CAM0_3AA1_414			0x0428
+#define TOP_DIV_ACLK_CAM0_CSIS3_132			0x042c
+#define TOP_DIV_ACLK_CAM0_TREX_528			0x0430
+#define TOP_DIV_ACLK_CAM1_ARM_672			0x0434
+#define TOP_DIV_ACLK_CAM1_TREX_VRA_528			0x0438
+#define TOP_DIV_ACLK_CAM1_TREX_B_528			0x043c
+#define TOP_DIV_ACLK_CAM1_BUS_264			0x0440
+#define TOP_DIV_ACLK_CAM1_PERI_84			0x0444
+#define TOP_DIV_ACLK_CAM1_CSIS2_414			0x0448
+#define TOP_DIV_ACLK_CAM1_CSIS3_132			0x044c
+#define TOP_DIV_ACLK_CAM1_SCL_566			0x0450
+#define TOP_DIV_SCLK_DISP0_DECON0_ECLK0			0x0454
+#define TOP_DIV_SCLK_DISP0_DECON0_VCLK0			0x0458
+#define TOP_DIV_SCLK_DISP0_DECON0_VCLK1			0x045c
+#define TOP_DIV_SCLK_DISP0_HDMI_AUDIO			0x0460
+#define TOP_DIV_SCLK_DISP1_DECON1_ECLK0			0x0464
+#define TOP_DIV_SCLK_DISP1_DECON1_ECLK1			0x0468
+#define TOP_DIV_SCLK_FSYS0_USBDRD30			0x046c
+#define TOP_DIV_SCLK_FSYS0_MMC0			0x0470
+#define TOP_DIV_SCLK_FSYS0_UFSUNIPRO20			0x0474
+#define TOP_DIV_SCLK_FSYS0_PHY_24M			0x0478
+#define TOP_DIV_SCLK_FSYS0_UFSUNIPRO_CFG			0x047c
+#define TOP_DIV_SCLK_FSYS1_MMC2			0x0480
+#define TOP_DIV_SCLK_FSYS1_UFSUNIPRO20			0x0484
+#define TOP_DIV_SCLK_FSYS1_PCIE_PHY			0x0488
+#define TOP_DIV_SCLK_FSYS1_UFSUNIPRO_CFG			0x048c
+#define TOP_DIV_SCLK_PERIC0_UART0			0x0490
+#define TOP_DIV_SCLK_PERIC1_SPI0			0x0494
+#define TOP_DIV_SCLK_PERIC1_SPI1			0x0498
+#define TOP_DIV_SCLK_PERIC1_SPI2			0x049c
+#define TOP_DIV_SCLK_PERIC1_SPI3			0x04a0
+#define TOP_DIV_SCLK_PERIC1_SPI4			0x04a4
+#define TOP_DIV_SCLK_PERIC1_SPI5			0x04a8
+#define TOP_DIV_SCLK_PERIC1_SPI6			0x04ac
+#define TOP_DIV_SCLK_PERIC1_SPI7			0x04b0
+#define TOP_DIV_SCLK_PERIC1_UART1			0x04b4
+#define TOP_DIV_SCLK_PERIC1_UART2			0x04b8
+#define TOP_DIV_SCLK_PERIC1_UART3			0x04bc
+#define TOP_DIV_SCLK_PERIC1_UART4			0x04c0
+#define TOP_DIV_SCLK_PERIC1_UART5			0x04c4
+#define TOP_DIV_SCLK_CAM1_ISP_SPI0			0x04c8
+#define TOP_DIV_SCLK_CAM1_ISP_SPI1			0x04cc
+#define TOP_DIV_SCLK_CAM1_ISP_UART			0x04d0
+#define TOP_DIV_SCLK_AP2CP_MIF_PLL_OUT			0x04d4
+#define TOP_DIV_ACLK_PSCDC_400			0x04d8
+#define TOP_DIV_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D	0x04dc
+#define TOP_DIV_SCLK_BUS_PLL_MNGS			0x04f0
+#define TOP_DIV_SCLK_BUS_PLL_APOLLO			0x04f4
+#define TOP_DIV_SCLK_BUS_PLL_MIF			0x04f8
+#define TOP_DIV_SCLK_BUS_PLL_G3D			0x04fc
+#define TOP_GATE_ACLK_CCORE_800			0x0800
+#define TOP_GATE_ACLK_CCORE_264			0x0804
+#define TOP_GATE_ACLK_CCORE_G3D_800			0x0808
+#define TOP_GATE_ACLK_CCORE_528			0x080c
+#define TOP_GATE_ACLK_CCORE_132			0x0810
+#define TOP_GATE_PCLK_CCORE_66			0x0814
+#define TOP_GATE_ACLK_BUS0_528			0x0818
+#define TOP_GATE_ACLK_BUS0_200			0x081c
+#define TOP_GATE_PCLK_BUS0_132			0x0820
+#define TOP_GATE_ACLK_BUS1_528			0x0824
+#define TOP_GATE_PCLK_BUS1_132			0x0828
+#define TOP_GATE_ACLK_DISP0_0_400			0x082c
+#define TOP_GATE_ACLK_DISP0_1_400			0x0830
+#define TOP_GATE_ACLK_DISP1_0_400			0x0834
+#define TOP_GATE_ACLK_DISP1_1_400			0x0838
+#define TOP_GATE_ACLK_MFC_600			0x083c
+#define TOP_GATE_ACLK_MSCL0_528			0x0840
+#define TOP_GATE_ACLK_MSCL1_528			0x0844
+#define TOP_GATE_ACLK_IMEM_266			0x0848
+#define TOP_GATE_ACLK_IMEM_200			0x084c
+#define TOP_GATE_ACLK_IMEM_100			0x0850
+#define TOP_GATE_ACLK_FSYS0_200			0x0854
+#define TOP_GATE_ACLK_FSYS1_200			0x0858
+#define TOP_GATE_ACLK_PERIS_66			0x085c
+#define TOP_GATE_ACLK_PERIC0_66			0x0860
+#define TOP_GATE_ACLK_PERIC1_66			0x0864
+#define TOP_GATE_ACLK_ISP0_ISP0_528			0x0868
+#define TOP_GATE_ACLK_ISP0_TPU_400			0x086c
+#define TOP_GATE_ACLK_ISP0_TREX_528			0x0870
+#define TOP_GATE_ACLK_ISP1_ISP1_468			0x0874
+#define TOP_GATE_ACLK_CAM0_CSIS0_414			0x0878
+#define TOP_GATE_ACLK_CAM0_CSIS1_168			0x087c
+#define TOP_GATE_ACLK_CAM0_CSIS2_234			0x0880
+#define TOP_GATE_ACLK_CAM0_3AA0_414			0x0884
+#define TOP_GATE_ACLK_CAM0_3AA1_414			0x0888
+#define TOP_GATE_ACLK_CAM0_CSIS3_132			0x088c
+#define TOP_GATE_ACLK_CAM0_TREX_528			0x0890
+#define TOP_GATE_ACLK_CAM1_ARM_672			0x0894
+#define TOP_GATE_ACLK_CAM1_TREX_VRA_528			0x0898
+#define TOP_GATE_ACLK_CAM1_TREX_B_528			0x089c
+#define TOP_GATE_ACLK_CAM1_BUS_264			0x08a0
+#define TOP_GATE_ACLK_CAM1_PERI_84			0x08a4
+#define TOP_GATE_ACLK_CAM1_CSIS2_414			0x08a8
+#define TOP_GATE_ACLK_CAM1_CSIS3_132			0x08ac
+#define TOP_GATE_ACLK_CAM1_SCL_566			0x08b0
+#define TOP_GATE_SCLK_DISP0_DECON0_ECLK0			0x0900
+#define TOP_GATE_SCLK_DISP0_DECON0_VCLK0			0x0904
+#define TOP_GATE_SCLK_DISP0_DECON0_VCLK1			0x0908
+#define TOP_GATE_SCLK_DISP0_HDMI_AUDIO			0x090c
+#define TOP_GATE_SCLK_DISP1_DECON1_ECLK0			0x0910
+#define TOP_GATE_SCLK_DISP1_DECON1_ECLK1			0x0914
+#define TOP_GATE_SCLK_FSYS0_USBDRD30			0x0918
+#define TOP_GATE_SCLK_FSYS0_MMC0			0x091c
+#define TOP_GATE_SCLK_FSYS0_UFSUNIPRO20			0x0920
+#define TOP_GATE_SCLK_FSYS0_PHY_24M			0x0924
+#define TOP_GATE_SCLK_FSYS0_UFSUNIPRO_CFG			0x0928
+#define TOP_GATE_SCLK_FSYS1_MMC2			0x092c
+#define TOP_GATE_SCLK_FSYS1_UFSUNIPRO20			0x0930
+#define TOP_GATE_SCLK_FSYS1_PCIE_PHY			0x0934
+#define TOP_GATE_SCLK_FSYS1_UFSUNIPRO_CFG			0x0938
+#define TOP_GATE_SCLK_PERIC0_UART0			0x093c
+#define TOP_GATE_SCLK_PERIC1_SPI0			0x0940
+#define TOP_GATE_SCLK_PERIC1_SPI1			0x0944
+#define TOP_GATE_SCLK_PERIC1_SPI2			0x0948
+#define TOP_GATE_SCLK_PERIC1_SPI3			0x094c
+#define TOP_GATE_SCLK_PERIC1_SPI4			0x0950
+#define TOP_GATE_SCLK_PERIC1_SPI5			0x0954
+#define TOP_GATE_SCLK_PERIC1_SPI6			0x0958
+#define TOP_GATE_SCLK_PERIC1_SPI7			0x095c
+#define TOP_GATE_SCLK_PERIC1_UART1			0x0960
+#define TOP_GATE_SCLK_PERIC1_UART2			0x0964
+#define TOP_GATE_SCLK_PERIC1_UART3			0x0968
+#define TOP_GATE_SCLK_PERIC1_UART4			0x096c
+#define TOP_GATE_SCLK_PERIC1_UART5			0x0970
+#define TOP_GATE_SCLK_CAM1_ISP_SPI0			0x0974
+#define TOP_GATE_SCLK_CAM1_ISP_SPI1			0x0978
+#define TOP_GATE_SCLK_CAM1_ISP_UART			0x097c
+#define TOP_GATE_SCLK_AP2CP_MIF_PLL_OUT			0x0980
+#define TOP_GATE_ACLK_PSCDC_400			0x0984
+#define TOP_GATE_SCLK_BUS_PLL_MNGS			0x0990
+#define TOP_GATE_SCLK_BUS_PLL_APOLLO			0x0994
+#define TOP_GATE_SCLK_BUS_PLL_MIF			0x0998
+#define TOP_GATE_SCLK_BUS_PLL_G3D			0x099c
+#define TOP_GATE_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D	0x09a0
+#define TOP_MUX_SCLK_ISP_SENSOR0			0x0b00
+#define TOP_DIV_SCLK_ISP_SENSOR0			0x0b04
+#define TOP_GATE_SCLK_ISP_SENSOR0			0x0b0c
+#define TOP_MUX_SCLK_ISP_SENSOR1			0x0b10
+#define TOP_DIV_SCLK_ISP_SENSOR1			0x0b14
+#define TOP_GATE_SCLK_ISP_SENSOR1			0x0b1c
+#define TOP_MUX_SCLK_ISP_SENSOR2			0x0b20
+#define TOP_DIV_SCLK_ISP_SENSOR2			0x0b24
+#define TOP_GATE_SCLK_ISP_SENSOR2			0x0b2c
+#define TOP_MUX_SCLK_ISP_SENSOR3			0x0b30
+#define TOP_DIV_SCLK_ISP_SENSOR3			0x0b34
+#define TOP_GATE_SCLK_ISP_SENSOR3			0x0b3c
+#define TOP_MUX_SCLK_PROMISE_INT			0x0b40
+#define TOP_DIV_SCLK_PROMISE_INT			0x0b44
+#define TOP_GATE_SCLK_PROMISE_INT			0x0b4c
+#define TOP_MUX_SCLK_PROMISE_DISP			0x0b50
+#define TOP_DIV_SCLK_PROMISE_DISP			0x0b54
+#define TOP_GATE_SCLK_PROMISE_DISP			0x0b5c
+#define TOP_MUX_CP2AP_MIF_CLK_USER			0x0d00
+#define MIF_CLK_CTRL0			0x1080
+#define TOP_MUX_MIF_PLL			0x1088
+#define TOP_MUX_BUS_PLL_MIF			0x108c
+#define TOP_MUX_ACLK_MIF_PLL			0x1090
+
+/*
+ * Not real registers in this domain -- see the PLL emission below.
+ * Never added to the clk_regs[] list this domain's driver walks.
+ */
+#define MIF0_PLL_LOCK			0x0000
+
+static const unsigned long top_clk_regs[] __initconst = {
+	BUS0_PLL_LOCK,
+	BUS1_PLL_LOCK,
+	BUS2_PLL_LOCK,
+	BUS3_PLL_LOCK,
+	MFC_PLL_LOCK,
+	ISP_PLL_LOCK,
+	AUD_PLL_LOCK,
+	G3D_PLL_LOCK,
+	BUS0_PLL_CON0,
+	BUS1_PLL_CON0,
+	BUS2_PLL_CON0,
+	BUS3_PLL_CON0,
+	MFC_PLL_CON0,
+	ISP_PLL_CON0,
+	AUD_PLL_CON0,
+	G3D_PLL_CON0,
+	TOP_MUX_BUS0_PLL,
+	TOP_MUX_BUS1_PLL,
+	TOP_MUX_BUS2_PLL,
+	TOP_MUX_BUS3_PLL,
+	TOP_MUX_MFC_PLL,
+	TOP_MUX_ISP_PLL,
+	TOP_MUX_AUD_PLL,
+	TOP_MUX_G3D_PLL,
+	TOP_MUX_SCLK_BUS0_PLL,
+	TOP_MUX_SCLK_BUS1_PLL,
+	TOP_MUX_SCLK_BUS2_PLL,
+	TOP_MUX_SCLK_BUS3_PLL,
+	TOP_MUX_SCLK_MFC_PLL,
+	TOP_MUX_SCLK_ISP_PLL,
+	TOP_MUX_ACLK_CCORE_800,
+	TOP_MUX_ACLK_CCORE_264,
+	TOP_MUX_ACLK_CCORE_G3D_800,
+	TOP_MUX_ACLK_CCORE_528,
+	TOP_MUX_ACLK_CCORE_132,
+	TOP_MUX_PCLK_CCORE_66,
+	TOP_MUX_ACLK_BUS0_528,
+	TOP_MUX_ACLK_BUS0_200,
+	TOP_MUX_PCLK_BUS0_132,
+	TOP_MUX_ACLK_BUS1_528,
+	TOP_MUX_PCLK_BUS1_132,
+	TOP_MUX_ACLK_DISP0_0_400,
+	TOP_MUX_ACLK_DISP0_1_400,
+	TOP_MUX_ACLK_DISP1_0_400,
+	TOP_MUX_ACLK_DISP1_1_400,
+	TOP_MUX_ACLK_MFC_600,
+	TOP_MUX_ACLK_MSCL0_528,
+	TOP_MUX_ACLK_MSCL1_528,
+	TOP_MUX_ACLK_IMEM_266,
+	TOP_MUX_ACLK_IMEM_200,
+	TOP_MUX_ACLK_IMEM_100,
+	TOP_MUX_ACLK_FSYS0_200,
+	TOP_MUX_ACLK_FSYS1_200,
+	TOP_MUX_ACLK_PERIS_66,
+	TOP_MUX_ACLK_PERIC0_66,
+	TOP_MUX_ACLK_PERIC1_66,
+	TOP_MUX_ACLK_ISP0_ISP0_528,
+	TOP_MUX_ACLK_ISP0_TPU_400,
+	TOP_MUX_ACLK_ISP0_TREX_528,
+	TOP_MUX_ACLK_ISP1_ISP1_468,
+	TOP_MUX_ACLK_CAM0_CSIS0_414,
+	TOP_MUX_ACLK_CAM0_CSIS1_168,
+	TOP_MUX_ACLK_CAM0_CSIS2_234,
+	TOP_MUX_ACLK_CAM0_3AA0_414,
+	TOP_MUX_ACLK_CAM0_3AA1_414,
+	TOP_MUX_ACLK_CAM0_CSIS3_132,
+	TOP_MUX_ACLK_CAM0_TREX_528,
+	TOP_MUX_ACLK_CAM1_ARM_672,
+	TOP_MUX_ACLK_CAM1_TREX_VRA_528,
+	TOP_MUX_ACLK_CAM1_TREX_B_528,
+	TOP_MUX_ACLK_CAM1_BUS_264,
+	TOP_MUX_ACLK_CAM1_PERI_84,
+	TOP_MUX_ACLK_CAM1_CSIS2_414,
+	TOP_MUX_ACLK_CAM1_CSIS3_132,
+	TOP_MUX_ACLK_CAM1_SCL_566,
+	TOP_MUX_SCLK_DISP0_DECON0_ECLK0,
+	TOP_MUX_SCLK_DISP0_DECON0_VCLK0,
+	TOP_MUX_SCLK_DISP0_DECON0_VCLK1,
+	TOP_MUX_SCLK_DISP0_HDMI_AUDIO,
+	TOP_MUX_SCLK_DISP1_DECON1_ECLK0,
+	TOP_MUX_SCLK_DISP1_DECON1_ECLK1,
+	TOP_MUX_SCLK_FSYS0_USBDRD30,
+	TOP_MUX_SCLK_FSYS0_MMC0,
+	TOP_MUX_SCLK_FSYS0_UFSUNIPRO20,
+	TOP_MUX_SCLK_FSYS0_PHY_24M,
+	TOP_MUX_SCLK_FSYS0_UFSUNIPRO_CFG,
+	TOP_MUX_SCLK_FSYS1_MMC2,
+	TOP_MUX_SCLK_FSYS1_UFSUNIPRO20,
+	TOP_MUX_SCLK_FSYS1_PCIE_PHY,
+	TOP_MUX_SCLK_FSYS1_UFSUNIPRO_CFG,
+	TOP_MUX_SCLK_PERIC0_UART0,
+	TOP_MUX_SCLK_PERIC1_SPI0,
+	TOP_MUX_SCLK_PERIC1_SPI1,
+	TOP_MUX_SCLK_PERIC1_SPI2,
+	TOP_MUX_SCLK_PERIC1_SPI3,
+	TOP_MUX_SCLK_PERIC1_SPI4,
+	TOP_MUX_SCLK_PERIC1_SPI5,
+	TOP_MUX_SCLK_PERIC1_SPI6,
+	TOP_MUX_SCLK_PERIC1_SPI7,
+	TOP_MUX_SCLK_PERIC1_UART1,
+	TOP_MUX_SCLK_PERIC1_UART2,
+	TOP_MUX_SCLK_PERIC1_UART3,
+	TOP_MUX_SCLK_PERIC1_UART4,
+	TOP_MUX_SCLK_PERIC1_UART5,
+	TOP_MUX_SCLK_CAM1_ISP_SPI0,
+	TOP_MUX_SCLK_CAM1_ISP_SPI1,
+	TOP_MUX_SCLK_CAM1_ISP_UART,
+	TOP_MUX_SCLK_AP2CP_MIF_PLL_OUT,
+	TOP_MUX_ACLK_PSCDC_400,
+	TOP_MUX_SCLK_BUS_PLL_MNGS,
+	TOP_MUX_SCLK_BUS_PLL_APOLLO,
+	TOP_MUX_SCLK_BUS_PLL_MIF,
+	TOP_MUX_SCLK_BUS_PLL_G3D,
+	TOP_MUX_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D,
+	TOP_DIV_ACLK_CCORE_800,
+	TOP_DIV_ACLK_CCORE_264,
+	TOP_DIV_ACLK_CCORE_G3D_800,
+	TOP_DIV_ACLK_CCORE_528,
+	TOP_DIV_ACLK_CCORE_132,
+	TOP_DIV_PCLK_CCORE_66,
+	TOP_DIV_ACLK_BUS0_528,
+	TOP_DIV_ACLK_BUS0_200,
+	TOP_DIV_PCLK_BUS0_132,
+	TOP_DIV_ACLK_BUS1_528,
+	TOP_DIV_PCLK_BUS1_132,
+	TOP_DIV_ACLK_DISP0_0_400,
+	TOP_DIV_ACLK_DISP0_1_400,
+	TOP_DIV_ACLK_DISP1_0_400,
+	TOP_DIV_ACLK_DISP1_1_400,
+	TOP_DIV_ACLK_MFC_600,
+	TOP_DIV_ACLK_MSCL0_528,
+	TOP_DIV_ACLK_MSCL1_528,
+	TOP_DIV_ACLK_IMEM_266,
+	TOP_DIV_ACLK_IMEM_200,
+	TOP_DIV_ACLK_IMEM_100,
+	TOP_DIV_ACLK_FSYS0_200,
+	TOP_DIV_ACLK_FSYS1_200,
+	TOP_DIV_ACLK_PERIS_66,
+	TOP_DIV_ACLK_PERIC0_66,
+	TOP_DIV_ACLK_PERIC1_66,
+	TOP_DIV_ACLK_ISP0_ISP0_528,
+	TOP_DIV_ACLK_ISP0_TPU_400,
+	TOP_DIV_ACLK_ISP0_TREX_528,
+	TOP_DIV_ACLK_ISP1_ISP1_468,
+	TOP_DIV_ACLK_CAM0_CSIS0_414,
+	TOP_DIV_ACLK_CAM0_CSIS1_168,
+	TOP_DIV_ACLK_CAM0_CSIS2_234,
+	TOP_DIV_ACLK_CAM0_3AA0_414,
+	TOP_DIV_ACLK_CAM0_3AA1_414,
+	TOP_DIV_ACLK_CAM0_CSIS3_132,
+	TOP_DIV_ACLK_CAM0_TREX_528,
+	TOP_DIV_ACLK_CAM1_ARM_672,
+	TOP_DIV_ACLK_CAM1_TREX_VRA_528,
+	TOP_DIV_ACLK_CAM1_TREX_B_528,
+	TOP_DIV_ACLK_CAM1_BUS_264,
+	TOP_DIV_ACLK_CAM1_PERI_84,
+	TOP_DIV_ACLK_CAM1_CSIS2_414,
+	TOP_DIV_ACLK_CAM1_CSIS3_132,
+	TOP_DIV_ACLK_CAM1_SCL_566,
+	TOP_DIV_SCLK_DISP0_DECON0_ECLK0,
+	TOP_DIV_SCLK_DISP0_DECON0_VCLK0,
+	TOP_DIV_SCLK_DISP0_DECON0_VCLK1,
+	TOP_DIV_SCLK_DISP0_HDMI_AUDIO,
+	TOP_DIV_SCLK_DISP1_DECON1_ECLK0,
+	TOP_DIV_SCLK_DISP1_DECON1_ECLK1,
+	TOP_DIV_SCLK_FSYS0_USBDRD30,
+	TOP_DIV_SCLK_FSYS0_MMC0,
+	TOP_DIV_SCLK_FSYS0_UFSUNIPRO20,
+	TOP_DIV_SCLK_FSYS0_PHY_24M,
+	TOP_DIV_SCLK_FSYS0_UFSUNIPRO_CFG,
+	TOP_DIV_SCLK_FSYS1_MMC2,
+	TOP_DIV_SCLK_FSYS1_UFSUNIPRO20,
+	TOP_DIV_SCLK_FSYS1_PCIE_PHY,
+	TOP_DIV_SCLK_FSYS1_UFSUNIPRO_CFG,
+	TOP_DIV_SCLK_PERIC0_UART0,
+	TOP_DIV_SCLK_PERIC1_SPI0,
+	TOP_DIV_SCLK_PERIC1_SPI1,
+	TOP_DIV_SCLK_PERIC1_SPI2,
+	TOP_DIV_SCLK_PERIC1_SPI3,
+	TOP_DIV_SCLK_PERIC1_SPI4,
+	TOP_DIV_SCLK_PERIC1_SPI5,
+	TOP_DIV_SCLK_PERIC1_SPI6,
+	TOP_DIV_SCLK_PERIC1_SPI7,
+	TOP_DIV_SCLK_PERIC1_UART1,
+	TOP_DIV_SCLK_PERIC1_UART2,
+	TOP_DIV_SCLK_PERIC1_UART3,
+	TOP_DIV_SCLK_PERIC1_UART4,
+	TOP_DIV_SCLK_PERIC1_UART5,
+	TOP_DIV_SCLK_CAM1_ISP_SPI0,
+	TOP_DIV_SCLK_CAM1_ISP_SPI1,
+	TOP_DIV_SCLK_CAM1_ISP_UART,
+	TOP_DIV_SCLK_AP2CP_MIF_PLL_OUT,
+	TOP_DIV_ACLK_PSCDC_400,
+	TOP_DIV_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D,
+	TOP_DIV_SCLK_BUS_PLL_MNGS,
+	TOP_DIV_SCLK_BUS_PLL_APOLLO,
+	TOP_DIV_SCLK_BUS_PLL_MIF,
+	TOP_DIV_SCLK_BUS_PLL_G3D,
+	TOP_GATE_ACLK_CCORE_800,
+	TOP_GATE_ACLK_CCORE_264,
+	TOP_GATE_ACLK_CCORE_G3D_800,
+	TOP_GATE_ACLK_CCORE_528,
+	TOP_GATE_ACLK_CCORE_132,
+	TOP_GATE_PCLK_CCORE_66,
+	TOP_GATE_ACLK_BUS0_528,
+	TOP_GATE_ACLK_BUS0_200,
+	TOP_GATE_PCLK_BUS0_132,
+	TOP_GATE_ACLK_BUS1_528,
+	TOP_GATE_PCLK_BUS1_132,
+	TOP_GATE_ACLK_DISP0_0_400,
+	TOP_GATE_ACLK_DISP0_1_400,
+	TOP_GATE_ACLK_DISP1_0_400,
+	TOP_GATE_ACLK_DISP1_1_400,
+	TOP_GATE_ACLK_MFC_600,
+	TOP_GATE_ACLK_MSCL0_528,
+	TOP_GATE_ACLK_MSCL1_528,
+	TOP_GATE_ACLK_IMEM_266,
+	TOP_GATE_ACLK_IMEM_200,
+	TOP_GATE_ACLK_IMEM_100,
+	TOP_GATE_ACLK_FSYS0_200,
+	TOP_GATE_ACLK_FSYS1_200,
+	TOP_GATE_ACLK_PERIS_66,
+	TOP_GATE_ACLK_PERIC0_66,
+	TOP_GATE_ACLK_PERIC1_66,
+	TOP_GATE_ACLK_ISP0_ISP0_528,
+	TOP_GATE_ACLK_ISP0_TPU_400,
+	TOP_GATE_ACLK_ISP0_TREX_528,
+	TOP_GATE_ACLK_ISP1_ISP1_468,
+	TOP_GATE_ACLK_CAM0_CSIS0_414,
+	TOP_GATE_ACLK_CAM0_CSIS1_168,
+	TOP_GATE_ACLK_CAM0_CSIS2_234,
+	TOP_GATE_ACLK_CAM0_3AA0_414,
+	TOP_GATE_ACLK_CAM0_3AA1_414,
+	TOP_GATE_ACLK_CAM0_CSIS3_132,
+	TOP_GATE_ACLK_CAM0_TREX_528,
+	TOP_GATE_ACLK_CAM1_ARM_672,
+	TOP_GATE_ACLK_CAM1_TREX_VRA_528,
+	TOP_GATE_ACLK_CAM1_TREX_B_528,
+	TOP_GATE_ACLK_CAM1_BUS_264,
+	TOP_GATE_ACLK_CAM1_PERI_84,
+	TOP_GATE_ACLK_CAM1_CSIS2_414,
+	TOP_GATE_ACLK_CAM1_CSIS3_132,
+	TOP_GATE_ACLK_CAM1_SCL_566,
+	TOP_GATE_SCLK_DISP0_DECON0_ECLK0,
+	TOP_GATE_SCLK_DISP0_DECON0_VCLK0,
+	TOP_GATE_SCLK_DISP0_DECON0_VCLK1,
+	TOP_GATE_SCLK_DISP0_HDMI_AUDIO,
+	TOP_GATE_SCLK_DISP1_DECON1_ECLK0,
+	TOP_GATE_SCLK_DISP1_DECON1_ECLK1,
+	TOP_GATE_SCLK_FSYS0_USBDRD30,
+	TOP_GATE_SCLK_FSYS0_MMC0,
+	TOP_GATE_SCLK_FSYS0_UFSUNIPRO20,
+	TOP_GATE_SCLK_FSYS0_PHY_24M,
+	TOP_GATE_SCLK_FSYS0_UFSUNIPRO_CFG,
+	TOP_GATE_SCLK_FSYS1_MMC2,
+	TOP_GATE_SCLK_FSYS1_UFSUNIPRO20,
+	TOP_GATE_SCLK_FSYS1_PCIE_PHY,
+	TOP_GATE_SCLK_FSYS1_UFSUNIPRO_CFG,
+	TOP_GATE_SCLK_PERIC0_UART0,
+	TOP_GATE_SCLK_PERIC1_SPI0,
+	TOP_GATE_SCLK_PERIC1_SPI1,
+	TOP_GATE_SCLK_PERIC1_SPI2,
+	TOP_GATE_SCLK_PERIC1_SPI3,
+	TOP_GATE_SCLK_PERIC1_SPI4,
+	TOP_GATE_SCLK_PERIC1_SPI5,
+	TOP_GATE_SCLK_PERIC1_SPI6,
+	TOP_GATE_SCLK_PERIC1_SPI7,
+	TOP_GATE_SCLK_PERIC1_UART1,
+	TOP_GATE_SCLK_PERIC1_UART2,
+	TOP_GATE_SCLK_PERIC1_UART3,
+	TOP_GATE_SCLK_PERIC1_UART4,
+	TOP_GATE_SCLK_PERIC1_UART5,
+	TOP_GATE_SCLK_CAM1_ISP_SPI0,
+	TOP_GATE_SCLK_CAM1_ISP_SPI1,
+	TOP_GATE_SCLK_CAM1_ISP_UART,
+	TOP_GATE_SCLK_AP2CP_MIF_PLL_OUT,
+	TOP_GATE_ACLK_PSCDC_400,
+	TOP_GATE_SCLK_BUS_PLL_MNGS,
+	TOP_GATE_SCLK_BUS_PLL_APOLLO,
+	TOP_GATE_SCLK_BUS_PLL_MIF,
+	TOP_GATE_SCLK_BUS_PLL_G3D,
+	TOP_GATE_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D,
+	TOP_MUX_SCLK_ISP_SENSOR0,
+	TOP_DIV_SCLK_ISP_SENSOR0,
+	TOP_GATE_SCLK_ISP_SENSOR0,
+	TOP_MUX_SCLK_ISP_SENSOR1,
+	TOP_DIV_SCLK_ISP_SENSOR1,
+	TOP_GATE_SCLK_ISP_SENSOR1,
+	TOP_MUX_SCLK_ISP_SENSOR2,
+	TOP_DIV_SCLK_ISP_SENSOR2,
+	TOP_GATE_SCLK_ISP_SENSOR2,
+	TOP_MUX_SCLK_ISP_SENSOR3,
+	TOP_DIV_SCLK_ISP_SENSOR3,
+	TOP_GATE_SCLK_ISP_SENSOR3,
+	TOP_MUX_SCLK_PROMISE_INT,
+	TOP_DIV_SCLK_PROMISE_INT,
+	TOP_GATE_SCLK_PROMISE_INT,
+	TOP_MUX_SCLK_PROMISE_DISP,
+	TOP_DIV_SCLK_PROMISE_DISP,
+	TOP_GATE_SCLK_PROMISE_DISP,
+	TOP_MUX_CP2AP_MIF_CLK_USER,
+	MIF_CLK_CTRL0,
+	TOP_MUX_MIF_PLL,
+	TOP_MUX_BUS_PLL_MIF,
+	TOP_MUX_ACLK_MIF_PLL,
+};
+
+static const struct samsung_fixed_rate_clock top_fixed_clks[] __initconst = {
+	FRATE(CLK_SCAN_CLK_OSC, "scan_clk_osc", NULL, 0, 26 * MHZ),
+	FRATE(CLK_I_CP2AP_MIF_CLK, "i_cp2ap_mif_clk", NULL, 0, 400 * MHZ),
+	FRATE(CLK_RTC_CLKIN, "rtc_clkin", NULL, 0, 30 * MHZ),
+	FRATE(CLK_IOCLK_SPI0, "ioclk_spi0", NULL, 0, 30 * MHZ),
+	FRATE(CLK_IOCLK_SPI1, "ioclk_spi1", NULL, 0, 30 * MHZ),
+	FRATE(CLK_IOCLK_SPI2, "ioclk_spi2", NULL, 0, 30 * MHZ),
+	FRATE(CLK_IOCLK_SPI3, "ioclk_spi3", NULL, 0, 30 * MHZ),
+	FRATE(CLK_IOCLK_SPI4, "ioclk_spi4", NULL, 0, 30 * MHZ),
+	FRATE(CLK_IOCLK_SPI5, "ioclk_spi5", NULL, 0, 30 * MHZ),
+	FRATE(CLK_IOCLK_SPI6, "ioclk_spi6", NULL, 0, 30 * MHZ),
+	FRATE(CLK_IOCLK_SPI7, "ioclk_spi7", NULL, 0, 30 * MHZ),
+	FRATE(CLK_PHYCLK_UFS_RX_PWM_CLK_PHY, "phyclk_ufs_rx_pwm_clk_phy", NULL, 0, 300 * MHZ),
+	FRATE(CLK_PHYCLK_UFS_TX_PWM_CLK_PHY, "phyclk_ufs_tx_pwm_clk_phy", NULL, 0, 300 * MHZ),
+	FRATE(CLK_PHYCLK_UFS_REFCLK_OUT_SOC_PHY, "phyclk_ufs_refclk_out_soc_phy", NULL, 0, 26 * MHZ),
+	FRATE(CLK_PHYCLK_USBHOST20_FREECLK_PHY, "phyclk_usbhost20_freeclk_phy", NULL, 0, 30 * MHZ),
+	FRATE(CLK_PHYCLK_USBHOST20_CLK48MOHCI_PHY, "phyclk_usbhost20_clk48mohci_phy", NULL, 0, 30 * MHZ),
+	FRATE(CLK_PHYCLK_UFS_LINK_SDCARD_TX1_SYMBOL_PHY, "phyclk_ufs_link_sdcard_tx1_symbol_phy", NULL, 0, 30 * MHZ),
+	FRATE(CLK_PHYCLK_UFS_LINK_SDCARD_RX1_SYMBOL_PHY, "phyclk_ufs_link_sdcard_rx1_symbol_phy", NULL, 0, 30 * MHZ),
+	FRATE(CLK_PHYCLK_UFS_LINK_SDCARD_RX_PWM_CLK_PHY, "phyclk_ufs_link_sdcard_rx_pwm_clk_phy", NULL, 0, 30 * MHZ),
+	FRATE(CLK_PHYCLK_UFS_LINK_SDCARD_TX_PWM_CLK_PHY, "phyclk_ufs_link_sdcard_tx_pwm_clk_phy", NULL, 0, 30 * MHZ),
+	FRATE(CLK_PHYCLK_UFS_LINK_SDCARD_REFCLK_OUT_SOC_PHY, "phyclk_ufs_link_sdcard_refclk_out_soc_phy", NULL, 0, 30 * MHZ),
+};
+
+static const struct samsung_pll_clock top_pll_clks[] __initconst = {
+	PLL(pll_1418x, CLK_FOUT_G3D_PLL, "fout_g3d_pll", "oscclk",
+	    G3D_PLL_LOCK, G3D_PLL_CON0, NULL),
+	/* MIF0_PLL_LOCK is in the MIF0 domain, not TOP -- inert here:
+	 * fout_mif_pll has no rate table, so it always uses the
+	 * *_min_ops variant, whose only op (recalc_rate) never
+	 * reads pll->lock_reg. See clk-pll.c pll_1419x comment. */
+	PLL(pll_1419x, CLK_FOUT_MIF_PLL, "fout_mif_pll", "oscclk",
+	    MIF0_PLL_LOCK, MIF_CLK_CTRL0, NULL),
+	PLL(pll_1418x, CLK_FOUT_BUS0_PLL, "fout_bus0_pll", "oscclk",
+	    BUS0_PLL_LOCK, BUS0_PLL_CON0, NULL),
+	PLL(pll_1418x, CLK_FOUT_BUS1_PLL, "fout_bus1_pll", "oscclk",
+	    BUS1_PLL_LOCK, BUS1_PLL_CON0, NULL),
+	PLL(pll_1418x, CLK_FOUT_BUS2_PLL, "fout_bus2_pll", "oscclk",
+	    BUS2_PLL_LOCK, BUS2_PLL_CON0, NULL),
+	PLL(pll_1417x, CLK_FOUT_BUS3_PLL, "fout_bus3_pll", "oscclk",
+	    BUS3_PLL_LOCK, BUS3_PLL_CON0, NULL),
+	PLL(pll_1418x, CLK_FOUT_MFC_PLL, "fout_mfc_pll", "oscclk",
+	    MFC_PLL_LOCK, MFC_PLL_CON0, NULL),
+	PLL(pll_1418x, CLK_FOUT_MFC_PLL_GATE, "fout_mfc_pll_gate", "oscclk",
+	    MFC_PLL_LOCK, MFC_PLL_CON0, NULL),
+	PLL(pll_1418x, CLK_FOUT_MFC_PLL_DVFS, "fout_mfc_pll_dvfs", "oscclk",
+	    MFC_PLL_LOCK, MFC_PLL_CON0, NULL),
+	PLL(pll_1418x, CLK_FOUT_ISP_PLL, "fout_isp_pll", "oscclk",
+	    ISP_PLL_LOCK, ISP_PLL_CON0, NULL),
+	PLL(pll_1431x, CLK_FOUT_AUD_PLL, "fout_aud_pll", "oscclk",
+	    AUD_PLL_LOCK, AUD_PLL_CON0, NULL),
+};
+
+/* List of parent clocks for Muxes in CMU_TOP */
+PNAME(mout_top_mux_bus0_pll_p) = { "oscclk", "fout_bus0_pll" };
+PNAME(mout_top_mux_bus1_pll_p) = { "oscclk", "fout_bus1_pll" };
+PNAME(mout_top_mux_bus2_pll_p) = { "oscclk", "fout_bus2_pll" };
+PNAME(mout_top_mux_bus3_pll_p) = { "oscclk", "fout_bus3_pll" };
+PNAME(mout_top_mux_mfc_pll_p) = { "oscclk", "fout_mfc_pll" };
+PNAME(mout_top_mux_isp_pll_p) = { "oscclk", "fout_isp_pll" };
+PNAME(mout_top_mux_aud_pll_p) = { "oscclk", "fout_aud_pll" };
+PNAME(mout_top_mux_g3d_pll_p) = { "oscclk", "fout_g3d_pll" };
+PNAME(mout_top_mux_aclk_ccore_264_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk", "mout_top_mux_cp2ap_mif_clk_user" };
+PNAME(mout_top_mux_aclk_ccore_528_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_cp2ap_mif_clk_user" };
+PNAME(mout_top_mux_aclk_ccore_132_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk", "mout_top_mux_cp2ap_mif_clk_user" };
+PNAME(mout_top_mux_pclk_ccore_66_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk", "mout_top_mux_cp2ap_mif_clk_user" };
+PNAME(mout_top_mux_aclk_bus0_528_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll" };
+PNAME(mout_top_mux_aclk_bus0_200_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk", "oscclk" };
+PNAME(mout_top_mux_pclk_bus0_132_p) = { "mout_top_mux_sclk_bus0_pll", "oscclk", "oscclk", "oscclk" };
+PNAME(mout_top_mux_aclk_bus1_528_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll" };
+PNAME(mout_top_mux_pclk_bus1_132_p) = { "mout_top_mux_sclk_bus0_pll", "oscclk", "oscclk", "oscclk" };
+PNAME(mout_top_mux_aclk_disp0_0_400_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll" };
+PNAME(mout_top_mux_aclk_disp0_1_400_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll" };
+PNAME(mout_top_mux_aclk_disp1_0_400_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll" };
+PNAME(mout_top_mux_aclk_disp1_1_400_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll" };
+PNAME(mout_top_mux_aclk_mfc_600_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_sclk_mfc_pll" };
+PNAME(mout_top_mux_aclk_mscl0_528_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll" };
+PNAME(mout_top_mux_aclk_mscl1_528_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll" };
+PNAME(mout_top_mux_aclk_imem_266_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk", "oscclk" };
+PNAME(mout_top_mux_aclk_imem_200_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk", "oscclk" };
+PNAME(mout_top_mux_aclk_imem_100_p) = { "mout_top_mux_sclk_bus0_pll", "oscclk", "oscclk", "oscclk" };
+PNAME(mout_top_mux_aclk_fsys0_200_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk", "oscclk" };
+PNAME(mout_top_mux_aclk_fsys1_200_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk", "oscclk" };
+PNAME(mout_top_mux_aclk_peris_66_p) = { "mout_top_mux_sclk_bus0_pll", "oscclk", "oscclk", "oscclk" };
+PNAME(mout_top_mux_aclk_peric0_66_p) = { "mout_top_mux_sclk_bus0_pll", "oscclk", "oscclk", "oscclk" };
+PNAME(mout_top_mux_aclk_peric1_66_p) = { "mout_top_mux_sclk_bus0_pll", "oscclk", "oscclk", "oscclk" };
+PNAME(mout_top_mux_aclk_isp0_isp0_528_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_sclk_isp_pll", "mout_top_mux_sclk_mfc_pll" };
+PNAME(mout_top_mux_aclk_isp0_tpu_400_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_sclk_isp_pll", "mout_top_mux_sclk_mfc_pll" };
+PNAME(mout_top_mux_aclk_isp0_trex_528_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_sclk_isp_pll", "mout_top_mux_sclk_mfc_pll" };
+PNAME(mout_top_mux_aclk_isp0_pxl_asbs_is_c_from_is_d_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_sclk_isp_pll", "mout_top_mux_sclk_mfc_pll" };
+PNAME(mout_top_mux_aclk_isp1_isp1_468_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_sclk_isp_pll", "mout_top_mux_sclk_mfc_pll" };
+PNAME(mout_top_mux_aclk_cam0_csis0_414_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_sclk_isp_pll", "mout_top_mux_sclk_mfc_pll" };
+PNAME(mout_top_mux_aclk_cam0_csis1_168_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus2_pll" };
+PNAME(mout_top_mux_aclk_cam0_csis2_234_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_sclk_isp_pll", "mout_top_mux_sclk_mfc_pll" };
+PNAME(mout_top_mux_aclk_cam0_3aa0_414_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_sclk_isp_pll", "mout_top_mux_sclk_mfc_pll" };
+PNAME(mout_top_mux_aclk_cam0_3aa1_414_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_sclk_isp_pll", "mout_top_mux_sclk_mfc_pll" };
+PNAME(mout_top_mux_aclk_cam0_csis3_132_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll" };
+PNAME(mout_top_mux_aclk_cam0_trex_528_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_sclk_isp_pll", "mout_top_mux_sclk_mfc_pll" };
+PNAME(mout_top_mux_aclk_cam1_arm_672_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_sclk_isp_pll", "mout_top_mux_sclk_mfc_pll", "mout_top_mux_bus2_pll" };
+PNAME(mout_top_mux_aclk_cam1_trex_vra_528_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_sclk_isp_pll", "mout_top_mux_sclk_mfc_pll" };
+PNAME(mout_top_mux_aclk_cam1_trex_b_528_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_sclk_isp_pll", "mout_top_mux_sclk_mfc_pll" };
+PNAME(mout_top_mux_aclk_cam1_bus_264_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_sclk_isp_pll", "mout_top_mux_sclk_mfc_pll" };
+PNAME(mout_top_mux_aclk_cam1_peri_84_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus2_pll" };
+PNAME(mout_top_mux_aclk_cam1_csis2_414_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_sclk_isp_pll", "mout_top_mux_sclk_mfc_pll" };
+PNAME(mout_top_mux_aclk_cam1_csis3_132_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll" };
+PNAME(mout_top_mux_aclk_cam1_scl_566_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_sclk_isp_pll", "mout_top_mux_sclk_mfc_pll" };
+PNAME(mout_top_mux_sclk_disp0_decon0_eclk0_p) = { "mout_top_mux_sclk_bus0_pll", "oscclk", "mout_top_mux_bus2_pll", "oscclk" };
+PNAME(mout_top_mux_sclk_disp0_decon0_vclk0_p) = { "mout_top_mux_sclk_bus0_pll", "oscclk", "mout_top_mux_bus2_pll", "oscclk" };
+PNAME(mout_top_mux_sclk_disp0_decon0_vclk1_p) = { "mout_top_mux_sclk_bus0_pll", "oscclk", "mout_top_mux_bus2_pll", "oscclk" };
+PNAME(mout_top_mux_sclk_disp0_hdmi_audio_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_aud_pll" };
+PNAME(mout_top_mux_sclk_disp1_decon1_eclk0_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_bus2_pll" };
+PNAME(mout_top_mux_sclk_disp1_decon1_eclk1_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_bus2_pll" };
+PNAME(mout_top_mux_sclk_fsys0_usbdrd30_p) = { "mout_top_mux_sclk_bus0_pll", "oscclk", "oscclk" };
+PNAME(mout_top_mux_sclk_fsys0_ufsunipro20_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll" };
+PNAME(mout_top_mux_sclk_fsys0_phy_24m_p) = { "mout_top_mux_sclk_bus0_pll", "oscclk" };
+PNAME(mout_top_mux_sclk_fsys0_ufsunipro_cfg_p) = { "mout_top_mux_sclk_bus0_pll", "oscclk", "mout_top_mux_sclk_bus2_pll" };
+PNAME(mout_top_mux_sclk_fsys1_ufsunipro20_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll" };
+PNAME(mout_top_mux_sclk_fsys1_pcie_phy_p) = { "mout_top_mux_sclk_bus1_pll", "oscclk" };
+PNAME(mout_top_mux_sclk_fsys1_ufsunipro_cfg_p) = { "mout_top_mux_sclk_bus0_pll", "oscclk", "mout_top_mux_sclk_bus2_pll", "oscclk" };
+PNAME(mout_top_mux_sclk_peric0_uart0_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk", "oscclk" };
+PNAME(mout_top_mux_sclk_peric1_spi0_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk" };
+PNAME(mout_top_mux_sclk_peric1_spi1_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk" };
+PNAME(mout_top_mux_sclk_peric1_spi2_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk" };
+PNAME(mout_top_mux_sclk_peric1_spi3_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk" };
+PNAME(mout_top_mux_sclk_peric1_spi4_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk" };
+PNAME(mout_top_mux_sclk_peric1_spi5_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk" };
+PNAME(mout_top_mux_sclk_peric1_spi6_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk" };
+PNAME(mout_top_mux_sclk_peric1_spi7_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk" };
+PNAME(mout_top_mux_sclk_peric1_uart1_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk", "oscclk" };
+PNAME(mout_top_mux_sclk_peric1_uart2_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk", "oscclk" };
+PNAME(mout_top_mux_sclk_peric1_uart3_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk", "oscclk" };
+PNAME(mout_top_mux_sclk_peric1_uart4_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk", "oscclk" };
+PNAME(mout_top_mux_sclk_peric1_uart5_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk", "oscclk" };
+PNAME(mout_top_mux_sclk_cam1_isp_spi0_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk" };
+PNAME(mout_top_mux_sclk_cam1_isp_spi1_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "oscclk" };
+PNAME(mout_top_mux_sclk_cam1_isp_uart_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll" };
+PNAME(mout_top_mux_sclk_ap2cp_mif_pll_out_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll", "mout_top_mux_sclk_bus3_pll" };
+PNAME(mout_top_mux_aclk_pscdc_400_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus3_pll", "mout_top_mux_cp2ap_mif_clk_user" };
+PNAME(mout_top_mux_sclk_isp_sensor0_p) = { "oscclk" };
+PNAME(mout_top_mux_sclk_isp_sensor1_p) = { "oscclk" };
+PNAME(mout_top_mux_sclk_isp_sensor2_p) = { "oscclk" };
+PNAME(mout_top_mux_sclk_isp_sensor3_p) = { "oscclk" };
+PNAME(mout_top_mux_sclk_promise_int_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll" };
+PNAME(mout_top_mux_sclk_promise_disp_p) = { "mout_top_mux_sclk_bus0_pll", "mout_top_mux_sclk_bus1_pll", "mout_top_mux_sclk_bus2_pll" };
+PNAME(mout_top_mux_cp2ap_mif_clk_user_p) = { "oscclk", "i_cp2ap_mif_clk" };
+PNAME(mout_top_mux_mif_pll_p) = { "oscclk", "fout_mif_pll" };
+PNAME(mout_top_mux_bus_pll_mif_p) = { "oscclk", "mout_top_mux_sclk_bus1_pll" };
+PNAME(mout_top_mux_aclk_mif_pll_p) = { "mout_top_mux_mif_pll", "mout_top_mux_bus_pll_mif" };
+
+static const struct samsung_mux_clock top_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_TOP_MUX_BUS0_PLL, "mout_top_mux_bus0_pll", mout_top_mux_bus0_pll_p,
+	    TOP_MUX_BUS0_PLL, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_BUS1_PLL, "mout_top_mux_bus1_pll", mout_top_mux_bus1_pll_p,
+	    TOP_MUX_BUS1_PLL, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_BUS2_PLL, "mout_top_mux_bus2_pll", mout_top_mux_bus2_pll_p,
+	    TOP_MUX_BUS2_PLL, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_BUS3_PLL, "mout_top_mux_bus3_pll", mout_top_mux_bus3_pll_p,
+	    TOP_MUX_BUS3_PLL, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_MFC_PLL, "mout_top_mux_mfc_pll", mout_top_mux_mfc_pll_p,
+	    TOP_MUX_MFC_PLL, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_ISP_PLL, "mout_top_mux_isp_pll", mout_top_mux_isp_pll_p,
+	    TOP_MUX_ISP_PLL, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_AUD_PLL, "mout_top_mux_aud_pll", mout_top_mux_aud_pll_p,
+	    TOP_MUX_AUD_PLL, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_G3D_PLL, "mout_top_mux_g3d_pll", mout_top_mux_g3d_pll_p,
+	    TOP_MUX_G3D_PLL, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_CCORE_264, "mout_top_mux_aclk_ccore_264",
+	    mout_top_mux_aclk_ccore_264_p,
+	    TOP_MUX_ACLK_CCORE_264, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_CCORE_528, "mout_top_mux_aclk_ccore_528",
+	    mout_top_mux_aclk_ccore_528_p,
+	    TOP_MUX_ACLK_CCORE_528, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_CCORE_132, "mout_top_mux_aclk_ccore_132",
+	    mout_top_mux_aclk_ccore_132_p,
+	    TOP_MUX_ACLK_CCORE_132, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_PCLK_CCORE_66, "mout_top_mux_pclk_ccore_66",
+	    mout_top_mux_pclk_ccore_66_p,
+	    TOP_MUX_PCLK_CCORE_66, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_BUS0_528, "mout_top_mux_aclk_bus0_528",
+	    mout_top_mux_aclk_bus0_528_p,
+	    TOP_MUX_ACLK_BUS0_528, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_BUS0_200, "mout_top_mux_aclk_bus0_200",
+	    mout_top_mux_aclk_bus0_200_p,
+	    TOP_MUX_ACLK_BUS0_200, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_PCLK_BUS0_132, "mout_top_mux_pclk_bus0_132",
+	    mout_top_mux_pclk_bus0_132_p,
+	    TOP_MUX_PCLK_BUS0_132, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_BUS1_528, "mout_top_mux_aclk_bus1_528",
+	    mout_top_mux_aclk_bus1_528_p,
+	    TOP_MUX_ACLK_BUS1_528, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_PCLK_BUS1_132, "mout_top_mux_pclk_bus1_132",
+	    mout_top_mux_pclk_bus1_132_p,
+	    TOP_MUX_PCLK_BUS1_132, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_DISP0_0_400, "mout_top_mux_aclk_disp0_0_400",
+	    mout_top_mux_aclk_disp0_0_400_p,
+	    TOP_MUX_ACLK_DISP0_0_400, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_DISP0_1_400, "mout_top_mux_aclk_disp0_1_400",
+	    mout_top_mux_aclk_disp0_1_400_p,
+	    TOP_MUX_ACLK_DISP0_1_400, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_DISP1_0_400, "mout_top_mux_aclk_disp1_0_400",
+	    mout_top_mux_aclk_disp1_0_400_p,
+	    TOP_MUX_ACLK_DISP1_0_400, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_DISP1_1_400, "mout_top_mux_aclk_disp1_1_400",
+	    mout_top_mux_aclk_disp1_1_400_p,
+	    TOP_MUX_ACLK_DISP1_1_400, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_MFC_600, "mout_top_mux_aclk_mfc_600", mout_top_mux_aclk_mfc_600_p,
+	    TOP_MUX_ACLK_MFC_600, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_MSCL0_528, "mout_top_mux_aclk_mscl0_528",
+	    mout_top_mux_aclk_mscl0_528_p,
+	    TOP_MUX_ACLK_MSCL0_528, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_MSCL1_528, "mout_top_mux_aclk_mscl1_528",
+	    mout_top_mux_aclk_mscl1_528_p,
+	    TOP_MUX_ACLK_MSCL1_528, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_IMEM_266, "mout_top_mux_aclk_imem_266",
+	    mout_top_mux_aclk_imem_266_p,
+	    TOP_MUX_ACLK_IMEM_266, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_IMEM_200, "mout_top_mux_aclk_imem_200",
+	    mout_top_mux_aclk_imem_200_p,
+	    TOP_MUX_ACLK_IMEM_200, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_IMEM_100, "mout_top_mux_aclk_imem_100",
+	    mout_top_mux_aclk_imem_100_p,
+	    TOP_MUX_ACLK_IMEM_100, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_FSYS0_200, "mout_top_mux_aclk_fsys0_200",
+	    mout_top_mux_aclk_fsys0_200_p,
+	    TOP_MUX_ACLK_FSYS0_200, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_FSYS1_200, "mout_top_mux_aclk_fsys1_200",
+	    mout_top_mux_aclk_fsys1_200_p,
+	    TOP_MUX_ACLK_FSYS1_200, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_PERIS_66, "mout_top_mux_aclk_peris_66",
+	    mout_top_mux_aclk_peris_66_p,
+	    TOP_MUX_ACLK_PERIS_66, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_PERIC0_66, "mout_top_mux_aclk_peric0_66",
+	    mout_top_mux_aclk_peric0_66_p,
+	    TOP_MUX_ACLK_PERIC0_66, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_PERIC1_66, "mout_top_mux_aclk_peric1_66",
+	    mout_top_mux_aclk_peric1_66_p,
+	    TOP_MUX_ACLK_PERIC1_66, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_ISP0_ISP0_528, "mout_top_mux_aclk_isp0_isp0_528",
+	    mout_top_mux_aclk_isp0_isp0_528_p,
+	    TOP_MUX_ACLK_ISP0_ISP0_528, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_ISP0_TPU_400, "mout_top_mux_aclk_isp0_tpu_400",
+	    mout_top_mux_aclk_isp0_tpu_400_p,
+	    TOP_MUX_ACLK_ISP0_TPU_400, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_ISP0_TREX_528, "mout_top_mux_aclk_isp0_trex_528",
+	    mout_top_mux_aclk_isp0_trex_528_p,
+	    TOP_MUX_ACLK_ISP0_TREX_528, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D, "mout_top_mux_aclk_isp0_pxl_asbs_is_c_from_is_d",
+	    mout_top_mux_aclk_isp0_pxl_asbs_is_c_from_is_d_p,
+	    TOP_MUX_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_ISP1_ISP1_468, "mout_top_mux_aclk_isp1_isp1_468",
+	    mout_top_mux_aclk_isp1_isp1_468_p,
+	    TOP_MUX_ACLK_ISP1_ISP1_468, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_CAM0_CSIS0_414, "mout_top_mux_aclk_cam0_csis0_414",
+	    mout_top_mux_aclk_cam0_csis0_414_p,
+	    TOP_MUX_ACLK_CAM0_CSIS0_414, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_CAM0_CSIS1_168, "mout_top_mux_aclk_cam0_csis1_168",
+	    mout_top_mux_aclk_cam0_csis1_168_p,
+	    TOP_MUX_ACLK_CAM0_CSIS1_168, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_CAM0_CSIS2_234, "mout_top_mux_aclk_cam0_csis2_234",
+	    mout_top_mux_aclk_cam0_csis2_234_p,
+	    TOP_MUX_ACLK_CAM0_CSIS2_234, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_CAM0_3AA0_414, "mout_top_mux_aclk_cam0_3aa0_414",
+	    mout_top_mux_aclk_cam0_3aa0_414_p,
+	    TOP_MUX_ACLK_CAM0_3AA0_414, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_CAM0_3AA1_414, "mout_top_mux_aclk_cam0_3aa1_414",
+	    mout_top_mux_aclk_cam0_3aa1_414_p,
+	    TOP_MUX_ACLK_CAM0_3AA1_414, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_CAM0_CSIS3_132, "mout_top_mux_aclk_cam0_csis3_132",
+	    mout_top_mux_aclk_cam0_csis3_132_p,
+	    TOP_MUX_ACLK_CAM0_CSIS3_132, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_CAM0_TREX_528, "mout_top_mux_aclk_cam0_trex_528",
+	    mout_top_mux_aclk_cam0_trex_528_p,
+	    TOP_MUX_ACLK_CAM0_TREX_528, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_CAM1_ARM_672, "mout_top_mux_aclk_cam1_arm_672",
+	    mout_top_mux_aclk_cam1_arm_672_p,
+	    TOP_MUX_ACLK_CAM1_ARM_672, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_CAM1_TREX_VRA_528, "mout_top_mux_aclk_cam1_trex_vra_528",
+	    mout_top_mux_aclk_cam1_trex_vra_528_p,
+	    TOP_MUX_ACLK_CAM1_TREX_VRA_528, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_CAM1_TREX_B_528, "mout_top_mux_aclk_cam1_trex_b_528",
+	    mout_top_mux_aclk_cam1_trex_b_528_p,
+	    TOP_MUX_ACLK_CAM1_TREX_B_528, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_CAM1_BUS_264, "mout_top_mux_aclk_cam1_bus_264",
+	    mout_top_mux_aclk_cam1_bus_264_p,
+	    TOP_MUX_ACLK_CAM1_BUS_264, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_CAM1_PERI_84, "mout_top_mux_aclk_cam1_peri_84",
+	    mout_top_mux_aclk_cam1_peri_84_p,
+	    TOP_MUX_ACLK_CAM1_PERI_84, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_CAM1_CSIS2_414, "mout_top_mux_aclk_cam1_csis2_414",
+	    mout_top_mux_aclk_cam1_csis2_414_p,
+	    TOP_MUX_ACLK_CAM1_CSIS2_414, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_CAM1_CSIS3_132, "mout_top_mux_aclk_cam1_csis3_132",
+	    mout_top_mux_aclk_cam1_csis3_132_p,
+	    TOP_MUX_ACLK_CAM1_CSIS3_132, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_CAM1_SCL_566, "mout_top_mux_aclk_cam1_scl_566",
+	    mout_top_mux_aclk_cam1_scl_566_p,
+	    TOP_MUX_ACLK_CAM1_SCL_566, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_DISP0_DECON0_ECLK0, "mout_top_mux_sclk_disp0_decon0_eclk0",
+	    mout_top_mux_sclk_disp0_decon0_eclk0_p,
+	    TOP_MUX_SCLK_DISP0_DECON0_ECLK0, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_DISP0_DECON0_VCLK0, "mout_top_mux_sclk_disp0_decon0_vclk0",
+	    mout_top_mux_sclk_disp0_decon0_vclk0_p,
+	    TOP_MUX_SCLK_DISP0_DECON0_VCLK0, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_DISP0_DECON0_VCLK1, "mout_top_mux_sclk_disp0_decon0_vclk1",
+	    mout_top_mux_sclk_disp0_decon0_vclk1_p,
+	    TOP_MUX_SCLK_DISP0_DECON0_VCLK1, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_DISP0_HDMI_AUDIO, "mout_top_mux_sclk_disp0_hdmi_audio",
+	    mout_top_mux_sclk_disp0_hdmi_audio_p,
+	    TOP_MUX_SCLK_DISP0_HDMI_AUDIO, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_DISP1_DECON1_ECLK0, "mout_top_mux_sclk_disp1_decon1_eclk0",
+	    mout_top_mux_sclk_disp1_decon1_eclk0_p,
+	    TOP_MUX_SCLK_DISP1_DECON1_ECLK0, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_DISP1_DECON1_ECLK1, "mout_top_mux_sclk_disp1_decon1_eclk1",
+	    mout_top_mux_sclk_disp1_decon1_eclk1_p,
+	    TOP_MUX_SCLK_DISP1_DECON1_ECLK1, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_FSYS0_USBDRD30, "mout_top_mux_sclk_fsys0_usbdrd30",
+	    mout_top_mux_sclk_fsys0_usbdrd30_p,
+	    TOP_MUX_SCLK_FSYS0_USBDRD30, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_FSYS0_UFSUNIPRO20, "mout_top_mux_sclk_fsys0_ufsunipro20",
+	    mout_top_mux_sclk_fsys0_ufsunipro20_p,
+	    TOP_MUX_SCLK_FSYS0_UFSUNIPRO20, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_FSYS0_PHY_24M, "mout_top_mux_sclk_fsys0_phy_24m",
+	    mout_top_mux_sclk_fsys0_phy_24m_p,
+	    TOP_MUX_SCLK_FSYS0_PHY_24M, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_FSYS0_UFSUNIPRO_CFG, "mout_top_mux_sclk_fsys0_ufsunipro_cfg",
+	    mout_top_mux_sclk_fsys0_ufsunipro_cfg_p,
+	    TOP_MUX_SCLK_FSYS0_UFSUNIPRO_CFG, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_FSYS1_UFSUNIPRO20, "mout_top_mux_sclk_fsys1_ufsunipro20",
+	    mout_top_mux_sclk_fsys1_ufsunipro20_p,
+	    TOP_MUX_SCLK_FSYS1_UFSUNIPRO20, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_FSYS1_PCIE_PHY, "mout_top_mux_sclk_fsys1_pcie_phy",
+	    mout_top_mux_sclk_fsys1_pcie_phy_p,
+	    TOP_MUX_SCLK_FSYS1_PCIE_PHY, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_FSYS1_UFSUNIPRO_CFG, "mout_top_mux_sclk_fsys1_ufsunipro_cfg",
+	    mout_top_mux_sclk_fsys1_ufsunipro_cfg_p,
+	    TOP_MUX_SCLK_FSYS1_UFSUNIPRO_CFG, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_PERIC0_UART0, "mout_top_mux_sclk_peric0_uart0",
+	    mout_top_mux_sclk_peric0_uart0_p,
+	    TOP_MUX_SCLK_PERIC0_UART0, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_PERIC1_SPI0, "mout_top_mux_sclk_peric1_spi0",
+	    mout_top_mux_sclk_peric1_spi0_p,
+	    TOP_MUX_SCLK_PERIC1_SPI0, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_PERIC1_SPI1, "mout_top_mux_sclk_peric1_spi1",
+	    mout_top_mux_sclk_peric1_spi1_p,
+	    TOP_MUX_SCLK_PERIC1_SPI1, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_PERIC1_SPI2, "mout_top_mux_sclk_peric1_spi2",
+	    mout_top_mux_sclk_peric1_spi2_p,
+	    TOP_MUX_SCLK_PERIC1_SPI2, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_PERIC1_SPI3, "mout_top_mux_sclk_peric1_spi3",
+	    mout_top_mux_sclk_peric1_spi3_p,
+	    TOP_MUX_SCLK_PERIC1_SPI3, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_PERIC1_SPI4, "mout_top_mux_sclk_peric1_spi4",
+	    mout_top_mux_sclk_peric1_spi4_p,
+	    TOP_MUX_SCLK_PERIC1_SPI4, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_PERIC1_SPI5, "mout_top_mux_sclk_peric1_spi5",
+	    mout_top_mux_sclk_peric1_spi5_p,
+	    TOP_MUX_SCLK_PERIC1_SPI5, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_PERIC1_SPI6, "mout_top_mux_sclk_peric1_spi6",
+	    mout_top_mux_sclk_peric1_spi6_p,
+	    TOP_MUX_SCLK_PERIC1_SPI6, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_PERIC1_SPI7, "mout_top_mux_sclk_peric1_spi7",
+	    mout_top_mux_sclk_peric1_spi7_p,
+	    TOP_MUX_SCLK_PERIC1_SPI7, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_PERIC1_UART1, "mout_top_mux_sclk_peric1_uart1",
+	    mout_top_mux_sclk_peric1_uart1_p,
+	    TOP_MUX_SCLK_PERIC1_UART1, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_PERIC1_UART2, "mout_top_mux_sclk_peric1_uart2",
+	    mout_top_mux_sclk_peric1_uart2_p,
+	    TOP_MUX_SCLK_PERIC1_UART2, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_PERIC1_UART3, "mout_top_mux_sclk_peric1_uart3",
+	    mout_top_mux_sclk_peric1_uart3_p,
+	    TOP_MUX_SCLK_PERIC1_UART3, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_PERIC1_UART4, "mout_top_mux_sclk_peric1_uart4",
+	    mout_top_mux_sclk_peric1_uart4_p,
+	    TOP_MUX_SCLK_PERIC1_UART4, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_PERIC1_UART5, "mout_top_mux_sclk_peric1_uart5",
+	    mout_top_mux_sclk_peric1_uart5_p,
+	    TOP_MUX_SCLK_PERIC1_UART5, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_CAM1_ISP_SPI0, "mout_top_mux_sclk_cam1_isp_spi0",
+	    mout_top_mux_sclk_cam1_isp_spi0_p,
+	    TOP_MUX_SCLK_CAM1_ISP_SPI0, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_CAM1_ISP_SPI1, "mout_top_mux_sclk_cam1_isp_spi1",
+	    mout_top_mux_sclk_cam1_isp_spi1_p,
+	    TOP_MUX_SCLK_CAM1_ISP_SPI1, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_CAM1_ISP_UART, "mout_top_mux_sclk_cam1_isp_uart",
+	    mout_top_mux_sclk_cam1_isp_uart_p,
+	    TOP_MUX_SCLK_CAM1_ISP_UART, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_AP2CP_MIF_PLL_OUT, "mout_top_mux_sclk_ap2cp_mif_pll_out",
+	    mout_top_mux_sclk_ap2cp_mif_pll_out_p,
+	    TOP_MUX_SCLK_AP2CP_MIF_PLL_OUT, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_PSCDC_400, "mout_top_mux_aclk_pscdc_400",
+	    mout_top_mux_aclk_pscdc_400_p,
+	    TOP_MUX_ACLK_PSCDC_400, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_ISP_SENSOR0, "mout_top_mux_sclk_isp_sensor0",
+	    mout_top_mux_sclk_isp_sensor0_p,
+	    TOP_MUX_SCLK_ISP_SENSOR0, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_ISP_SENSOR1, "mout_top_mux_sclk_isp_sensor1",
+	    mout_top_mux_sclk_isp_sensor1_p,
+	    TOP_MUX_SCLK_ISP_SENSOR1, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_ISP_SENSOR2, "mout_top_mux_sclk_isp_sensor2",
+	    mout_top_mux_sclk_isp_sensor2_p,
+	    TOP_MUX_SCLK_ISP_SENSOR2, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_ISP_SENSOR3, "mout_top_mux_sclk_isp_sensor3",
+	    mout_top_mux_sclk_isp_sensor3_p,
+	    TOP_MUX_SCLK_ISP_SENSOR3, 12, 3),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_PROMISE_INT, "mout_top_mux_sclk_promise_int",
+	    mout_top_mux_sclk_promise_int_p,
+	    TOP_MUX_SCLK_PROMISE_INT, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_SCLK_PROMISE_DISP, "mout_top_mux_sclk_promise_disp",
+	    mout_top_mux_sclk_promise_disp_p,
+	    TOP_MUX_SCLK_PROMISE_DISP, 12, 2),
+	MUX(CLK_MOUT_TOP_MUX_CP2AP_MIF_CLK_USER, "mout_top_mux_cp2ap_mif_clk_user",
+	    mout_top_mux_cp2ap_mif_clk_user_p,
+	    TOP_MUX_CP2AP_MIF_CLK_USER, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_MIF_PLL, "mout_top_mux_mif_pll", mout_top_mux_mif_pll_p,
+	    TOP_MUX_MIF_PLL, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_BUS_PLL_MIF, "mout_top_mux_bus_pll_mif", mout_top_mux_bus_pll_mif_p,
+	    TOP_MUX_BUS_PLL_MIF, 12, 1),
+	MUX(CLK_MOUT_TOP_MUX_ACLK_MIF_PLL, "mout_top_mux_aclk_mif_pll", mout_top_mux_aclk_mif_pll_p,
+	    TOP_MUX_ACLK_MIF_PLL, 12, 1),
+};
+
+static const struct samsung_div_clock top_div_clks[] __initconst = {
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CCORE_800, "dout_top_div_aclk_ccore_800",
+	    "mout_top_mux_aclk_ccore_800",
+	    TOP_DIV_ACLK_CCORE_800, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CCORE_264, "dout_top_div_aclk_ccore_264",
+	    "mout_top_mux_aclk_ccore_264",
+	    TOP_DIV_ACLK_CCORE_264, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CCORE_G3D_800, "dout_top_div_aclk_ccore_g3d_800",
+	    "mout_top_mux_aclk_ccore_g3d_800",
+	    TOP_DIV_ACLK_CCORE_G3D_800, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CCORE_528, "dout_top_div_aclk_ccore_528",
+	    "mout_top_mux_aclk_ccore_528",
+	    TOP_DIV_ACLK_CCORE_528, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CCORE_132, "dout_top_div_aclk_ccore_132",
+	    "mout_top_mux_aclk_ccore_132",
+	    TOP_DIV_ACLK_CCORE_132, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_PCLK_CCORE_66, "dout_top_div_pclk_ccore_66",
+	    "mout_top_mux_pclk_ccore_66",
+	    TOP_DIV_PCLK_CCORE_66, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_BUS0_528, "dout_top_div_aclk_bus0_528",
+	    "mout_top_mux_aclk_bus0_528",
+	    TOP_DIV_ACLK_BUS0_528, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_BUS0_200, "dout_top_div_aclk_bus0_200",
+	    "mout_top_mux_aclk_bus0_200",
+	    TOP_DIV_ACLK_BUS0_200, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_PCLK_BUS0_132, "dout_top_div_pclk_bus0_132",
+	    "mout_top_mux_pclk_bus0_132",
+	    TOP_DIV_PCLK_BUS0_132, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_BUS1_528, "dout_top_div_aclk_bus1_528",
+	    "mout_top_mux_aclk_bus1_528",
+	    TOP_DIV_ACLK_BUS1_528, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_PCLK_BUS1_132, "dout_top_div_pclk_bus1_132",
+	    "mout_top_mux_pclk_bus1_132",
+	    TOP_DIV_PCLK_BUS1_132, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_DISP0_0_400, "dout_top_div_aclk_disp0_0_400",
+	    "mout_top_mux_aclk_disp0_0_400",
+	    TOP_DIV_ACLK_DISP0_0_400, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_DISP0_1_400, "dout_top_div_aclk_disp0_1_400",
+	    "mout_top_mux_aclk_disp0_1_400",
+	    TOP_DIV_ACLK_DISP0_1_400, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_DISP1_0_400, "dout_top_div_aclk_disp1_0_400",
+	    "mout_top_mux_aclk_disp1_0_400",
+	    TOP_DIV_ACLK_DISP1_0_400, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_DISP1_1_400, "dout_top_div_aclk_disp1_1_400",
+	    "mout_top_mux_aclk_disp1_1_400",
+	    TOP_DIV_ACLK_DISP1_1_400, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_MFC_600, "dout_top_div_aclk_mfc_600", "mout_top_mux_aclk_mfc_600",
+	    TOP_DIV_ACLK_MFC_600, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_MSCL0_528, "dout_top_div_aclk_mscl0_528",
+	    "mout_top_mux_aclk_mscl0_528",
+	    TOP_DIV_ACLK_MSCL0_528, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_MSCL1_528, "dout_top_div_aclk_mscl1_528",
+	    "mout_top_mux_aclk_mscl1_528",
+	    TOP_DIV_ACLK_MSCL1_528, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_IMEM_266, "dout_top_div_aclk_imem_266",
+	    "mout_top_mux_aclk_imem_266",
+	    TOP_DIV_ACLK_IMEM_266, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_IMEM_200, "dout_top_div_aclk_imem_200",
+	    "mout_top_mux_aclk_imem_200",
+	    TOP_DIV_ACLK_IMEM_200, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_IMEM_100, "dout_top_div_aclk_imem_100",
+	    "mout_top_mux_aclk_imem_100",
+	    TOP_DIV_ACLK_IMEM_100, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_FSYS0_200, "dout_top_div_aclk_fsys0_200",
+	    "mout_top_mux_aclk_fsys0_200",
+	    TOP_DIV_ACLK_FSYS0_200, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_FSYS1_200, "dout_top_div_aclk_fsys1_200",
+	    "mout_top_mux_aclk_fsys1_200",
+	    TOP_DIV_ACLK_FSYS1_200, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_PERIS_66, "dout_top_div_aclk_peris_66",
+	    "mout_top_mux_aclk_peris_66",
+	    TOP_DIV_ACLK_PERIS_66, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_PERIC0_66, "dout_top_div_aclk_peric0_66",
+	    "mout_top_mux_aclk_peric0_66",
+	    TOP_DIV_ACLK_PERIC0_66, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_PERIC1_66, "dout_top_div_aclk_peric1_66",
+	    "mout_top_mux_aclk_peric1_66",
+	    TOP_DIV_ACLK_PERIC1_66, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_ISP0_ISP0_528, "dout_top_div_aclk_isp0_isp0_528",
+	    "mout_top_mux_aclk_isp0_isp0_528",
+	    TOP_DIV_ACLK_ISP0_ISP0_528, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_ISP0_TPU_400, "dout_top_div_aclk_isp0_tpu_400",
+	    "mout_top_mux_aclk_isp0_tpu_400",
+	    TOP_DIV_ACLK_ISP0_TPU_400, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_ISP0_TREX_528, "dout_top_div_aclk_isp0_trex_528",
+	    "mout_top_mux_aclk_isp0_trex_528",
+	    TOP_DIV_ACLK_ISP0_TREX_528, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D, "dout_top_div_aclk_isp0_pxl_asbs_is_c_from_is_d",
+	    "mout_top_mux_aclk_isp0_pxl_asbs_is_c_from_is_d",
+	    TOP_DIV_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_ISP1_ISP1_468, "dout_top_div_aclk_isp1_isp1_468",
+	    "mout_top_mux_aclk_isp1_isp1_468",
+	    TOP_DIV_ACLK_ISP1_ISP1_468, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CAM0_CSIS0_414, "dout_top_div_aclk_cam0_csis0_414",
+	    "mout_top_mux_aclk_cam0_csis0_414",
+	    TOP_DIV_ACLK_CAM0_CSIS0_414, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CAM0_CSIS1_168, "dout_top_div_aclk_cam0_csis1_168",
+	    "mout_top_mux_aclk_cam0_csis1_168",
+	    TOP_DIV_ACLK_CAM0_CSIS1_168, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CAM0_CSIS2_234, "dout_top_div_aclk_cam0_csis2_234",
+	    "mout_top_mux_aclk_cam0_csis2_234",
+	    TOP_DIV_ACLK_CAM0_CSIS2_234, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CAM0_3AA0_414, "dout_top_div_aclk_cam0_3aa0_414",
+	    "mout_top_mux_aclk_cam0_3aa0_414",
+	    TOP_DIV_ACLK_CAM0_3AA0_414, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CAM0_3AA1_414, "dout_top_div_aclk_cam0_3aa1_414",
+	    "mout_top_mux_aclk_cam0_3aa1_414",
+	    TOP_DIV_ACLK_CAM0_3AA1_414, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CAM0_CSIS3_132, "dout_top_div_aclk_cam0_csis3_132",
+	    "mout_top_mux_aclk_cam0_csis3_132",
+	    TOP_DIV_ACLK_CAM0_CSIS3_132, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CAM0_TREX_528, "dout_top_div_aclk_cam0_trex_528",
+	    "mout_top_mux_aclk_cam0_trex_528",
+	    TOP_DIV_ACLK_CAM0_TREX_528, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CAM1_ARM_672, "dout_top_div_aclk_cam1_arm_672",
+	    "mout_top_mux_aclk_cam1_arm_672",
+	    TOP_DIV_ACLK_CAM1_ARM_672, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CAM1_TREX_VRA_528, "dout_top_div_aclk_cam1_trex_vra_528",
+	    "mout_top_mux_aclk_cam1_trex_vra_528",
+	    TOP_DIV_ACLK_CAM1_TREX_VRA_528, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CAM1_TREX_B_528, "dout_top_div_aclk_cam1_trex_b_528",
+	    "mout_top_mux_aclk_cam1_trex_b_528",
+	    TOP_DIV_ACLK_CAM1_TREX_B_528, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CAM1_BUS_264, "dout_top_div_aclk_cam1_bus_264",
+	    "mout_top_mux_aclk_cam1_bus_264",
+	    TOP_DIV_ACLK_CAM1_BUS_264, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CAM1_PERI_84, "dout_top_div_aclk_cam1_peri_84",
+	    "mout_top_mux_aclk_cam1_peri_84",
+	    TOP_DIV_ACLK_CAM1_PERI_84, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CAM1_CSIS2_414, "dout_top_div_aclk_cam1_csis2_414",
+	    "mout_top_mux_aclk_cam1_csis2_414",
+	    TOP_DIV_ACLK_CAM1_CSIS2_414, 0, 8),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CAM1_CSIS3_132, "dout_top_div_aclk_cam1_csis3_132",
+	    "mout_top_mux_aclk_cam1_csis3_132",
+	    TOP_DIV_ACLK_CAM1_CSIS3_132, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_CAM1_SCL_566, "dout_top_div_aclk_cam1_scl_566",
+	    "mout_top_mux_aclk_cam1_scl_566",
+	    TOP_DIV_ACLK_CAM1_SCL_566, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_DISP0_DECON0_ECLK0, "dout_top_div_sclk_disp0_decon0_eclk0",
+	    "mout_top_mux_sclk_disp0_decon0_eclk0",
+	    TOP_DIV_SCLK_DISP0_DECON0_ECLK0, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_DISP0_DECON0_VCLK0, "dout_top_div_sclk_disp0_decon0_vclk0",
+	    "mout_top_mux_sclk_disp0_decon0_vclk0",
+	    TOP_DIV_SCLK_DISP0_DECON0_VCLK0, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_DISP0_DECON0_VCLK1, "dout_top_div_sclk_disp0_decon0_vclk1",
+	    "mout_top_mux_sclk_disp0_decon0_vclk1",
+	    TOP_DIV_SCLK_DISP0_DECON0_VCLK1, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_DISP0_HDMI_AUDIO, "dout_top_div_sclk_disp0_hdmi_audio",
+	    "mout_top_mux_sclk_disp0_hdmi_audio",
+	    TOP_DIV_SCLK_DISP0_HDMI_AUDIO, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_DISP1_DECON1_ECLK0, "dout_top_div_sclk_disp1_decon1_eclk0",
+	    "mout_top_mux_sclk_disp1_decon1_eclk0",
+	    TOP_DIV_SCLK_DISP1_DECON1_ECLK0, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_DISP1_DECON1_ECLK1, "dout_top_div_sclk_disp1_decon1_eclk1",
+	    "mout_top_mux_sclk_disp1_decon1_eclk1",
+	    TOP_DIV_SCLK_DISP1_DECON1_ECLK1, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_FSYS0_USBDRD30, "dout_top_div_sclk_fsys0_usbdrd30",
+	    "mout_top_mux_sclk_fsys0_usbdrd30",
+	    TOP_DIV_SCLK_FSYS0_USBDRD30, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_FSYS0_MMC0, "dout_top_div_sclk_fsys0_mmc0",
+	    "mout_top_mux_sclk_fsys0_mmc0",
+	    TOP_DIV_SCLK_FSYS0_MMC0, 0, 10),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_FSYS0_UFSUNIPRO20, "dout_top_div_sclk_fsys0_ufsunipro20",
+	    "mout_top_mux_sclk_fsys0_ufsunipro20",
+	    TOP_DIV_SCLK_FSYS0_UFSUNIPRO20, 0, 6),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_FSYS0_PHY_24M, "dout_top_div_sclk_fsys0_phy_24m",
+	    "mout_top_mux_sclk_fsys0_phy_24m",
+	    TOP_DIV_SCLK_FSYS0_PHY_24M, 0, 6),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_FSYS0_UFSUNIPRO_CFG, "dout_top_div_sclk_fsys0_ufsunipro_cfg",
+	    "mout_top_mux_sclk_fsys0_ufsunipro_cfg",
+	    TOP_DIV_SCLK_FSYS0_UFSUNIPRO_CFG, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_FSYS1_MMC2, "dout_top_div_sclk_fsys1_mmc2",
+	    "mout_top_mux_sclk_fsys1_mmc2",
+	    TOP_DIV_SCLK_FSYS1_MMC2, 0, 10),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_FSYS1_UFSUNIPRO20, "dout_top_div_sclk_fsys1_ufsunipro20",
+	    "mout_top_mux_sclk_fsys1_ufsunipro20",
+	    TOP_DIV_SCLK_FSYS1_UFSUNIPRO20, 0, 6),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_FSYS1_PCIE_PHY, "dout_top_div_sclk_fsys1_pcie_phy",
+	    "mout_top_mux_sclk_fsys1_pcie_phy",
+	    TOP_DIV_SCLK_FSYS1_PCIE_PHY, 0, 6),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_FSYS1_UFSUNIPRO_CFG, "dout_top_div_sclk_fsys1_ufsunipro_cfg",
+	    "mout_top_mux_sclk_fsys1_ufsunipro_cfg",
+	    TOP_DIV_SCLK_FSYS1_UFSUNIPRO_CFG, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_PERIC0_UART0, "dout_top_div_sclk_peric0_uart0",
+	    "mout_top_mux_sclk_peric0_uart0",
+	    TOP_DIV_SCLK_PERIC0_UART0, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_PERIC1_SPI0, "dout_top_div_sclk_peric1_spi0",
+	    "mout_top_mux_sclk_peric1_spi0",
+	    TOP_DIV_SCLK_PERIC1_SPI0, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_PERIC1_SPI1, "dout_top_div_sclk_peric1_spi1",
+	    "mout_top_mux_sclk_peric1_spi1",
+	    TOP_DIV_SCLK_PERIC1_SPI1, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_PERIC1_SPI2, "dout_top_div_sclk_peric1_spi2",
+	    "mout_top_mux_sclk_peric1_spi2",
+	    TOP_DIV_SCLK_PERIC1_SPI2, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_PERIC1_SPI3, "dout_top_div_sclk_peric1_spi3",
+	    "mout_top_mux_sclk_peric1_spi3",
+	    TOP_DIV_SCLK_PERIC1_SPI3, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_PERIC1_SPI4, "dout_top_div_sclk_peric1_spi4",
+	    "mout_top_mux_sclk_peric1_spi4",
+	    TOP_DIV_SCLK_PERIC1_SPI4, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_PERIC1_SPI5, "dout_top_div_sclk_peric1_spi5",
+	    "mout_top_mux_sclk_peric1_spi5",
+	    TOP_DIV_SCLK_PERIC1_SPI5, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_PERIC1_SPI6, "dout_top_div_sclk_peric1_spi6",
+	    "mout_top_mux_sclk_peric1_spi6",
+	    TOP_DIV_SCLK_PERIC1_SPI6, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_PERIC1_SPI7, "dout_top_div_sclk_peric1_spi7",
+	    "mout_top_mux_sclk_peric1_spi7",
+	    TOP_DIV_SCLK_PERIC1_SPI7, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_PERIC1_UART1, "dout_top_div_sclk_peric1_uart1",
+	    "mout_top_mux_sclk_peric1_uart1",
+	    TOP_DIV_SCLK_PERIC1_UART1, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_PERIC1_UART2, "dout_top_div_sclk_peric1_uart2",
+	    "mout_top_mux_sclk_peric1_uart2",
+	    TOP_DIV_SCLK_PERIC1_UART2, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_PERIC1_UART3, "dout_top_div_sclk_peric1_uart3",
+	    "mout_top_mux_sclk_peric1_uart3",
+	    TOP_DIV_SCLK_PERIC1_UART3, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_PERIC1_UART4, "dout_top_div_sclk_peric1_uart4",
+	    "mout_top_mux_sclk_peric1_uart4",
+	    TOP_DIV_SCLK_PERIC1_UART4, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_PERIC1_UART5, "dout_top_div_sclk_peric1_uart5",
+	    "mout_top_mux_sclk_peric1_uart5",
+	    TOP_DIV_SCLK_PERIC1_UART5, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_CAM1_ISP_SPI0, "dout_top_div_sclk_cam1_isp_spi0",
+	    "mout_top_mux_sclk_cam1_isp_spi0",
+	    TOP_DIV_SCLK_CAM1_ISP_SPI0, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_CAM1_ISP_SPI1, "dout_top_div_sclk_cam1_isp_spi1",
+	    "mout_top_mux_sclk_cam1_isp_spi1",
+	    TOP_DIV_SCLK_CAM1_ISP_SPI1, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_CAM1_ISP_UART, "dout_top_div_sclk_cam1_isp_uart",
+	    "mout_top_mux_sclk_cam1_isp_uart",
+	    TOP_DIV_SCLK_CAM1_ISP_UART, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_AP2CP_MIF_PLL_OUT, "dout_top_div_sclk_ap2cp_mif_pll_out",
+	    "mout_top_mux_sclk_ap2cp_mif_pll_out",
+	    TOP_DIV_SCLK_AP2CP_MIF_PLL_OUT, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_ACLK_PSCDC_400, "dout_top_div_aclk_pscdc_400",
+	    "mout_top_mux_aclk_pscdc_400",
+	    TOP_DIV_ACLK_PSCDC_400, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_BUS_PLL_MNGS, "dout_top_div_sclk_bus_pll_mngs",
+	    "mout_top_mux_sclk_bus_pll_mngs",
+	    TOP_DIV_SCLK_BUS_PLL_MNGS, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_BUS_PLL_APOLLO, "dout_top_div_sclk_bus_pll_apollo",
+	    "mout_top_mux_sclk_bus_pll_apollo",
+	    TOP_DIV_SCLK_BUS_PLL_APOLLO, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_BUS_PLL_MIF, "dout_top_div_sclk_bus_pll_mif",
+	    "mout_top_mux_sclk_bus_pll_mif",
+	    TOP_DIV_SCLK_BUS_PLL_MIF, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_BUS_PLL_G3D, "dout_top_div_sclk_bus_pll_g3d",
+	    "mout_top_mux_sclk_bus_pll_g3d",
+	    TOP_DIV_SCLK_BUS_PLL_G3D, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_ISP_SENSOR0, "dout_top_div_sclk_isp_sensor0",
+	    "mout_top_mux_sclk_isp_sensor0",
+	    TOP_DIV_SCLK_ISP_SENSOR0, 0, 8),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_ISP_SENSOR1, "dout_top_div_sclk_isp_sensor1",
+	    "mout_top_mux_sclk_isp_sensor1",
+	    TOP_DIV_SCLK_ISP_SENSOR1, 0, 8),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_ISP_SENSOR2, "dout_top_div_sclk_isp_sensor2",
+	    "mout_top_mux_sclk_isp_sensor2",
+	    TOP_DIV_SCLK_ISP_SENSOR2, 0, 8),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_ISP_SENSOR3, "dout_top_div_sclk_isp_sensor3",
+	    "mout_top_mux_sclk_isp_sensor3",
+	    TOP_DIV_SCLK_ISP_SENSOR3, 0, 8),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_PROMISE_INT, "dout_top_div_sclk_promise_int",
+	    "mout_top_mux_sclk_promise_int",
+	    TOP_DIV_SCLK_PROMISE_INT, 0, 4),
+	DIV(CLK_DOUT_TOP_DIV_SCLK_PROMISE_DISP, "dout_top_div_sclk_promise_disp",
+	    "mout_top_mux_sclk_promise_disp",
+	    TOP_DIV_SCLK_PROMISE_DISP, 0, 4),
+};
+
+static const struct samsung_gate_clock top_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CCORE_800, "gout_top_gate_aclk_ccore_800",
+	     "dout_top_div_aclk_ccore_800",
+	     TOP_GATE_ACLK_CCORE_800, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CCORE_264, "gout_top_gate_aclk_ccore_264",
+	     "dout_top_div_aclk_ccore_264",
+	     TOP_GATE_ACLK_CCORE_264, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CCORE_G3D_800, "gout_top_gate_aclk_ccore_g3d_800",
+	     "dout_top_div_aclk_ccore_g3d_800",
+	     TOP_GATE_ACLK_CCORE_G3D_800, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CCORE_528, "gout_top_gate_aclk_ccore_528",
+	     "dout_top_div_aclk_ccore_528",
+	     TOP_GATE_ACLK_CCORE_528, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CCORE_132, "gout_top_gate_aclk_ccore_132",
+	     "dout_top_div_aclk_ccore_132",
+	     TOP_GATE_ACLK_CCORE_132, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_PCLK_CCORE_66, "gout_top_gate_pclk_ccore_66",
+	     "dout_top_div_pclk_ccore_66",
+	     TOP_GATE_PCLK_CCORE_66, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_BUS0_528, "gout_top_gate_aclk_bus0_528",
+	     "dout_top_div_aclk_bus0_528",
+	     TOP_GATE_ACLK_BUS0_528, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_BUS0_200, "gout_top_gate_aclk_bus0_200",
+	     "dout_top_div_aclk_bus0_200",
+	     TOP_GATE_ACLK_BUS0_200, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_PCLK_BUS0_132, "gout_top_gate_pclk_bus0_132",
+	     "dout_top_div_pclk_bus0_132",
+	     TOP_GATE_PCLK_BUS0_132, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_BUS1_528, "gout_top_gate_aclk_bus1_528",
+	     "dout_top_div_aclk_bus1_528",
+	     TOP_GATE_ACLK_BUS1_528, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_PCLK_BUS1_132, "gout_top_gate_pclk_bus1_132",
+	     "dout_top_div_pclk_bus1_132",
+	     TOP_GATE_PCLK_BUS1_132, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_DISP0_0_400, "gout_top_gate_aclk_disp0_0_400",
+	     "dout_top_div_aclk_disp0_0_400",
+	     TOP_GATE_ACLK_DISP0_0_400, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_DISP0_1_400, "gout_top_gate_aclk_disp0_1_400",
+	     "dout_top_div_aclk_disp0_1_400",
+	     TOP_GATE_ACLK_DISP0_1_400, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_DISP1_0_400, "gout_top_gate_aclk_disp1_0_400",
+	     "dout_top_div_aclk_disp1_0_400",
+	     TOP_GATE_ACLK_DISP1_0_400, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_DISP1_1_400, "gout_top_gate_aclk_disp1_1_400",
+	     "dout_top_div_aclk_disp1_1_400",
+	     TOP_GATE_ACLK_DISP1_1_400, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_MFC_600, "gout_top_gate_aclk_mfc_600",
+	     "dout_top_div_aclk_mfc_600",
+	     TOP_GATE_ACLK_MFC_600, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_MSCL0_528, "gout_top_gate_aclk_mscl0_528",
+	     "dout_top_div_aclk_mscl0_528",
+	     TOP_GATE_ACLK_MSCL0_528, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_MSCL1_528, "gout_top_gate_aclk_mscl1_528",
+	     "dout_top_div_aclk_mscl1_528",
+	     TOP_GATE_ACLK_MSCL1_528, 1, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_IMEM_266, "gout_top_gate_aclk_imem_266",
+	     "dout_top_div_aclk_imem_266",
+	     TOP_GATE_ACLK_IMEM_266, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_IMEM_200, "gout_top_gate_aclk_imem_200",
+	     "dout_top_div_aclk_imem_200",
+	     TOP_GATE_ACLK_IMEM_200, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_IMEM_100, "gout_top_gate_aclk_imem_100",
+	     "dout_top_div_aclk_imem_100",
+	     TOP_GATE_ACLK_IMEM_100, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_FSYS0_200, "gout_top_gate_aclk_fsys0_200",
+	     "dout_top_div_aclk_fsys0_200",
+	     TOP_GATE_ACLK_FSYS0_200, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_FSYS1_200, "gout_top_gate_aclk_fsys1_200",
+	     "dout_top_div_aclk_fsys1_200",
+	     TOP_GATE_ACLK_FSYS1_200, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_PERIS_66, "gout_top_gate_aclk_peris_66",
+	     "dout_top_div_aclk_peris_66",
+	     TOP_GATE_ACLK_PERIS_66, 0, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_PERIC0_66, "gout_top_gate_aclk_peric0_66",
+	     "dout_top_div_aclk_peric0_66",
+	     TOP_GATE_ACLK_PERIC0_66, 0, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_PERIC1_66, "gout_top_gate_aclk_peric1_66",
+	     "dout_top_div_aclk_peric1_66",
+	     TOP_GATE_ACLK_PERIC1_66, 0, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_ISP0_ISP0_528, "gout_top_gate_aclk_isp0_isp0_528",
+	     "dout_top_div_aclk_isp0_isp0_528",
+	     TOP_GATE_ACLK_ISP0_ISP0_528, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_ISP0_TPU_400, "gout_top_gate_aclk_isp0_tpu_400",
+	     "dout_top_div_aclk_isp0_tpu_400",
+	     TOP_GATE_ACLK_ISP0_TPU_400, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_ISP0_TREX_528, "gout_top_gate_aclk_isp0_trex_528",
+	     "dout_top_div_aclk_isp0_trex_528",
+	     TOP_GATE_ACLK_ISP0_TREX_528, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D, "gout_top_gate_aclk_isp0_pxl_asbs_is_c_from_is_d",
+	     "dout_top_div_aclk_isp0_pxl_asbs_is_c_from_is_d",
+	     TOP_GATE_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_ISP1_ISP1_468, "gout_top_gate_aclk_isp1_isp1_468",
+	     "dout_top_div_aclk_isp1_isp1_468",
+	     TOP_GATE_ACLK_ISP1_ISP1_468, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CAM0_CSIS0_414, "gout_top_gate_aclk_cam0_csis0_414",
+	     "dout_top_div_aclk_cam0_csis0_414",
+	     TOP_GATE_ACLK_CAM0_CSIS0_414, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CAM0_CSIS1_168, "gout_top_gate_aclk_cam0_csis1_168",
+	     "dout_top_div_aclk_cam0_csis1_168",
+	     TOP_GATE_ACLK_CAM0_CSIS1_168, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CAM0_CSIS2_234, "gout_top_gate_aclk_cam0_csis2_234",
+	     "dout_top_div_aclk_cam0_csis2_234",
+	     TOP_GATE_ACLK_CAM0_CSIS2_234, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CAM0_3AA0_414, "gout_top_gate_aclk_cam0_3aa0_414",
+	     "dout_top_div_aclk_cam0_3aa0_414",
+	     TOP_GATE_ACLK_CAM0_3AA0_414, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CAM0_3AA1_414, "gout_top_gate_aclk_cam0_3aa1_414",
+	     "dout_top_div_aclk_cam0_3aa1_414",
+	     TOP_GATE_ACLK_CAM0_3AA1_414, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CAM0_CSIS3_132, "gout_top_gate_aclk_cam0_csis3_132",
+	     "dout_top_div_aclk_cam0_csis3_132",
+	     TOP_GATE_ACLK_CAM0_CSIS3_132, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CAM0_TREX_528, "gout_top_gate_aclk_cam0_trex_528",
+	     "dout_top_div_aclk_cam0_trex_528",
+	     TOP_GATE_ACLK_CAM0_TREX_528, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CAM1_ARM_672, "gout_top_gate_aclk_cam1_arm_672",
+	     "dout_top_div_aclk_cam1_arm_672",
+	     TOP_GATE_ACLK_CAM1_ARM_672, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CAM1_TREX_VRA_528, "gout_top_gate_aclk_cam1_trex_vra_528",
+	     "dout_top_div_aclk_cam1_trex_vra_528",
+	     TOP_GATE_ACLK_CAM1_TREX_VRA_528, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CAM1_TREX_B_528, "gout_top_gate_aclk_cam1_trex_b_528",
+	     "dout_top_div_aclk_cam1_trex_b_528",
+	     TOP_GATE_ACLK_CAM1_TREX_B_528, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CAM1_BUS_264, "gout_top_gate_aclk_cam1_bus_264",
+	     "dout_top_div_aclk_cam1_bus_264",
+	     TOP_GATE_ACLK_CAM1_BUS_264, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CAM1_PERI_84, "gout_top_gate_aclk_cam1_peri_84",
+	     "dout_top_div_aclk_cam1_peri_84",
+	     TOP_GATE_ACLK_CAM1_PERI_84, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CAM1_CSIS2_414, "gout_top_gate_aclk_cam1_csis2_414",
+	     "dout_top_div_aclk_cam1_csis2_414",
+	     TOP_GATE_ACLK_CAM1_CSIS2_414, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CAM1_CSIS3_132, "gout_top_gate_aclk_cam1_csis3_132",
+	     "dout_top_div_aclk_cam1_csis3_132",
+	     TOP_GATE_ACLK_CAM1_CSIS3_132, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_CAM1_SCL_566, "gout_top_gate_aclk_cam1_scl_566",
+	     "dout_top_div_aclk_cam1_scl_566",
+	     TOP_GATE_ACLK_CAM1_SCL_566, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_DISP0_DECON0_ECLK0, "gout_top_gate_sclk_disp0_decon0_eclk0",
+	     "dout_top_div_sclk_disp0_decon0_eclk0",
+	     TOP_GATE_SCLK_DISP0_DECON0_ECLK0, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_DISP0_DECON0_VCLK0, "gout_top_gate_sclk_disp0_decon0_vclk0",
+	     "dout_top_div_sclk_disp0_decon0_vclk0",
+	     TOP_GATE_SCLK_DISP0_DECON0_VCLK0, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_DISP0_DECON0_VCLK1, "gout_top_gate_sclk_disp0_decon0_vclk1",
+	     "dout_top_div_sclk_disp0_decon0_vclk1",
+	     TOP_GATE_SCLK_DISP0_DECON0_VCLK1, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_DISP0_HDMI_AUDIO, "gout_top_gate_sclk_disp0_hdmi_audio",
+	     "dout_top_div_sclk_disp0_hdmi_audio",
+	     TOP_GATE_SCLK_DISP0_HDMI_AUDIO, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_DISP1_DECON1_ECLK0, "gout_top_gate_sclk_disp1_decon1_eclk0",
+	     "dout_top_div_sclk_disp1_decon1_eclk0",
+	     TOP_GATE_SCLK_DISP1_DECON1_ECLK0, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_DISP1_DECON1_ECLK1, "gout_top_gate_sclk_disp1_decon1_eclk1",
+	     "dout_top_div_sclk_disp1_decon1_eclk1",
+	     TOP_GATE_SCLK_DISP1_DECON1_ECLK1, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_FSYS0_USBDRD30, "gout_top_gate_sclk_fsys0_usbdrd30",
+	     "dout_top_div_sclk_fsys0_usbdrd30",
+	     TOP_GATE_SCLK_FSYS0_USBDRD30, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_FSYS0_MMC0, "gout_top_gate_sclk_fsys0_mmc0",
+	     "dout_top_div_sclk_fsys0_mmc0",
+	     TOP_GATE_SCLK_FSYS0_MMC0, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_FSYS0_UFSUNIPRO20, "gout_top_gate_sclk_fsys0_ufsunipro20",
+	     "dout_top_div_sclk_fsys0_ufsunipro20",
+	     TOP_GATE_SCLK_FSYS0_UFSUNIPRO20, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_FSYS0_PHY_24M, "gout_top_gate_sclk_fsys0_phy_24m",
+	     "dout_top_div_sclk_fsys0_phy_24m",
+	     TOP_GATE_SCLK_FSYS0_PHY_24M, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_FSYS0_UFSUNIPRO_CFG, "gout_top_gate_sclk_fsys0_ufsunipro_cfg",
+	     "dout_top_div_sclk_fsys0_ufsunipro_cfg",
+	     TOP_GATE_SCLK_FSYS0_UFSUNIPRO_CFG, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_FSYS1_MMC2, "gout_top_gate_sclk_fsys1_mmc2",
+	     "dout_top_div_sclk_fsys1_mmc2",
+	     TOP_GATE_SCLK_FSYS1_MMC2, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_FSYS1_UFSUNIPRO20, "gout_top_gate_sclk_fsys1_ufsunipro20",
+	     "dout_top_div_sclk_fsys1_ufsunipro20",
+	     TOP_GATE_SCLK_FSYS1_UFSUNIPRO20, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_FSYS1_PCIE_PHY, "gout_top_gate_sclk_fsys1_pcie_phy",
+	     "dout_top_div_sclk_fsys1_pcie_phy",
+	     TOP_GATE_SCLK_FSYS1_PCIE_PHY, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_FSYS1_UFSUNIPRO_CFG, "gout_top_gate_sclk_fsys1_ufsunipro_cfg",
+	     "dout_top_div_sclk_fsys1_ufsunipro_cfg",
+	     TOP_GATE_SCLK_FSYS1_UFSUNIPRO_CFG, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_PERIC0_UART0, "gout_top_gate_sclk_peric0_uart0",
+	     "dout_top_div_sclk_peric0_uart0",
+	     TOP_GATE_SCLK_PERIC0_UART0, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_PERIC1_SPI0, "gout_top_gate_sclk_peric1_spi0",
+	     "dout_top_div_sclk_peric1_spi0",
+	     TOP_GATE_SCLK_PERIC1_SPI0, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_PERIC1_SPI1, "gout_top_gate_sclk_peric1_spi1",
+	     "dout_top_div_sclk_peric1_spi1",
+	     TOP_GATE_SCLK_PERIC1_SPI1, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_PERIC1_SPI2, "gout_top_gate_sclk_peric1_spi2",
+	     "dout_top_div_sclk_peric1_spi2",
+	     TOP_GATE_SCLK_PERIC1_SPI2, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_PERIC1_SPI3, "gout_top_gate_sclk_peric1_spi3",
+	     "dout_top_div_sclk_peric1_spi3",
+	     TOP_GATE_SCLK_PERIC1_SPI3, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_PERIC1_SPI4, "gout_top_gate_sclk_peric1_spi4",
+	     "dout_top_div_sclk_peric1_spi4",
+	     TOP_GATE_SCLK_PERIC1_SPI4, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_PERIC1_SPI5, "gout_top_gate_sclk_peric1_spi5",
+	     "dout_top_div_sclk_peric1_spi5",
+	     TOP_GATE_SCLK_PERIC1_SPI5, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_PERIC1_SPI6, "gout_top_gate_sclk_peric1_spi6",
+	     "dout_top_div_sclk_peric1_spi6",
+	     TOP_GATE_SCLK_PERIC1_SPI6, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_PERIC1_SPI7, "gout_top_gate_sclk_peric1_spi7",
+	     "dout_top_div_sclk_peric1_spi7",
+	     TOP_GATE_SCLK_PERIC1_SPI7, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_PERIC1_UART1, "gout_top_gate_sclk_peric1_uart1",
+	     "dout_top_div_sclk_peric1_uart1",
+	     TOP_GATE_SCLK_PERIC1_UART1, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_PERIC1_UART2, "gout_top_gate_sclk_peric1_uart2",
+	     "dout_top_div_sclk_peric1_uart2",
+	     TOP_GATE_SCLK_PERIC1_UART2, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_PERIC1_UART3, "gout_top_gate_sclk_peric1_uart3",
+	     "dout_top_div_sclk_peric1_uart3",
+	     TOP_GATE_SCLK_PERIC1_UART3, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_PERIC1_UART4, "gout_top_gate_sclk_peric1_uart4",
+	     "dout_top_div_sclk_peric1_uart4",
+	     TOP_GATE_SCLK_PERIC1_UART4, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_PERIC1_UART5, "gout_top_gate_sclk_peric1_uart5",
+	     "dout_top_div_sclk_peric1_uart5",
+	     TOP_GATE_SCLK_PERIC1_UART5, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_CAM1_ISP_SPI0, "gout_top_gate_sclk_cam1_isp_spi0",
+	     "dout_top_div_sclk_cam1_isp_spi0",
+	     TOP_GATE_SCLK_CAM1_ISP_SPI0, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_CAM1_ISP_SPI1, "gout_top_gate_sclk_cam1_isp_spi1",
+	     "dout_top_div_sclk_cam1_isp_spi1",
+	     TOP_GATE_SCLK_CAM1_ISP_SPI1, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_CAM1_ISP_UART, "gout_top_gate_sclk_cam1_isp_uart",
+	     "dout_top_div_sclk_cam1_isp_uart",
+	     TOP_GATE_SCLK_CAM1_ISP_UART, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_AP2CP_MIF_PLL_OUT, "gout_top_gate_sclk_ap2cp_mif_pll_out",
+	     "dout_top_div_sclk_ap2cp_mif_pll_out",
+	     TOP_GATE_SCLK_AP2CP_MIF_PLL_OUT, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_ACLK_PSCDC_400, "gout_top_gate_aclk_pscdc_400",
+	     "dout_top_div_aclk_pscdc_400",
+	     TOP_GATE_ACLK_PSCDC_400, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_BUS_PLL_MNGS, "gout_top_gate_sclk_bus_pll_mngs",
+	     "dout_top_div_sclk_bus_pll_mngs",
+	     TOP_GATE_SCLK_BUS_PLL_MNGS, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_BUS_PLL_APOLLO, "gout_top_gate_sclk_bus_pll_apollo",
+	     "dout_top_div_sclk_bus_pll_apollo",
+	     TOP_GATE_SCLK_BUS_PLL_APOLLO, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_BUS_PLL_MIF, "gout_top_gate_sclk_bus_pll_mif",
+	     "mout_top_mux_sclk_bus_pll_mif",
+	     TOP_GATE_SCLK_BUS_PLL_MIF, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_BUS_PLL_G3D, "gout_top_gate_sclk_bus_pll_g3d",
+	     "dout_top_div_sclk_bus_pll_g3d",
+	     TOP_GATE_SCLK_BUS_PLL_G3D, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_ISP_SENSOR0, "gout_top_gate_sclk_isp_sensor0",
+	     "dout_top_div_sclk_isp_sensor0",
+	     TOP_GATE_SCLK_ISP_SENSOR0, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_ISP_SENSOR1, "gout_top_gate_sclk_isp_sensor1",
+	     "dout_top_div_sclk_isp_sensor1",
+	     TOP_GATE_SCLK_ISP_SENSOR1, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_ISP_SENSOR2, "gout_top_gate_sclk_isp_sensor2",
+	     "dout_top_div_sclk_isp_sensor2",
+	     TOP_GATE_SCLK_ISP_SENSOR2, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_ISP_SENSOR3, "gout_top_gate_sclk_isp_sensor3",
+	     "dout_top_div_sclk_isp_sensor3",
+	     TOP_GATE_SCLK_ISP_SENSOR3, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_PROMISE_INT, "gout_top_gate_sclk_promise_int",
+	     "dout_top_div_sclk_promise_int",
+	     TOP_GATE_SCLK_PROMISE_INT, 0, 0, 0),
+	GATE(CLK_GOUT_TOP_GATE_SCLK_PROMISE_DISP, "gout_top_gate_sclk_promise_disp",
+	     "dout_top_div_sclk_promise_disp",
+	     TOP_GATE_SCLK_PROMISE_DISP, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info top_cmu_info __initconst = {
+	.pll_clks		= top_pll_clks,
+	.nr_pll_clks		= ARRAY_SIZE(top_pll_clks),
+	.mux_clks		= top_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(top_mux_clks),
+	.div_clks		= top_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(top_div_clks),
+	.gate_clks		= top_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(top_gate_clks),
+	.fixed_clks		= top_fixed_clks,
+	.nr_fixed_clks		= ARRAY_SIZE(top_fixed_clks),
+	.nr_clk_ids		= CLKS_NR_TOP,
+	.clk_regs		= top_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(top_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_top_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &top_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_top, "samsung,exynos8890-cmu-top",
+	       exynos8890_cmu_top_init);
+
+/* ---- CMU_CCORE -------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_CCORE (0x105b0000) */
+#define CCORE_MUX_ACLK_CCORE_800_USER			0x0200
+#define CCORE_MUX_ACLK_CCORE_264_USER			0x0204
+#define CCORE_MUX_ACLK_CCORE_G3D_800_USER			0x0208
+#define CCORE_MUX_ACLK_CCORE_528_USER			0x020c
+#define CCORE_MUX_ACLK_CCORE_132_USER			0x0210
+#define CCORE_MUX_PCLK_CCORE_66_USER			0x0214
+#define CCORE_DIV_SCLK_HPM_CCORE			0x0400
+#define CCORE_GATE_ACLK_AXI_AS_SI_IRPM			0x0800
+#define CCORE_GATE_ACLK_CLEANY_CPPERI			0x0804
+#define CCORE_GATE_ACLK_TREX_CCORE_G3D			0x0808
+#define CCORE_GATE_ACLK_ATB_APL_MNGS			0x080c
+#define CCORE_GATE_PCLK_CMU			0x0810
+#define CCORE_GATE_PCLK_APBASYNC_BAT_AP			0x0814
+#define CCORE_GATE_PCLK_APBASYNC_BAT_CP			0x0818
+#define CCORE_GATE_PCLK_HSI2C_BAT_AP			0x0900
+#define CCORE_GATE_PCLK_HSI2C_BAT_CP			0x0904
+#define CCORE_GATE_SCLK_PROMISE			0x0a00
+
+static const unsigned long ccore_clk_regs[] __initconst = {
+	CCORE_MUX_ACLK_CCORE_800_USER,
+	CCORE_MUX_ACLK_CCORE_264_USER,
+	CCORE_MUX_ACLK_CCORE_G3D_800_USER,
+	CCORE_MUX_ACLK_CCORE_528_USER,
+	CCORE_MUX_ACLK_CCORE_132_USER,
+	CCORE_MUX_PCLK_CCORE_66_USER,
+	CCORE_DIV_SCLK_HPM_CCORE,
+	CCORE_GATE_ACLK_AXI_AS_SI_IRPM,
+	CCORE_GATE_ACLK_CLEANY_CPPERI,
+	CCORE_GATE_ACLK_TREX_CCORE_G3D,
+	CCORE_GATE_ACLK_ATB_APL_MNGS,
+	CCORE_GATE_PCLK_CMU,
+	CCORE_GATE_PCLK_APBASYNC_BAT_AP,
+	CCORE_GATE_PCLK_APBASYNC_BAT_CP,
+	CCORE_GATE_PCLK_HSI2C_BAT_AP,
+	CCORE_GATE_PCLK_HSI2C_BAT_CP,
+	CCORE_GATE_SCLK_PROMISE,
+};
+
+/* List of parent clocks for Muxes in CMU_CCORE */
+PNAME(mout_ccore_mux_aclk_ccore_800_user_p) = { "oscclk", "gout_top_gate_aclk_ccore_800" };
+PNAME(mout_ccore_mux_aclk_ccore_264_user_p) = { "oscclk", "gout_top_gate_aclk_ccore_264" };
+PNAME(mout_ccore_mux_aclk_ccore_g3d_800_user_p) = { "oscclk", "gout_top_gate_aclk_ccore_g3d_800" };
+PNAME(mout_ccore_mux_aclk_ccore_528_user_p) = { "oscclk", "gout_top_gate_aclk_ccore_528" };
+PNAME(mout_ccore_mux_aclk_ccore_132_user_p) = { "oscclk", "gout_top_gate_aclk_ccore_132" };
+PNAME(mout_ccore_mux_pclk_ccore_66_user_p) = { "oscclk", "gout_top_gate_pclk_ccore_66" };
+
+static const struct samsung_mux_clock ccore_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_CCORE_MUX_ACLK_CCORE_800_USER, "mout_ccore_mux_aclk_ccore_800_user",
+	    mout_ccore_mux_aclk_ccore_800_user_p,
+	    CCORE_MUX_ACLK_CCORE_800_USER, 12, 1),
+	MUX(CLK_MOUT_CCORE_MUX_ACLK_CCORE_264_USER, "mout_ccore_mux_aclk_ccore_264_user",
+	    mout_ccore_mux_aclk_ccore_264_user_p,
+	    CCORE_MUX_ACLK_CCORE_264_USER, 12, 1),
+	MUX(CLK_MOUT_CCORE_MUX_ACLK_CCORE_G3D_800_USER, "mout_ccore_mux_aclk_ccore_g3d_800_user",
+	    mout_ccore_mux_aclk_ccore_g3d_800_user_p,
+	    CCORE_MUX_ACLK_CCORE_G3D_800_USER, 12, 1),
+	MUX(CLK_MOUT_CCORE_MUX_ACLK_CCORE_528_USER, "mout_ccore_mux_aclk_ccore_528_user",
+	    mout_ccore_mux_aclk_ccore_528_user_p,
+	    CCORE_MUX_ACLK_CCORE_528_USER, 12, 1),
+	MUX(CLK_MOUT_CCORE_MUX_ACLK_CCORE_132_USER, "mout_ccore_mux_aclk_ccore_132_user",
+	    mout_ccore_mux_aclk_ccore_132_user_p,
+	    CCORE_MUX_ACLK_CCORE_132_USER, 12, 1),
+	MUX(CLK_MOUT_CCORE_MUX_PCLK_CCORE_66_USER, "mout_ccore_mux_pclk_ccore_66_user",
+	    mout_ccore_mux_pclk_ccore_66_user_p,
+	    CCORE_MUX_PCLK_CCORE_66_USER, 12, 1),
+};
+
+static const struct samsung_div_clock ccore_div_clks[] __initconst = {
+	DIV(CLK_DOUT_CCORE_DIV_SCLK_HPM_CCORE, "dout_ccore_div_sclk_hpm_ccore",
+	    "mout_ccore_mux_aclk_ccore_800_user",
+	    CCORE_DIV_SCLK_HPM_CCORE, 0, 4),
+};
+
+static const struct samsung_gate_clock ccore_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_AS_SI_IRPM, "gout_ccore_gate_aclk_axi_as_si_irpm",
+	     "mout_ccore_mux_aclk_ccore_800_user",
+	     CCORE_GATE_ACLK_AXI_AS_SI_IRPM, 11, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_MPACEBRIDGE, "gout_ccore_gate_aclk_mpacebridge",
+	     "mout_ccore_mux_aclk_ccore_800_user",
+	     CCORE_GATE_ACLK_AXI_AS_SI_IRPM, 10, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_PULSE2HS, "gout_ccore_gate_aclk_pulse2hs",
+	     "mout_ccore_mux_aclk_ccore_800_user",
+	     CCORE_GATE_ACLK_AXI_AS_SI_IRPM, 9, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_DBG_LH_MI_MIF_CCORE, "gout_ccore_gate_aclk_dbg_lh_mi_mif_ccore",
+	     "mout_ccore_mux_aclk_ccore_800_user",
+	     CCORE_GATE_ACLK_AXI_AS_SI_IRPM, 8, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_SCI_PPC_WRAPPER, "gout_ccore_gate_aclk_sci_ppc_wrapper",
+	     "mout_ccore_mux_aclk_ccore_800_user",
+	     CCORE_GATE_ACLK_AXI_AS_SI_IRPM, 7, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_ACE_AS_MI_APL_CCORE, "gout_ccore_gate_aclk_ace_as_mi_apl_ccore",
+	     "mout_ccore_mux_aclk_ccore_800_user",
+	     CCORE_GATE_ACLK_AXI_AS_SI_IRPM, 6, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_MPACE_SI, "gout_ccore_gate_aclk_mpace_si",
+	     "mout_ccore_mux_aclk_ccore_800_user",
+	     CCORE_GATE_ACLK_AXI_AS_SI_IRPM, 5, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_CPACE_MI, "gout_ccore_gate_aclk_cpace_mi",
+	     "mout_ccore_mux_aclk_ccore_800_user",
+	     CCORE_GATE_ACLK_AXI_AS_SI_IRPM, 4, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_ATB_SI_CCOREBDU_MNGSCS, "gout_ccore_gate_aclk_atb_si_ccorebdu_mngscs",
+	     "mout_ccore_mux_aclk_ccore_800_user",
+	     CCORE_GATE_ACLK_AXI_AS_SI_IRPM, 3, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_BDU, "gout_ccore_gate_aclk_bdu",
+	     "mout_ccore_mux_aclk_ccore_800_user",
+	     CCORE_GATE_ACLK_AXI_AS_SI_IRPM, 2, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_TREX_CCORE_SCI, "gout_ccore_gate_aclk_trex_ccore_sci",
+	     "mout_ccore_mux_aclk_ccore_800_user",
+	     CCORE_GATE_ACLK_AXI_AS_SI_IRPM, 1, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_SCI, "gout_ccore_gate_aclk_sci",
+	     "mout_ccore_mux_aclk_ccore_800_user",
+	     CCORE_GATE_ACLK_AXI_AS_SI_IRPM, 0, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_CLEANY_CPPERI, "gout_ccore_gate_aclk_cleany_cpperi",
+	     "mout_ccore_mux_aclk_ccore_264_user",
+	     CCORE_GATE_ACLK_CLEANY_CPPERI, 9, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_US_CPPERI, "gout_ccore_gate_aclk_axi_us_cpperi",
+	     "mout_ccore_mux_aclk_ccore_264_user",
+	     CCORE_GATE_ACLK_CLEANY_CPPERI, 8, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_LH_MI_CPPERI_CCORE, "gout_ccore_gate_aclk_axi_lh_mi_cpperi_ccore",
+	     "mout_ccore_mux_aclk_ccore_264_user",
+	     CCORE_GATE_ACLK_CLEANY_CPPERI, 7, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_LH_SI_CCORESFRX_IMEMX, "gout_ccore_gate_aclk_axi_lh_si_ccoresfrx_imemx",
+	     "mout_ccore_mux_aclk_ccore_264_user",
+	     CCORE_GATE_ACLK_CLEANY_CPPERI, 6, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_LH_MI_G3DXIRAM_CCORESFR, "gout_ccore_gate_aclk_axi_lh_mi_g3dxiram_ccoresfr",
+	     "mout_ccore_mux_aclk_ccore_264_user",
+	     CCORE_GATE_ACLK_CLEANY_CPPERI, 5, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_DS_IRPM, "gout_ccore_gate_aclk_axi_ds_irpm",
+	     "mout_ccore_mux_aclk_ccore_264_user",
+	     CCORE_GATE_ACLK_CLEANY_CPPERI, 4, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_XIU_CCORESFRX, "gout_ccore_gate_aclk_xiu_ccoresfrx",
+	     "mout_ccore_mux_aclk_ccore_264_user",
+	     CCORE_GATE_ACLK_CLEANY_CPPERI, 3, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_TREX_P_CCORE_BUS, "gout_ccore_gate_aclk_trex_p_ccore_bus",
+	     "mout_ccore_mux_aclk_ccore_264_user",
+	     CCORE_GATE_ACLK_CLEANY_CPPERI, 2, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_TREX_CCORE_PERI, "gout_ccore_gate_aclk_trex_ccore_peri",
+	     "mout_ccore_mux_aclk_ccore_264_user",
+	     CCORE_GATE_ACLK_CLEANY_CPPERI, 1, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_AS_MI_IRPM, "gout_ccore_gate_aclk_axi_as_mi_irpm",
+	     "mout_ccore_mux_aclk_ccore_264_user",
+	     CCORE_GATE_ACLK_CLEANY_CPPERI, 0, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_TREX_CCORE_G3D, "gout_ccore_gate_aclk_trex_ccore_g3d",
+	     "mout_ccore_mux_aclk_ccore_g3d_800_user",
+	     CCORE_GATE_ACLK_TREX_CCORE_G3D, 2, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_ACEL_LH_MI_G3DX1_CCORETD, "gout_ccore_gate_aclk_acel_lh_mi_g3dx1_ccoretd",
+	     "mout_ccore_mux_aclk_ccore_g3d_800_user",
+	     CCORE_GATE_ACLK_TREX_CCORE_G3D, 1, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_ACEL_LH_MI_G3DX0_CCORETD, "gout_ccore_gate_aclk_acel_lh_mi_g3dx0_ccoretd",
+	     "mout_ccore_mux_aclk_ccore_g3d_800_user",
+	     CCORE_GATE_ACLK_TREX_CCORE_G3D, 0, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_ATB_APL_MNGS, "gout_ccore_gate_aclk_atb_apl_mngs",
+	     "mout_ccore_mux_aclk_ccore_528_user",
+	     CCORE_GATE_ACLK_ATB_APL_MNGS, 7, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_XIU_CPX, "gout_ccore_gate_aclk_xiu_cpx",
+	     "mout_ccore_mux_aclk_ccore_528_user",
+	     CCORE_GATE_ACLK_ATB_APL_MNGS, 6, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_CLEANY_CPDATA, "gout_ccore_gate_aclk_cleany_cpdata",
+	     "mout_ccore_mux_aclk_ccore_528_user",
+	     CCORE_GATE_ACLK_ATB_APL_MNGS, 5, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_LH_MI_CPDATA_CCORE, "gout_ccore_gate_aclk_axi_lh_mi_cpdata_ccore",
+	     "mout_ccore_mux_aclk_ccore_528_user",
+	     CCORE_GATE_ACLK_ATB_APL_MNGS, 4, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_LH_MI_IMEMX_CCORETD, "gout_ccore_gate_aclk_axi_lh_mi_imemx_ccoretd",
+	     "mout_ccore_mux_aclk_ccore_528_user",
+	     CCORE_GATE_ACLK_ATB_APL_MNGS, 3, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_LH_MI_AUDX_CCORETD, "gout_ccore_gate_aclk_axi_lh_mi_audx_ccoretd",
+	     "mout_ccore_mux_aclk_ccore_528_user",
+	     CCORE_GATE_ACLK_ATB_APL_MNGS, 2, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_AS_MI_MNGSCS_CCORETD, "gout_ccore_gate_aclk_axi_as_mi_mngscs_ccoretd",
+	     "mout_ccore_mux_aclk_ccore_528_user",
+	     CCORE_GATE_ACLK_ATB_APL_MNGS, 1, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_TREX_CCORE, "gout_ccore_gate_aclk_trex_ccore",
+	     "mout_ccore_mux_aclk_ccore_528_user",
+	     CCORE_GATE_ACLK_ATB_APL_MNGS, 0, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_CMU, "gout_ccore_gate_pclk_cmu",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 30, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_HPM_APBIF, "gout_ccore_gate_pclk_hpm_apbif",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 29, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_SCI, "gout_ccore_gate_pclk_sci",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 28, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_GPIO_CCORE, "gout_ccore_gate_pclk_gpio_ccore",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 27, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_S_MAILBOX, "gout_ccore_gate_pclk_s_mailbox",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 26, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_MAILBOX, "gout_ccore_gate_pclk_mailbox",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 25, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_SYSREG_CCORE, "gout_ccore_gate_pclk_sysreg_ccore",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 24, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_GPIO_APBIF_ALIVE, "gout_ccore_gate_pclk_gpio_apbif_alive",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 23, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_SCI_PPC_WRAPPER, "gout_ccore_gate_pclk_sci_ppc_wrapper",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 22, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_VT_MON_APB, "gout_ccore_gate_pclk_vt_mon_apb",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 21, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_PMU_CCORE, "gout_ccore_gate_pclk_pmu_ccore",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 20, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_PMU_APBIF, "gout_ccore_gate_pclk_pmu_apbif",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 19, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_CMU_TOPC_APBIF, "gout_ccore_gate_pclk_cmu_topc_apbif",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 18, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_AXI2APB_CORESIGHT, "gout_ccore_gate_pclk_axi2apb_coresight",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 17, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_AXI2APB_TREX_P_CCORE, "gout_ccore_gate_pclk_axi2apb_trex_p_ccore",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 16, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_AXI2APB_TREX_CCORE, "gout_ccore_gate_pclk_axi2apb_trex_ccore",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 15, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_AXI2APB_CCORE, "gout_ccore_gate_pclk_axi2apb_ccore",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 14, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_TREX_P_CCORE, "gout_ccore_gate_pclk_trex_p_ccore",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 13, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_TREX_CCORE, "gout_ccore_gate_pclk_trex_ccore",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 12, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_BDU, "gout_ccore_gate_pclk_bdu",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 11, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_LH_SI_CCORETP_MIF3P, "gout_ccore_gate_aclk_axi_lh_si_ccoretp_mif3p",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 10, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_LH_SI_CCORETP_MIF2P, "gout_ccore_gate_aclk_axi_lh_si_ccoretp_mif2p",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 9, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_LH_SI_CCORETP_MIF1P, "gout_ccore_gate_aclk_axi_lh_si_ccoretp_mif1p",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 8, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_LH_SI_CCORETP_MIF0P, "gout_ccore_gate_aclk_axi_lh_si_ccoretp_mif0p",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 7, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_LH_SI_CCORETP_G3DP, "gout_ccore_gate_aclk_axi_lh_si_ccoretp_g3dp",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 6, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_LH_SI_CCORETP_AUDX, "gout_ccore_gate_aclk_axi_lh_si_ccoretp_audx",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 5, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_AS_SI_CCORETP_APL, "gout_ccore_gate_aclk_axi_as_si_ccoretp_apl",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 4, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_AXI_AS_SI_CCORETP_MNGS, "gout_ccore_gate_aclk_axi_as_si_ccoretp_mngs",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 3, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_APB_AS_MI_CCORETP_MNGSCS, "gout_ccore_gate_aclk_apb_as_mi_ccoretp_mngscs",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 2, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_APB_AS_MI_MNGSCS_CCOREBDU, "gout_ccore_gate_aclk_apb_as_mi_mngscs_ccorebdu",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 1, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_ACLK_TREX_P_CCORE, "gout_ccore_gate_aclk_trex_p_ccore",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_CMU, 0, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_APBASYNC_BAT_AP, "gout_ccore_gate_pclk_apbasync_bat_ap",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_APBASYNC_BAT_AP, 0, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_APBASYNC_BAT_CP, "gout_ccore_gate_pclk_apbasync_bat_cp",
+	     "mout_ccore_mux_aclk_ccore_132_user",
+	     CCORE_GATE_PCLK_APBASYNC_BAT_CP, 0, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_HSI2C_BAT_AP, "gout_ccore_gate_pclk_hsi2c_bat_ap",
+	     "mout_ccore_mux_pclk_ccore_66_user",
+	     CCORE_GATE_PCLK_HSI2C_BAT_AP, 1, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_HSI2C, "gout_ccore_gate_pclk_hsi2c",
+	     "mout_ccore_mux_pclk_ccore_66_user",
+	     CCORE_GATE_PCLK_HSI2C_BAT_AP, 0, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_HSI2C_BAT_CP, "gout_ccore_gate_pclk_hsi2c_bat_cp",
+	     "mout_ccore_mux_pclk_ccore_66_user",
+	     CCORE_GATE_PCLK_HSI2C_BAT_CP, 1, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_PCLK_HSI2C_CP, "gout_ccore_gate_pclk_hsi2c_cp",
+	     "mout_ccore_mux_pclk_ccore_66_user",
+	     CCORE_GATE_PCLK_HSI2C_BAT_CP, 0, 0, 0),
+	GATE(CLK_GOUT_CCORE_GATE_SCLK_PROMISE, "gout_ccore_gate_sclk_promise",
+	     "dout_ccore_div_sclk_hpm_ccore",
+	     CCORE_GATE_SCLK_PROMISE, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info ccore_cmu_info __initconst = {
+	.mux_clks		= ccore_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(ccore_mux_clks),
+	.div_clks		= ccore_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(ccore_div_clks),
+	.gate_clks		= ccore_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(ccore_gate_clks),
+	.nr_clk_ids		= CLKS_NR_CCORE,
+	.clk_regs		= ccore_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(ccore_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_ccore_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &ccore_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_ccore, "samsung,exynos8890-cmu-ccore",
+	       exynos8890_cmu_ccore_init);
+
+/* ---- CMU_MIF0 --------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_MIF0 (0x10850000) */
+#define MIF0_MUX_MIF_PLL			0x0200
+#define MIF0_MUX_BUS_PLL_USER			0x0204
+#define MIF0_MUX_ACLK_MIF_PLL			0x0208
+#define MIF0_MUX_PCLK_MIF			0x0210
+#define MIF0_MUX_SCLK_HPM_MIF			0x0214
+#define MIF0_MUX_PCLK_SMC			0x0218
+#define MIF0_DIV_PCLK_MIF			0x0400
+#define MIF0_DIV_PCLK_SMC			0x0404
+#define MIF0_DIV_SCLK_HPM_MIF			0x0408
+#define MIF0_GATE_ACLK_APSCDC			0x0800
+#define MIF0_GATE_PCLK_SMC1			0x0900
+#define MIF0_GATE_PCLK_SMC2			0x0904
+#define MIF0_GATE_SCLK_PROMISE			0x0a00
+#define MIF0_GATE_RCLK_DREX			0x0a04
+
+static const unsigned long mif0_clk_regs[] __initconst = {
+	MIF0_MUX_MIF_PLL,
+	MIF0_MUX_BUS_PLL_USER,
+	MIF0_MUX_ACLK_MIF_PLL,
+	MIF0_MUX_PCLK_MIF,
+	MIF0_MUX_SCLK_HPM_MIF,
+	MIF0_MUX_PCLK_SMC,
+	MIF0_DIV_PCLK_MIF,
+	MIF0_DIV_PCLK_SMC,
+	MIF0_DIV_SCLK_HPM_MIF,
+	MIF0_GATE_ACLK_APSCDC,
+	MIF0_GATE_PCLK_SMC1,
+	MIF0_GATE_PCLK_SMC2,
+	MIF0_GATE_SCLK_PROMISE,
+	MIF0_GATE_RCLK_DREX,
+};
+
+/* List of parent clocks for Muxes in CMU_MIF0 */
+PNAME(mout_mif0_mux_mif_pll_p) = { "oscclk", "fout_mif_pll" };
+PNAME(mout_mif0_mux_bus_pll_user_p) = { "oscclk", "gout_top_gate_sclk_bus_pll_mif" };
+PNAME(mout_mif0_mux_aclk_mif_pll_p) = { "mout_mif0_mux_mif_pll", "mout_mif0_mux_bus_pll_user" };
+
+static const struct samsung_mux_clock mif0_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_MIF0_MUX_MIF_PLL, "mout_mif0_mux_mif_pll", mout_mif0_mux_mif_pll_p,
+	    MIF0_MUX_MIF_PLL, 12, 1),
+	MUX(CLK_MOUT_MIF0_MUX_BUS_PLL_USER, "mout_mif0_mux_bus_pll_user",
+	    mout_mif0_mux_bus_pll_user_p,
+	    MIF0_MUX_BUS_PLL_USER, 12, 1),
+	MUX(CLK_MOUT_MIF0_MUX_ACLK_MIF_PLL, "mout_mif0_mux_aclk_mif_pll",
+	    mout_mif0_mux_aclk_mif_pll_p,
+	    MIF0_MUX_ACLK_MIF_PLL, 12, 1),
+};
+
+static const struct samsung_div_clock mif0_div_clks[] __initconst = {
+	DIV(CLK_DOUT_MIF0_DIV_PCLK_MIF, "dout_mif0_div_pclk_mif", "mout_mif0_mux_pclk_mif",
+	    MIF0_DIV_PCLK_MIF, 0, 3),
+	DIV(CLK_DOUT_MIF0_DIV_SCLK_HPM_MIF, "dout_mif0_div_sclk_hpm_mif",
+	    "mout_mif0_mux_sclk_hpm_mif",
+	    MIF0_DIV_SCLK_HPM_MIF, 0, 2),
+	DIV(CLK_DOUT_MIF0_DIV_PCLK_SMC, "dout_mif0_div_pclk_smc", "mout_mif0_mux_pclk_smc",
+	    MIF0_DIV_PCLK_SMC, 0, 3),
+};
+
+static const struct samsung_gate_clock mif0_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_MIF0_GATE_PCLK_SMC1, "gout_mif0_gate_pclk_smc1", "dout_mif0_div_pclk_mif",
+	     MIF0_GATE_PCLK_SMC1, 9, 0, 0),
+	GATE(CLK_GOUT_MIF0_GATE_PCLK_DMC_MISC, "gout_mif0_gate_pclk_dmc_misc",
+	     "dout_mif0_div_pclk_mif",
+	     MIF0_GATE_PCLK_SMC1, 8, 0, 0),
+	GATE(CLK_GOUT_MIF0_GATE_PCLK_PPC_DEBUG, "gout_mif0_gate_pclk_ppc_debug",
+	     "dout_mif0_div_pclk_mif",
+	     MIF0_GATE_PCLK_SMC1, 7, 0, 0),
+	GATE(CLK_GOUT_MIF0_GATE_PCLK_PPC_DVFS, "gout_mif0_gate_pclk_ppc_dvfs",
+	     "dout_mif0_div_pclk_mif",
+	     MIF0_GATE_PCLK_SMC1, 6, 0, 0),
+	GATE(CLK_GOUT_MIF0_GATE_PCLK_SYSREG_MIF, "gout_mif0_gate_pclk_sysreg_mif",
+	     "dout_mif0_div_pclk_mif",
+	     MIF0_GATE_PCLK_SMC1, 5, 0, 0),
+	GATE(CLK_GOUT_MIF0_GATE_PCLK_HPM, "gout_mif0_gate_pclk_hpm", "dout_mif0_div_pclk_mif",
+	     MIF0_GATE_PCLK_SMC1, 4, 0, 0),
+	GATE(CLK_GOUT_MIF0_GATE_ACLK_AXI_ASYNC, "gout_mif0_gate_aclk_axi_async",
+	     "dout_mif0_div_pclk_mif",
+	     MIF0_GATE_PCLK_SMC1, 3, 0, 0),
+	GATE(CLK_GOUT_MIF0_GATE_PCLK_MIFP, "gout_mif0_gate_pclk_mifp", "dout_mif0_div_pclk_mif",
+	     MIF0_GATE_PCLK_SMC1, 2, 0, 0),
+	GATE(CLK_GOUT_MIF0_GATE_PCLK_PMU_MIF, "gout_mif0_gate_pclk_pmu_mif",
+	     "dout_mif0_div_pclk_mif",
+	     MIF0_GATE_PCLK_SMC1, 1, 0, 0),
+	GATE(CLK_GOUT_MIF0_GATE_PCLK_LPDDR4PHY, "gout_mif0_gate_pclk_lpddr4phy",
+	     "dout_mif0_div_pclk_mif",
+	     MIF0_GATE_PCLK_SMC1, 0, 0, 0),
+	GATE(CLK_GOUT_MIF0_GATE_PCLK_SMC2, "gout_mif0_gate_pclk_smc2", "dout_mif0_div_pclk_mif",
+	     MIF0_GATE_PCLK_SMC2, 0, 0, 0),
+	GATE(CLK_GOUT_MIF0_GATE_SCLK_PROMISE, "gout_mif0_gate_sclk_promise",
+	     "dout_mif0_div_sclk_hpm_mif",
+	     MIF0_GATE_SCLK_PROMISE, 0, 0, 0),
+	GATE(CLK_GOUT_MIF0_GATE_RCLK_DREX, "gout_mif0_gate_rclk_drex", "oscclk",
+	     MIF0_GATE_RCLK_DREX, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info mif0_cmu_info __initconst = {
+	.mux_clks		= mif0_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(mif0_mux_clks),
+	.div_clks		= mif0_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(mif0_div_clks),
+	.gate_clks		= mif0_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(mif0_gate_clks),
+	.nr_clk_ids		= CLKS_NR_MIF0,
+	.clk_regs		= mif0_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(mif0_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_mif0_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &mif0_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_mif0, "samsung,exynos8890-cmu-mif0",
+	       exynos8890_cmu_mif0_init);
+
+/* ---- CMU_MIF1 --------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_MIF1 (0x10950000) */
+#define MIF1_MUX_MIF_PLL			0x0200
+#define MIF1_MUX_BUS_PLL_USER			0x0204
+#define MIF1_MUX_ACLK_MIF_PLL			0x0208
+#define MIF1_MUX_PCLK_MIF			0x0210
+#define MIF1_MUX_SCLK_HPM_MIF			0x0214
+#define MIF1_MUX_PCLK_SMC			0x0218
+#define MIF1_DIV_PCLK_MIF			0x0400
+#define MIF1_DIV_PCLK_SMC			0x0404
+#define MIF1_DIV_SCLK_HPM_MIF			0x0408
+#define MIF1_GATE_ACLK_APSCDC			0x0800
+#define MIF1_GATE_PCLK_SMC1			0x0900
+#define MIF1_GATE_PCLK_SMC2			0x0904
+#define MIF1_GATE_SCLK_PROMISE			0x0a00
+#define MIF1_GATE_RCLK_DREX			0x0a04
+
+static const unsigned long mif1_clk_regs[] __initconst = {
+	MIF1_MUX_MIF_PLL,
+	MIF1_MUX_BUS_PLL_USER,
+	MIF1_MUX_ACLK_MIF_PLL,
+	MIF1_MUX_PCLK_MIF,
+	MIF1_MUX_SCLK_HPM_MIF,
+	MIF1_MUX_PCLK_SMC,
+	MIF1_DIV_PCLK_MIF,
+	MIF1_DIV_PCLK_SMC,
+	MIF1_DIV_SCLK_HPM_MIF,
+	MIF1_GATE_ACLK_APSCDC,
+	MIF1_GATE_PCLK_SMC1,
+	MIF1_GATE_PCLK_SMC2,
+	MIF1_GATE_SCLK_PROMISE,
+	MIF1_GATE_RCLK_DREX,
+};
+
+/* List of parent clocks for Muxes in CMU_MIF1 */
+PNAME(mout_mif1_mux_mif_pll_p) = { "oscclk", "fout_mif_pll" };
+PNAME(mout_mif1_mux_bus_pll_user_p) = { "oscclk", "gout_top_gate_sclk_bus_pll_mif" };
+PNAME(mout_mif1_mux_aclk_mif_pll_p) = { "mout_mif1_mux_mif_pll", "mout_mif1_mux_bus_pll_user" };
+
+static const struct samsung_mux_clock mif1_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_MIF1_MUX_MIF_PLL, "mout_mif1_mux_mif_pll", mout_mif1_mux_mif_pll_p,
+	    MIF1_MUX_MIF_PLL, 12, 1),
+	MUX(CLK_MOUT_MIF1_MUX_BUS_PLL_USER, "mout_mif1_mux_bus_pll_user",
+	    mout_mif1_mux_bus_pll_user_p,
+	    MIF1_MUX_BUS_PLL_USER, 12, 1),
+	MUX(CLK_MOUT_MIF1_MUX_ACLK_MIF_PLL, "mout_mif1_mux_aclk_mif_pll",
+	    mout_mif1_mux_aclk_mif_pll_p,
+	    MIF1_MUX_ACLK_MIF_PLL, 12, 1),
+};
+
+static const struct samsung_div_clock mif1_div_clks[] __initconst = {
+	DIV(CLK_DOUT_MIF1_DIV_PCLK_MIF, "dout_mif1_div_pclk_mif", "mout_mif1_mux_pclk_mif",
+	    MIF1_DIV_PCLK_MIF, 0, 3),
+	DIV(CLK_DOUT_MIF1_DIV_SCLK_HPM_MIF, "dout_mif1_div_sclk_hpm_mif",
+	    "mout_mif1_mux_sclk_hpm_mif",
+	    MIF1_DIV_SCLK_HPM_MIF, 0, 2),
+	DIV(CLK_DOUT_MIF1_DIV_PCLK_SMC, "dout_mif1_div_pclk_smc", "mout_mif1_mux_pclk_smc",
+	    MIF1_DIV_PCLK_SMC, 0, 3),
+};
+
+static const struct samsung_gate_clock mif1_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_MIF1_GATE_PCLK_SMC1, "gout_mif1_gate_pclk_smc1", "dout_mif1_div_pclk_mif",
+	     MIF1_GATE_PCLK_SMC1, 9, 0, 0),
+	GATE(CLK_GOUT_MIF1_GATE_PCLK_DMC_MISC, "gout_mif1_gate_pclk_dmc_misc",
+	     "dout_mif1_div_pclk_mif",
+	     MIF1_GATE_PCLK_SMC1, 8, 0, 0),
+	GATE(CLK_GOUT_MIF1_GATE_PCLK_PPC_DEBUG, "gout_mif1_gate_pclk_ppc_debug",
+	     "dout_mif1_div_pclk_mif",
+	     MIF1_GATE_PCLK_SMC1, 7, 0, 0),
+	GATE(CLK_GOUT_MIF1_GATE_PCLK_PPC_DVFS, "gout_mif1_gate_pclk_ppc_dvfs",
+	     "dout_mif1_div_pclk_mif",
+	     MIF1_GATE_PCLK_SMC1, 6, 0, 0),
+	GATE(CLK_GOUT_MIF1_GATE_PCLK_SYSREG_MIF, "gout_mif1_gate_pclk_sysreg_mif",
+	     "dout_mif1_div_pclk_mif",
+	     MIF1_GATE_PCLK_SMC1, 5, 0, 0),
+	GATE(CLK_GOUT_MIF1_GATE_PCLK_HPM, "gout_mif1_gate_pclk_hpm", "dout_mif1_div_pclk_mif",
+	     MIF1_GATE_PCLK_SMC1, 4, 0, 0),
+	GATE(CLK_GOUT_MIF1_GATE_ACLK_AXI_ASYNC, "gout_mif1_gate_aclk_axi_async",
+	     "dout_mif1_div_pclk_mif",
+	     MIF1_GATE_PCLK_SMC1, 3, 0, 0),
+	GATE(CLK_GOUT_MIF1_GATE_PCLK_MIFP, "gout_mif1_gate_pclk_mifp", "dout_mif1_div_pclk_mif",
+	     MIF1_GATE_PCLK_SMC1, 2, 0, 0),
+	GATE(CLK_GOUT_MIF1_GATE_PCLK_PMU_MIF, "gout_mif1_gate_pclk_pmu_mif",
+	     "dout_mif1_div_pclk_mif",
+	     MIF1_GATE_PCLK_SMC1, 1, 0, 0),
+	GATE(CLK_GOUT_MIF1_GATE_PCLK_LPDDR4PHY, "gout_mif1_gate_pclk_lpddr4phy",
+	     "dout_mif1_div_pclk_mif",
+	     MIF1_GATE_PCLK_SMC1, 0, 0, 0),
+	GATE(CLK_GOUT_MIF1_GATE_PCLK_SMC2, "gout_mif1_gate_pclk_smc2", "dout_mif1_div_pclk_mif",
+	     MIF1_GATE_PCLK_SMC2, 0, 0, 0),
+	GATE(CLK_GOUT_MIF1_GATE_SCLK_PROMISE, "gout_mif1_gate_sclk_promise",
+	     "dout_mif1_div_sclk_hpm_mif",
+	     MIF1_GATE_SCLK_PROMISE, 0, 0, 0),
+	GATE(CLK_GOUT_MIF1_GATE_RCLK_DREX, "gout_mif1_gate_rclk_drex", "oscclk",
+	     MIF1_GATE_RCLK_DREX, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info mif1_cmu_info __initconst = {
+	.mux_clks		= mif1_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(mif1_mux_clks),
+	.div_clks		= mif1_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(mif1_div_clks),
+	.gate_clks		= mif1_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(mif1_gate_clks),
+	.nr_clk_ids		= CLKS_NR_MIF1,
+	.clk_regs		= mif1_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(mif1_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_mif1_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &mif1_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_mif1, "samsung,exynos8890-cmu-mif1",
+	       exynos8890_cmu_mif1_init);
+
+/* ---- CMU_MIF2 --------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_MIF2 (0x10a50000) */
+#define MIF2_MUX_MIF_PLL			0x0200
+#define MIF2_MUX_BUS_PLL_USER			0x0204
+#define MIF2_MUX_ACLK_MIF_PLL			0x0208
+#define MIF2_MUX_PCLK_MIF			0x0210
+#define MIF2_MUX_SCLK_HPM_MIF			0x0214
+#define MIF2_MUX_PCLK_SMC			0x0218
+#define MIF2_DIV_PCLK_MIF			0x0400
+#define MIF2_DIV_PCLK_SMC			0x0404
+#define MIF2_DIV_SCLK_HPM_MIF			0x0408
+#define MIF2_GATE_ACLK_APSCDC			0x0800
+#define MIF2_GATE_PCLK_SMC1			0x0900
+#define MIF2_GATE_PCLK_SMC2			0x0904
+#define MIF2_GATE_SCLK_PROMISE			0x0a00
+#define MIF2_GATE_RCLK_DREX			0x0a04
+
+static const unsigned long mif2_clk_regs[] __initconst = {
+	MIF2_MUX_MIF_PLL,
+	MIF2_MUX_BUS_PLL_USER,
+	MIF2_MUX_ACLK_MIF_PLL,
+	MIF2_MUX_PCLK_MIF,
+	MIF2_MUX_SCLK_HPM_MIF,
+	MIF2_MUX_PCLK_SMC,
+	MIF2_DIV_PCLK_MIF,
+	MIF2_DIV_PCLK_SMC,
+	MIF2_DIV_SCLK_HPM_MIF,
+	MIF2_GATE_ACLK_APSCDC,
+	MIF2_GATE_PCLK_SMC1,
+	MIF2_GATE_PCLK_SMC2,
+	MIF2_GATE_SCLK_PROMISE,
+	MIF2_GATE_RCLK_DREX,
+};
+
+/* List of parent clocks for Muxes in CMU_MIF2 */
+PNAME(mout_mif2_mux_mif_pll_p) = { "oscclk", "fout_mif_pll" };
+PNAME(mout_mif2_mux_bus_pll_user_p) = { "oscclk", "gout_top_gate_sclk_bus_pll_mif" };
+PNAME(mout_mif2_mux_aclk_mif_pll_p) = { "mout_mif2_mux_mif_pll", "mout_mif2_mux_bus_pll_user" };
+
+static const struct samsung_mux_clock mif2_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_MIF2_MUX_MIF_PLL, "mout_mif2_mux_mif_pll", mout_mif2_mux_mif_pll_p,
+	    MIF2_MUX_MIF_PLL, 12, 1),
+	MUX(CLK_MOUT_MIF2_MUX_BUS_PLL_USER, "mout_mif2_mux_bus_pll_user",
+	    mout_mif2_mux_bus_pll_user_p,
+	    MIF2_MUX_BUS_PLL_USER, 12, 1),
+	MUX(CLK_MOUT_MIF2_MUX_ACLK_MIF_PLL, "mout_mif2_mux_aclk_mif_pll",
+	    mout_mif2_mux_aclk_mif_pll_p,
+	    MIF2_MUX_ACLK_MIF_PLL, 12, 1),
+};
+
+static const struct samsung_div_clock mif2_div_clks[] __initconst = {
+	DIV(CLK_DOUT_MIF2_DIV_PCLK_MIF, "dout_mif2_div_pclk_mif", "mout_mif2_mux_pclk_mif",
+	    MIF2_DIV_PCLK_MIF, 0, 3),
+	DIV(CLK_DOUT_MIF2_DIV_SCLK_HPM_MIF, "dout_mif2_div_sclk_hpm_mif",
+	    "mout_mif2_mux_sclk_hpm_mif",
+	    MIF2_DIV_SCLK_HPM_MIF, 0, 2),
+	DIV(CLK_DOUT_MIF2_DIV_PCLK_SMC, "dout_mif2_div_pclk_smc", "mout_mif2_mux_pclk_smc",
+	    MIF2_DIV_PCLK_SMC, 0, 3),
+};
+
+static const struct samsung_gate_clock mif2_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_MIF2_GATE_PCLK_SMC1, "gout_mif2_gate_pclk_smc1", "dout_mif2_div_pclk_mif",
+	     MIF2_GATE_PCLK_SMC1, 9, 0, 0),
+	GATE(CLK_GOUT_MIF2_GATE_PCLK_DMC_MISC, "gout_mif2_gate_pclk_dmc_misc",
+	     "dout_mif2_div_pclk_mif",
+	     MIF2_GATE_PCLK_SMC1, 8, 0, 0),
+	GATE(CLK_GOUT_MIF2_GATE_PCLK_PPC_DEBUG, "gout_mif2_gate_pclk_ppc_debug",
+	     "dout_mif2_div_pclk_mif",
+	     MIF2_GATE_PCLK_SMC1, 7, 0, 0),
+	GATE(CLK_GOUT_MIF2_GATE_PCLK_PPC_DVFS, "gout_mif2_gate_pclk_ppc_dvfs",
+	     "dout_mif2_div_pclk_mif",
+	     MIF2_GATE_PCLK_SMC1, 6, 0, 0),
+	GATE(CLK_GOUT_MIF2_GATE_PCLK_SYSREG_MIF, "gout_mif2_gate_pclk_sysreg_mif",
+	     "dout_mif2_div_pclk_mif",
+	     MIF2_GATE_PCLK_SMC1, 5, 0, 0),
+	GATE(CLK_GOUT_MIF2_GATE_PCLK_HPM, "gout_mif2_gate_pclk_hpm", "dout_mif2_div_pclk_mif",
+	     MIF2_GATE_PCLK_SMC1, 4, 0, 0),
+	GATE(CLK_GOUT_MIF2_GATE_ACLK_AXI_ASYNC, "gout_mif2_gate_aclk_axi_async",
+	     "dout_mif2_div_pclk_mif",
+	     MIF2_GATE_PCLK_SMC1, 3, 0, 0),
+	GATE(CLK_GOUT_MIF2_GATE_PCLK_MIFP, "gout_mif2_gate_pclk_mifp", "dout_mif2_div_pclk_mif",
+	     MIF2_GATE_PCLK_SMC1, 2, 0, 0),
+	GATE(CLK_GOUT_MIF2_GATE_PCLK_PMU_MIF, "gout_mif2_gate_pclk_pmu_mif",
+	     "dout_mif2_div_pclk_mif",
+	     MIF2_GATE_PCLK_SMC1, 1, 0, 0),
+	GATE(CLK_GOUT_MIF2_GATE_PCLK_LPDDR4PHY, "gout_mif2_gate_pclk_lpddr4phy",
+	     "dout_mif2_div_pclk_mif",
+	     MIF2_GATE_PCLK_SMC1, 0, 0, 0),
+	GATE(CLK_GOUT_MIF2_GATE_PCLK_SMC2, "gout_mif2_gate_pclk_smc2", "dout_mif2_div_pclk_mif",
+	     MIF2_GATE_PCLK_SMC2, 0, 0, 0),
+	GATE(CLK_GOUT_MIF2_GATE_SCLK_PROMISE, "gout_mif2_gate_sclk_promise",
+	     "dout_mif2_div_sclk_hpm_mif",
+	     MIF2_GATE_SCLK_PROMISE, 0, 0, 0),
+	GATE(CLK_GOUT_MIF2_GATE_RCLK_DREX, "gout_mif2_gate_rclk_drex", "oscclk",
+	     MIF2_GATE_RCLK_DREX, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info mif2_cmu_info __initconst = {
+	.mux_clks		= mif2_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(mif2_mux_clks),
+	.div_clks		= mif2_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(mif2_div_clks),
+	.gate_clks		= mif2_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(mif2_gate_clks),
+	.nr_clk_ids		= CLKS_NR_MIF2,
+	.clk_regs		= mif2_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(mif2_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_mif2_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &mif2_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_mif2, "samsung,exynos8890-cmu-mif2",
+	       exynos8890_cmu_mif2_init);
+
+/* ---- CMU_MIF3 --------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_MIF3 (0x10b50000) */
+#define MIF3_MUX_MIF_PLL			0x0200
+#define MIF3_MUX_BUS_PLL_USER			0x0204
+#define MIF3_MUX_ACLK_MIF_PLL			0x0208
+#define MIF3_MUX_PCLK_MIF			0x0210
+#define MIF3_MUX_SCLK_HPM_MIF			0x0214
+#define MIF3_MUX_PCLK_SMC			0x0218
+#define MIF3_DIV_PCLK_MIF			0x0400
+#define MIF3_DIV_PCLK_SMC			0x0404
+#define MIF3_DIV_SCLK_HPM_MIF			0x0408
+#define MIF3_GATE_ACLK_APSCDC			0x0800
+#define MIF3_GATE_PCLK_SMC1			0x0900
+#define MIF3_GATE_PCLK_SMC2			0x0904
+#define MIF3_GATE_SCLK_PROMISE			0x0a00
+#define MIF3_GATE_RCLK_DREX			0x0a04
+
+static const unsigned long mif3_clk_regs[] __initconst = {
+	MIF3_MUX_MIF_PLL,
+	MIF3_MUX_BUS_PLL_USER,
+	MIF3_MUX_ACLK_MIF_PLL,
+	MIF3_MUX_PCLK_MIF,
+	MIF3_MUX_SCLK_HPM_MIF,
+	MIF3_MUX_PCLK_SMC,
+	MIF3_DIV_PCLK_MIF,
+	MIF3_DIV_PCLK_SMC,
+	MIF3_DIV_SCLK_HPM_MIF,
+	MIF3_GATE_ACLK_APSCDC,
+	MIF3_GATE_PCLK_SMC1,
+	MIF3_GATE_PCLK_SMC2,
+	MIF3_GATE_SCLK_PROMISE,
+	MIF3_GATE_RCLK_DREX,
+};
+
+/* List of parent clocks for Muxes in CMU_MIF3 */
+PNAME(mout_mif3_mux_mif_pll_p) = { "oscclk", "fout_mif_pll" };
+PNAME(mout_mif3_mux_bus_pll_user_p) = { "oscclk", "gout_top_gate_sclk_bus_pll_mif" };
+PNAME(mout_mif3_mux_aclk_mif_pll_p) = { "mout_mif3_mux_mif_pll", "mout_mif3_mux_bus_pll_user" };
+
+static const struct samsung_mux_clock mif3_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_MIF3_MUX_MIF_PLL, "mout_mif3_mux_mif_pll", mout_mif3_mux_mif_pll_p,
+	    MIF3_MUX_MIF_PLL, 12, 1),
+	MUX(CLK_MOUT_MIF3_MUX_BUS_PLL_USER, "mout_mif3_mux_bus_pll_user",
+	    mout_mif3_mux_bus_pll_user_p,
+	    MIF3_MUX_BUS_PLL_USER, 12, 1),
+	MUX(CLK_MOUT_MIF3_MUX_ACLK_MIF_PLL, "mout_mif3_mux_aclk_mif_pll",
+	    mout_mif3_mux_aclk_mif_pll_p,
+	    MIF3_MUX_ACLK_MIF_PLL, 12, 1),
+};
+
+static const struct samsung_div_clock mif3_div_clks[] __initconst = {
+	DIV(CLK_DOUT_MIF3_DIV_PCLK_MIF, "dout_mif3_div_pclk_mif", "mout_mif3_mux_pclk_mif",
+	    MIF3_DIV_PCLK_MIF, 0, 3),
+	DIV(CLK_DOUT_MIF3_DIV_SCLK_HPM_MIF, "dout_mif3_div_sclk_hpm_mif",
+	    "mout_mif3_mux_sclk_hpm_mif",
+	    MIF3_DIV_SCLK_HPM_MIF, 0, 2),
+	DIV(CLK_DOUT_MIF3_DIV_PCLK_SMC, "dout_mif3_div_pclk_smc", "mout_mif3_mux_pclk_smc",
+	    MIF3_DIV_PCLK_SMC, 0, 3),
+};
+
+static const struct samsung_gate_clock mif3_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_MIF3_GATE_PCLK_SMC1, "gout_mif3_gate_pclk_smc1", "dout_mif3_div_pclk_mif",
+	     MIF3_GATE_PCLK_SMC1, 9, 0, 0),
+	GATE(CLK_GOUT_MIF3_GATE_PCLK_DMC_MISC, "gout_mif3_gate_pclk_dmc_misc",
+	     "dout_mif3_div_pclk_mif",
+	     MIF3_GATE_PCLK_SMC1, 8, 0, 0),
+	GATE(CLK_GOUT_MIF3_GATE_PCLK_PPC_DEBUG, "gout_mif3_gate_pclk_ppc_debug",
+	     "dout_mif3_div_pclk_mif",
+	     MIF3_GATE_PCLK_SMC1, 7, 0, 0),
+	GATE(CLK_GOUT_MIF3_GATE_PCLK_PPC_DVFS, "gout_mif3_gate_pclk_ppc_dvfs",
+	     "dout_mif3_div_pclk_mif",
+	     MIF3_GATE_PCLK_SMC1, 6, 0, 0),
+	GATE(CLK_GOUT_MIF3_GATE_PCLK_SYSREG_MIF, "gout_mif3_gate_pclk_sysreg_mif",
+	     "dout_mif3_div_pclk_mif",
+	     MIF3_GATE_PCLK_SMC1, 5, 0, 0),
+	GATE(CLK_GOUT_MIF3_GATE_PCLK_HPM, "gout_mif3_gate_pclk_hpm", "dout_mif3_div_pclk_mif",
+	     MIF3_GATE_PCLK_SMC1, 4, 0, 0),
+	GATE(CLK_GOUT_MIF3_GATE_ACLK_AXI_ASYNC, "gout_mif3_gate_aclk_axi_async",
+	     "dout_mif3_div_pclk_mif",
+	     MIF3_GATE_PCLK_SMC1, 3, 0, 0),
+	GATE(CLK_GOUT_MIF3_GATE_PCLK_MIFP, "gout_mif3_gate_pclk_mifp", "dout_mif3_div_pclk_mif",
+	     MIF3_GATE_PCLK_SMC1, 2, 0, 0),
+	GATE(CLK_GOUT_MIF3_GATE_PCLK_PMU_MIF, "gout_mif3_gate_pclk_pmu_mif",
+	     "dout_mif3_div_pclk_mif",
+	     MIF3_GATE_PCLK_SMC1, 1, 0, 0),
+	GATE(CLK_GOUT_MIF3_GATE_PCLK_LPDDR4PHY, "gout_mif3_gate_pclk_lpddr4phy",
+	     "dout_mif3_div_pclk_mif",
+	     MIF3_GATE_PCLK_SMC1, 0, 0, 0),
+	GATE(CLK_GOUT_MIF3_GATE_PCLK_SMC2, "gout_mif3_gate_pclk_smc2", "dout_mif3_div_pclk_mif",
+	     MIF3_GATE_PCLK_SMC2, 0, 0, 0),
+	GATE(CLK_GOUT_MIF3_GATE_SCLK_PROMISE, "gout_mif3_gate_sclk_promise",
+	     "dout_mif3_div_sclk_hpm_mif",
+	     MIF3_GATE_SCLK_PROMISE, 0, 0, 0),
+	GATE(CLK_GOUT_MIF3_GATE_RCLK_DREX, "gout_mif3_gate_rclk_drex", "oscclk",
+	     MIF3_GATE_RCLK_DREX, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info mif3_cmu_info __initconst = {
+	.mux_clks		= mif3_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(mif3_mux_clks),
+	.div_clks		= mif3_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(mif3_div_clks),
+	.gate_clks		= mif3_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(mif3_gate_clks),
+	.nr_clk_ids		= CLKS_NR_MIF3,
+	.clk_regs		= mif3_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(mif3_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_mif3_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &mif3_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_mif3, "samsung,exynos8890-cmu-mif3",
+	       exynos8890_cmu_mif3_init);
+
+/* ---- CMU_FSYS0 -------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_FSYS0 (0x10e90000) */
+#define FSYS0_MUX_ACLK_FSYS0_200_USER			0x0200
+#define FSYS0_MUX_SCLK_FSYS0_USBDRD30_USER			0x0204
+#define FSYS0_MUX_SCLK_FSYS0_MMC0_USER			0x0208
+#define FSYS0_MUX_SCLK_FSYS0_UFSUNIPRO_EMBEDDED_USER	0x020c
+#define FSYS0_MUX_SCLK_FSYS0_24M_USER			0x0210
+#define FSYS0_MUX_SCLK_FSYS0_UFSUNIPRO_EMBEDDED_CFG_USER	0x0214
+#define FSYS0_MUX_PHYCLK_USBDRD30_UDRD30_PHYCLOCK_USER	0x0218
+#define FSYS0_MUX_PHYCLK_USBDRD30_UDRD30_PIPE_PCLK_USER	0x021c
+#define FSYS0_MUX_PHYCLK_UFS_TX0_SYMBOL_USER			0x0220
+#define FSYS0_MUX_PHYCLK_UFS_RX0_SYMBOL_USER			0x0224
+#define FSYS0_MUX_PHYCLK_USBHOST20_PHYCLOCK_USER	0x0228
+#define FSYS0_MUX_PHYCLK_USBHOST20PHY_REF_CLK			0x0234
+#define FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X			0x0800
+#define FSYS0_GATE_PCLK_HPM_APBIF_FSYS0			0x0820
+#define FSYS0_GATE_SCLK_USBDRD30_SUSPEND_CLK			0x0840
+#define FSYS0_GATE_SCLK_MMC0			0x0844
+#define FSYS0_GATE_SCLK_UFSUNIPRO_EMBEDDED			0x0848
+#define FSYS0_GATE_SCLK_USBDRD30_REF_CLK			0x084c
+#define FSYS0_GATE_PHYCLK_USBDRD30_UDRD30_PHYCLOCK	0x0850
+#define FSYS0_GATE_PHYCLK_USBDRD30_UDRD30_PIPE_PCLK	0x0854
+#define FSYS0_GATE_PHYCLK_UFS_TX0_SYMBOL			0x0858
+#define FSYS0_GATE_PHYCLK_UFS_RX0_SYMBOL			0x085c
+#define FSYS0_GATE_PHYCLK_USBHOST20_PHYCLOCK			0x0860
+#define FSYS0_GATE_SCLK_USBHOST20_REF_CLK			0x0864
+#define FSYS0_GATE_SCLK_PROMISE_FSYS0			0x0878
+#define FSYS0_GATE_SCLK_USBHOST20PHY_REF_CLK			0x087c
+#define FSYS0_GATE_SCLK_UFSUNIPRO_EMBEDDED_CFG			0x0880
+#define FSYS0_HWACG_QCH_USBDRD30			0x201c
+#define FSYS0_HWACG_USBDRD30			0x2400
+#define FSYS0_HWACG_UFS_LINK_EMBEDDED			0x2404
+#define FSYS0_HWACG_USBHOST20			0x2408
+#define FSYS0_HWACG_USBHOST20_PHY			0x240c
+#define FSYS0_HWACG_GPIO_FSYS0			0x2410
+#define FSYS0_HWACG_HPM_APBIF_FSYS0			0x2414
+#define FSYS0_HWACG_PROMISE_FSYS0			0x2418
+
+static const unsigned long fsys0_clk_regs[] __initconst = {
+	FSYS0_MUX_ACLK_FSYS0_200_USER,
+	FSYS0_MUX_SCLK_FSYS0_USBDRD30_USER,
+	FSYS0_MUX_SCLK_FSYS0_MMC0_USER,
+	FSYS0_MUX_SCLK_FSYS0_UFSUNIPRO_EMBEDDED_USER,
+	FSYS0_MUX_SCLK_FSYS0_24M_USER,
+	FSYS0_MUX_SCLK_FSYS0_UFSUNIPRO_EMBEDDED_CFG_USER,
+	FSYS0_MUX_PHYCLK_USBDRD30_UDRD30_PHYCLOCK_USER,
+	FSYS0_MUX_PHYCLK_USBDRD30_UDRD30_PIPE_PCLK_USER,
+	FSYS0_MUX_PHYCLK_UFS_TX0_SYMBOL_USER,
+	FSYS0_MUX_PHYCLK_UFS_RX0_SYMBOL_USER,
+	FSYS0_MUX_PHYCLK_USBHOST20_PHYCLOCK_USER,
+	FSYS0_MUX_PHYCLK_USBHOST20PHY_REF_CLK,
+	FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X,
+	FSYS0_GATE_PCLK_HPM_APBIF_FSYS0,
+	FSYS0_GATE_SCLK_USBDRD30_SUSPEND_CLK,
+	FSYS0_GATE_SCLK_MMC0,
+	FSYS0_GATE_SCLK_UFSUNIPRO_EMBEDDED,
+	FSYS0_GATE_SCLK_USBDRD30_REF_CLK,
+	FSYS0_GATE_PHYCLK_USBDRD30_UDRD30_PHYCLOCK,
+	FSYS0_GATE_PHYCLK_USBDRD30_UDRD30_PIPE_PCLK,
+	FSYS0_GATE_PHYCLK_UFS_TX0_SYMBOL,
+	FSYS0_GATE_PHYCLK_UFS_RX0_SYMBOL,
+	FSYS0_GATE_PHYCLK_USBHOST20_PHYCLOCK,
+	FSYS0_GATE_SCLK_USBHOST20_REF_CLK,
+	FSYS0_GATE_SCLK_PROMISE_FSYS0,
+	FSYS0_GATE_SCLK_USBHOST20PHY_REF_CLK,
+	FSYS0_GATE_SCLK_UFSUNIPRO_EMBEDDED_CFG,
+	FSYS0_HWACG_QCH_USBDRD30,
+	FSYS0_HWACG_USBDRD30,
+	FSYS0_HWACG_UFS_LINK_EMBEDDED,
+	FSYS0_HWACG_USBHOST20,
+	FSYS0_HWACG_USBHOST20_PHY,
+	FSYS0_HWACG_GPIO_FSYS0,
+	FSYS0_HWACG_HPM_APBIF_FSYS0,
+	FSYS0_HWACG_PROMISE_FSYS0,
+};
+
+static const struct samsung_fixed_rate_clock fsys0_fixed_clks[] __initconst = {
+	FRATE(CLK_PHYCLK_USB30_12MOHCI, "phyclk_usb30_12mohci", NULL, 0, 30 * MHZ),
+	FRATE(CLK_PHYCLK_USBDRD30_UDRD30_PHYCLOCK_PHY, "phyclk_usbdrd30_udrd30_phyclock_phy", NULL, 0, 60 * MHZ),
+	FRATE(CLK_PHYCLK_USBDRD30_UDRD30_PIPE_PCLK_PHY, "phyclk_usbdrd30_udrd30_pipe_pclk_phy", NULL, 0, 125 * MHZ),
+	FRATE(CLK_PHYCLK_UFS_TX0_SYMBOL_PHY, "phyclk_ufs_tx0_symbol_phy", NULL, 0, 300 * MHZ),
+	FRATE(CLK_PHYCLK_UFS_RX0_SYMBOL_PHY, "phyclk_ufs_rx0_symbol_phy", NULL, 0, 300 * MHZ),
+	FRATE(CLK_PHYCLK_USBHOST20_PHYCLOCK_PHY, "phyclk_usbhost20_phyclock_phy", NULL, 0, 30 * MHZ),
+};
+
+/* List of parent clocks for Muxes in CMU_FSYS0 */
+PNAME(mout_fsys0_mux_aclk_fsys0_200_user_p) = { "oscclk", "gout_top_gate_aclk_fsys0_200" };
+PNAME(mout_fsys0_mux_sclk_fsys0_usbdrd30_user_p) = { "oscclk", "gout_top_gate_sclk_fsys0_usbdrd30" };
+PNAME(mout_fsys0_mux_sclk_fsys0_mmc0_user_p) = { "oscclk", "gout_top_gate_sclk_fsys0_mmc0" };
+PNAME(mout_fsys0_mux_sclk_fsys0_ufsunipro_embedded_user_p) = { "oscclk", "gout_top_gate_sclk_fsys0_ufsunipro20" };
+PNAME(mout_fsys0_mux_sclk_fsys0_24m_user_p) = { "oscclk", "gout_top_gate_sclk_fsys0_phy_24m" };
+PNAME(mout_fsys0_mux_sclk_fsys0_ufsunipro_embedded_cfg_user_p) = { "oscclk", "gout_top_gate_sclk_fsys0_ufsunipro_cfg" };
+PNAME(mout_fsys0_mux_phyclk_usbdrd30_udrd30_phyclock_user_p) = { "oscclk", "phyclk_usbdrd30_udrd30_phyclock_phy" };
+PNAME(mout_fsys0_mux_phyclk_usbdrd30_udrd30_pipe_pclk_user_p) = { "oscclk", "phyclk_usbdrd30_udrd30_pipe_pclk_phy" };
+PNAME(mout_fsys0_mux_phyclk_ufs_tx0_symbol_user_p) = { "oscclk", "phyclk_ufs_tx0_symbol_phy" };
+PNAME(mout_fsys0_mux_phyclk_ufs_rx0_symbol_user_p) = { "oscclk", "phyclk_ufs_rx0_symbol_phy" };
+PNAME(mout_fsys0_mux_phyclk_usbhost20_phyclock_user_p) = { "oscclk", "phyclk_usbhost20_phyclock_phy" };
+PNAME(mout_fsys0_mux_phyclk_usbhost20phy_ref_clk_p) = { "mout_fsys0_mux_sclk_fsys0_24m_user", "phyclk_usb30_12mohci" };
+
+static const struct samsung_mux_clock fsys0_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_FSYS0_MUX_ACLK_FSYS0_200_USER, "mout_fsys0_mux_aclk_fsys0_200_user",
+	    mout_fsys0_mux_aclk_fsys0_200_user_p,
+	    FSYS0_MUX_ACLK_FSYS0_200_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS0_MUX_SCLK_FSYS0_USBDRD30_USER, "mout_fsys0_mux_sclk_fsys0_usbdrd30_user",
+	    mout_fsys0_mux_sclk_fsys0_usbdrd30_user_p,
+	    FSYS0_MUX_SCLK_FSYS0_USBDRD30_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS0_MUX_SCLK_FSYS0_MMC0_USER, "mout_fsys0_mux_sclk_fsys0_mmc0_user",
+	    mout_fsys0_mux_sclk_fsys0_mmc0_user_p,
+	    FSYS0_MUX_SCLK_FSYS0_MMC0_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS0_MUX_SCLK_FSYS0_UFSUNIPRO_EMBEDDED_USER, "mout_fsys0_mux_sclk_fsys0_ufsunipro_embedded_user",
+	    mout_fsys0_mux_sclk_fsys0_ufsunipro_embedded_user_p,
+	    FSYS0_MUX_SCLK_FSYS0_UFSUNIPRO_EMBEDDED_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS0_MUX_SCLK_FSYS0_24M_USER, "mout_fsys0_mux_sclk_fsys0_24m_user",
+	    mout_fsys0_mux_sclk_fsys0_24m_user_p,
+	    FSYS0_MUX_SCLK_FSYS0_24M_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS0_MUX_SCLK_FSYS0_UFSUNIPRO_EMBEDDED_CFG_USER, "mout_fsys0_mux_sclk_fsys0_ufsunipro_embedded_cfg_user",
+	    mout_fsys0_mux_sclk_fsys0_ufsunipro_embedded_cfg_user_p,
+	    FSYS0_MUX_SCLK_FSYS0_UFSUNIPRO_EMBEDDED_CFG_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS0_MUX_PHYCLK_USBDRD30_UDRD30_PHYCLOCK_USER, "mout_fsys0_mux_phyclk_usbdrd30_udrd30_phyclock_user",
+	    mout_fsys0_mux_phyclk_usbdrd30_udrd30_phyclock_user_p,
+	    FSYS0_MUX_PHYCLK_USBDRD30_UDRD30_PHYCLOCK_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS0_MUX_PHYCLK_USBDRD30_UDRD30_PIPE_PCLK_USER, "mout_fsys0_mux_phyclk_usbdrd30_udrd30_pipe_pclk_user",
+	    mout_fsys0_mux_phyclk_usbdrd30_udrd30_pipe_pclk_user_p,
+	    FSYS0_MUX_PHYCLK_USBDRD30_UDRD30_PIPE_PCLK_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS0_MUX_PHYCLK_UFS_TX0_SYMBOL_USER, "mout_fsys0_mux_phyclk_ufs_tx0_symbol_user",
+	    mout_fsys0_mux_phyclk_ufs_tx0_symbol_user_p,
+	    FSYS0_MUX_PHYCLK_UFS_TX0_SYMBOL_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS0_MUX_PHYCLK_UFS_RX0_SYMBOL_USER, "mout_fsys0_mux_phyclk_ufs_rx0_symbol_user",
+	    mout_fsys0_mux_phyclk_ufs_rx0_symbol_user_p,
+	    FSYS0_MUX_PHYCLK_UFS_RX0_SYMBOL_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS0_MUX_PHYCLK_USBHOST20_PHYCLOCK_USER, "mout_fsys0_mux_phyclk_usbhost20_phyclock_user",
+	    mout_fsys0_mux_phyclk_usbhost20_phyclock_user_p,
+	    FSYS0_MUX_PHYCLK_USBHOST20_PHYCLOCK_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS0_MUX_PHYCLK_USBHOST20PHY_REF_CLK, "mout_fsys0_mux_phyclk_usbhost20phy_ref_clk",
+	    mout_fsys0_mux_phyclk_usbhost20phy_ref_clk_p,
+	    FSYS0_MUX_PHYCLK_USBHOST20PHY_REF_CLK, 12, 1),
+};
+
+static const struct samsung_gate_clock fsys0_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, "gout_fsys0_gate_aclk_axi2acel_fsys0x",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 31, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_PCLK_CMU_FSYS0, "gout_fsys0_gate_pclk_cmu_fsys0",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 30, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_PCLK_GPIO_FSYS0, "gout_fsys0_gate_pclk_gpio_fsys0",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 29, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_PCLK_SYSREG_FSYS0, "gout_fsys0_gate_pclk_sysreg_fsys0",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 28, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_PCLK_PPMU_FSYS0, "gout_fsys0_gate_pclk_ppmu_fsys0",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 27, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_PCLK_PMU_FSYS0, "gout_fsys0_gate_pclk_pmu_fsys0",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 26, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_PCLK_ETR_USB_FSYS0, "gout_fsys0_gate_pclk_etr_usb_fsys0",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 25, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_HCLK_USBHOST20, "gout_fsys0_gate_hclk_usbhost20",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 24, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_AXI_US_USBHS_FSYS0X, "gout_fsys0_gate_aclk_axi_us_usbhs_fsys0x",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 21, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_ETR_USB_FSYS0, "gout_fsys0_gate_aclk_etr_usb_fsys0",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 20, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_UFS_LINK_EMBEDDED, "gout_fsys0_gate_aclk_ufs_link_embedded",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 19, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_USBDRD30, "gout_fsys0_gate_aclk_usbdrd30",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 18, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_MMC0, "gout_fsys0_gate_aclk_mmc0",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 17, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_PDMAS, "gout_fsys0_gate_aclk_pdmas",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 16, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_PDMA0, "gout_fsys0_gate_aclk_pdma0",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 15, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_PPMU_FSYS0, "gout_fsys0_gate_aclk_ppmu_fsys0",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 14, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_XIU_FSYS0SFRX, "gout_fsys0_gate_aclk_xiu_fsys0sfrx",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 13, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_AXI_US_USBDRD30X_FSYS0X, "gout_fsys0_gate_aclk_axi_us_usbdrd30x_fsys0x",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 12, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_AXI_US_PDMAX_FSYS0X, "gout_fsys0_gate_aclk_axi_us_pdmax_fsys0x",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 11, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_AXI2AHB_FSYS0H, "gout_fsys0_gate_aclk_axi2ahb_fsys0h",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 10, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_AXI2AHB_USBDRD30H, "gout_fsys0_gate_aclk_axi2ahb_usbdrd30h",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 9, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_AXI_LH_ASYNC_MI_ETR_USB_FSYS0, "gout_fsys0_gate_aclk_axi_lh_async_mi_etr_usb_fsys0",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 8, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_XIU_PDMAX, "gout_fsys0_gate_aclk_xiu_pdmax",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 7, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_XIU_USBX, "gout_fsys0_gate_aclk_xiu_usbx",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 6, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_XIU_EMBEDDEDX, "gout_fsys0_gate_aclk_xiu_embeddedx",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 5, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_XIU_FSYS0X, "gout_fsys0_gate_aclk_xiu_fsys0x",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 4, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_AXI2APB_FSYS0P, "gout_fsys0_gate_aclk_axi2apb_fsys0p",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 3, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_AHB_BRIDGE_FSYS0H, "gout_fsys0_gate_aclk_ahb_bridge_fsys0h",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 2, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_AXI_LH_ASYNC_MI_TOP_FSYS0, "gout_fsys0_gate_aclk_axi_lh_async_mi_top_fsys0",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_ACLK_ACEL_LH_ASYNC_SI_TOP_FSYS0, "gout_fsys0_gate_aclk_acel_lh_async_si_top_fsys0",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_ACLK_AXI2ACEL_FSYS0X, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_PCLK_HPM_APBIF_FSYS0, "gout_fsys0_gate_pclk_hpm_apbif_fsys0",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_GATE_PCLK_HPM_APBIF_FSYS0, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_SCLK_USBDRD30_SUSPEND_CLK, "gout_fsys0_gate_sclk_usbdrd30_suspend_clk",
+	     "mout_fsys0_mux_sclk_fsys0_usbdrd30_user",
+	     FSYS0_GATE_SCLK_USBDRD30_SUSPEND_CLK, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_SCLK_MMC0, "gout_fsys0_gate_sclk_mmc0",
+	     "mout_fsys0_mux_sclk_fsys0_mmc0_user",
+	     FSYS0_GATE_SCLK_MMC0, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_SCLK_UFSUNIPRO_EMBEDDED, "gout_fsys0_gate_sclk_ufsunipro_embedded",
+	     "mout_fsys0_mux_sclk_fsys0_ufsunipro_embedded_user",
+	     FSYS0_GATE_SCLK_UFSUNIPRO_EMBEDDED, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_SCLK_USBDRD30_REF_CLK, "gout_fsys0_gate_sclk_usbdrd30_ref_clk",
+	     "mout_fsys0_mux_sclk_fsys0_usbdrd30_user",
+	     FSYS0_GATE_SCLK_USBDRD30_REF_CLK, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_PHYCLK_USBDRD30_UDRD30_PHYCLOCK, "gout_fsys0_gate_phyclk_usbdrd30_udrd30_phyclock",
+	     "mout_fsys0_mux_phyclk_usbdrd30_udrd30_phyclock_user",
+	     FSYS0_GATE_PHYCLK_USBDRD30_UDRD30_PHYCLOCK, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_PHYCLK_USBDRD30_UDRD30_PIPE_PCLK, "gout_fsys0_gate_phyclk_usbdrd30_udrd30_pipe_pclk",
+	     "mout_fsys0_mux_phyclk_usbdrd30_udrd30_pipe_pclk_user",
+	     FSYS0_GATE_PHYCLK_USBDRD30_UDRD30_PIPE_PCLK, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_PHYCLK_UFS_TX0_SYMBOL, "gout_fsys0_gate_phyclk_ufs_tx0_symbol",
+	     "mout_fsys0_mux_phyclk_ufs_tx0_symbol_user",
+	     FSYS0_GATE_PHYCLK_UFS_TX0_SYMBOL, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_PHYCLK_UFS_RX0_SYMBOL, "gout_fsys0_gate_phyclk_ufs_rx0_symbol",
+	     "mout_fsys0_mux_phyclk_ufs_rx0_symbol_user",
+	     FSYS0_GATE_PHYCLK_UFS_RX0_SYMBOL, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_PHYCLK_USBHOST20_PHYCLOCK, "gout_fsys0_gate_phyclk_usbhost20_phyclock",
+	     "mout_fsys0_mux_phyclk_usbhost20_phyclock_user",
+	     FSYS0_GATE_PHYCLK_USBHOST20_PHYCLOCK, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_SCLK_PROMISE_FSYS0, "gout_fsys0_gate_sclk_promise_fsys0",
+	     "gout_top_gate_sclk_promise_int",
+	     FSYS0_GATE_SCLK_PROMISE_FSYS0, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_SCLK_USBHOST20PHY_REF_CLK, "gout_fsys0_gate_sclk_usbhost20phy_ref_clk",
+	     "mout_fsys0_mux_phyclk_usbhost20phy_ref_clk",
+	     FSYS0_GATE_SCLK_USBHOST20PHY_REF_CLK, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_SCLK_UFSUNIPRO_EMBEDDED_CFG, "gout_fsys0_gate_sclk_ufsunipro_embedded_cfg",
+	     "mout_fsys0_mux_sclk_fsys0_ufsunipro_embedded_cfg_user",
+	     FSYS0_GATE_SCLK_UFSUNIPRO_EMBEDDED_CFG, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS0_GATE_SCLK_USBHOST20_REF_CLK, "gout_fsys0_gate_sclk_usbhost20_ref_clk",
+	     "mout_fsys0_mux_sclk_fsys0_usbdrd30_user",
+	     FSYS0_GATE_SCLK_USBHOST20_REF_CLK, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS0_HWACG_USBDRD30, "gout_fsys0_hwacg_usbdrd30",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_HWACG_USBDRD30, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS0_HWACG_QCH_USBDRD30, "gout_fsys0_hwacg_qch_usbdrd30",
+	     "phyclk_usbdrd30_udrd30_phyclock_phy",
+	     FSYS0_HWACG_QCH_USBDRD30, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS0_HWACG_UFS_LINK_EMBEDDED, "gout_fsys0_hwacg_ufs_link_embedded",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_HWACG_UFS_LINK_EMBEDDED, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS0_HWACG_USBHOST20, "gout_fsys0_hwacg_usbhost20",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_HWACG_USBHOST20, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS0_HWACG_USBHOST20_PHY, "gout_fsys0_hwacg_usbhost20_phy",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_HWACG_USBHOST20_PHY, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS0_HWACG_GPIO_FSYS0, "gout_fsys0_hwacg_gpio_fsys0",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_HWACG_GPIO_FSYS0, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS0_HWACG_HPM_APBIF_FSYS0, "gout_fsys0_hwacg_hpm_apbif_fsys0",
+	     "mout_fsys0_mux_aclk_fsys0_200_user",
+	     FSYS0_HWACG_HPM_APBIF_FSYS0, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS0_HWACG_PROMISE_FSYS0, "gout_fsys0_hwacg_promise_fsys0",
+	     "gout_top_gate_sclk_promise_int",
+	     FSYS0_HWACG_PROMISE_FSYS0, 1, 0, 0),
+};
+
+static const struct samsung_cmu_info fsys0_cmu_info __initconst = {
+	.mux_clks		= fsys0_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(fsys0_mux_clks),
+	.gate_clks		= fsys0_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(fsys0_gate_clks),
+	.fixed_clks		= fsys0_fixed_clks,
+	.nr_fixed_clks		= ARRAY_SIZE(fsys0_fixed_clks),
+	.nr_clk_ids		= CLKS_NR_FSYS0,
+	.clk_regs		= fsys0_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(fsys0_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_fsys0_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &fsys0_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_fsys0, "samsung,exynos8890-cmu-fsys0",
+	       exynos8890_cmu_fsys0_init);
+
+/* ---- CMU_IMEM --------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_IMEM (0x11060000) */
+#define IMEM_MUX_ACLK_IMEM_266_USER			0x0200
+#define IMEM_MUX_ACLK_IMEM_200_USER			0x0204
+#define IMEM_MUX_ACLK_IMEM_100_USER			0x0208
+#define IMEM_GATE_ACLK_MC			0x0800
+#define IMEM_GATE_ACLK_SSS			0x0804
+#define IMEM_GATE_ACLK_RTIC			0x0808
+#define IMEM_GATE_PCLK_CMU_IMEM			0x080c
+#define IMEM_GATE_PCLK_SSS			0x0810
+#define IMEM_GATE_PCLK_RTIC			0x0814
+#define IMEM_GATE_ACLK_ASYNCAHBSM_APM			0x0818
+#define IMEM_GATE_ACLK_CM3_APM			0x081c
+#define IMEM_GATE_ACLK_AHB_BUSMATRIX_APM			0x0820
+#define IMEM_HWACG_GIC			0x2400
+#define IMEM_HWACG_ASYNCAHBM_SSS_ATLAS			0x2408
+
+static const unsigned long imem_clk_regs[] __initconst = {
+	IMEM_MUX_ACLK_IMEM_266_USER,
+	IMEM_MUX_ACLK_IMEM_200_USER,
+	IMEM_MUX_ACLK_IMEM_100_USER,
+	IMEM_GATE_ACLK_MC,
+	IMEM_GATE_ACLK_SSS,
+	IMEM_GATE_ACLK_RTIC,
+	IMEM_GATE_PCLK_CMU_IMEM,
+	IMEM_GATE_PCLK_SSS,
+	IMEM_GATE_PCLK_RTIC,
+	IMEM_GATE_ACLK_ASYNCAHBSM_APM,
+	IMEM_GATE_ACLK_CM3_APM,
+	IMEM_GATE_ACLK_AHB_BUSMATRIX_APM,
+	IMEM_HWACG_GIC,
+	IMEM_HWACG_ASYNCAHBM_SSS_ATLAS,
+};
+
+/* List of parent clocks for Muxes in CMU_IMEM */
+PNAME(mout_imem_mux_aclk_imem_266_user_p) = { "oscclk", "gout_top_gate_aclk_imem_266" };
+PNAME(mout_imem_mux_aclk_imem_200_user_p) = { "oscclk", "gout_top_gate_aclk_imem_200" };
+PNAME(mout_imem_mux_aclk_imem_100_user_p) = { "oscclk", "gout_top_gate_aclk_imem_100" };
+
+static const struct samsung_mux_clock imem_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_IMEM_MUX_ACLK_IMEM_266_USER, "mout_imem_mux_aclk_imem_266_user",
+	    mout_imem_mux_aclk_imem_266_user_p,
+	    IMEM_MUX_ACLK_IMEM_266_USER, 12, 1),
+	MUX(CLK_MOUT_IMEM_MUX_ACLK_IMEM_200_USER, "mout_imem_mux_aclk_imem_200_user",
+	    mout_imem_mux_aclk_imem_200_user_p,
+	    IMEM_MUX_ACLK_IMEM_200_USER, 12, 1),
+	MUX(CLK_MOUT_IMEM_MUX_ACLK_IMEM_100_USER, "mout_imem_mux_aclk_imem_100_user",
+	    mout_imem_mux_aclk_imem_100_user_p,
+	    IMEM_MUX_ACLK_IMEM_100_USER, 12, 1),
+};
+
+static const struct samsung_gate_clock imem_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_MC, "gout_imem_gate_aclk_mc",
+	     "mout_imem_mux_aclk_imem_266_user",
+	     IMEM_GATE_ACLK_MC, 7, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_XIU_3X1_SSS, "gout_imem_gate_aclk_xiu_3x1_sss",
+	     "mout_imem_mux_aclk_imem_266_user",
+	     IMEM_GATE_ACLK_MC, 6, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_AXI_US_APM, "gout_imem_gate_aclk_axi_us_apm",
+	     "mout_imem_mux_aclk_imem_266_user",
+	     IMEM_GATE_ACLK_MC, 5, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_ASYNCAHBMSTM_APM, "gout_imem_gate_aclk_asyncahbmstm_apm",
+	     "mout_imem_mux_aclk_imem_266_user",
+	     IMEM_GATE_ACLK_MC, 4, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_ASYNCAHBM_SSS_ATLAS, "gout_imem_gate_aclk_asyncahbm_sss_atlas",
+	     "mout_imem_mux_aclk_imem_266_user",
+	     IMEM_GATE_ACLK_MC, 3, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_LH_ASYNC_SI_IMEM, "gout_imem_gate_aclk_lh_async_si_imem",
+	     "mout_imem_mux_aclk_imem_266_user",
+	     IMEM_GATE_ACLK_MC, 2, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_PPMU_SSSX, "gout_imem_gate_aclk_ppmu_sssx",
+	     "mout_imem_mux_aclk_imem_266_user",
+	     IMEM_GATE_ACLK_MC, 1, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_XIU_IMEMX, "gout_imem_gate_aclk_xiu_imemx",
+	     "mout_imem_mux_aclk_imem_266_user",
+	     IMEM_GATE_ACLK_MC, 0, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_SSS, "gout_imem_gate_aclk_sss",
+	     "mout_imem_mux_aclk_imem_266_user",
+	     IMEM_GATE_ACLK_SSS, 0, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_RTIC, "gout_imem_gate_aclk_rtic",
+	     "mout_imem_mux_aclk_imem_266_user",
+	     IMEM_GATE_ACLK_RTIC, 0, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_PCLK_CMU_IMEM, "gout_imem_gate_pclk_cmu_imem",
+	     "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_GATE_PCLK_CMU_IMEM, 16, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_IMEM_GATE_PCLK_SYSREG_IMEM, "gout_imem_gate_pclk_sysreg_imem",
+	     "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_GATE_PCLK_CMU_IMEM, 15, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_PCLK_MC, "gout_imem_gate_pclk_mc",
+	     "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_GATE_PCLK_CMU_IMEM, 14, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_PCLK_PPMU_SSSX, "gout_imem_gate_pclk_ppmu_sssx",
+	     "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_GATE_PCLK_CMU_IMEM, 12, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_PCLK_PMU_IMEM, "gout_imem_gate_pclk_pmu_imem",
+	     "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_GATE_PCLK_CMU_IMEM, 11, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_ASYNCAHBSS_APM, "gout_imem_gate_aclk_asyncahbss_apm",
+	     "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_GATE_PCLK_CMU_IMEM, 10, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_AXI2AHB_APM, "gout_imem_gate_aclk_axi2ahb_apm",
+	     "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_GATE_PCLK_CMU_IMEM, 9, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_INT_MEM_ALV, "gout_imem_gate_aclk_int_mem_alv",
+	     "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_GATE_PCLK_CMU_IMEM, 8, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_INT_MEM, "gout_imem_gate_aclk_int_mem",
+	     "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_GATE_PCLK_CMU_IMEM, 7, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_AXIDS_PIMEMX_IMEM, "gout_imem_gate_aclk_axids_pimemx_imem",
+	     "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_GATE_PCLK_CMU_IMEM, 6, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_AXILHASYNCM_PIMEMX, "gout_imem_gate_aclk_axilhasyncm_pimemx",
+	     "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_GATE_PCLK_CMU_IMEM, 5, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_AXI2APB_IMEM_1, "gout_imem_gate_aclk_axi2apb_imem_1",
+	     "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_GATE_PCLK_CMU_IMEM, 4, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_AXI2APB_IMEM_0, "gout_imem_gate_aclk_axi2apb_imem_0",
+	     "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_GATE_PCLK_CMU_IMEM, 3, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_XIU_PIMEMX1, "gout_imem_gate_aclk_xiu_pimemx1",
+	     "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_GATE_PCLK_CMU_IMEM, 2, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_XIU_PIMEMX0, "gout_imem_gate_aclk_xiu_pimemx0",
+	     "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_GATE_PCLK_CMU_IMEM, 1, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_GIC, "gout_imem_gate_aclk_gic",
+	     "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_GATE_PCLK_CMU_IMEM, 0, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_IMEM_GATE_PCLK_SSS, "gout_imem_gate_pclk_sss",
+	     "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_GATE_PCLK_SSS, 0, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_PCLK_RTIC, "gout_imem_gate_pclk_rtic",
+	     "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_GATE_PCLK_RTIC, 0, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_ASYNCAHBSM_APM, "gout_imem_gate_aclk_asyncahbsm_apm",
+	     "mout_imem_mux_aclk_imem_100_user",
+	     IMEM_GATE_ACLK_ASYNCAHBSM_APM, 2, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_AHB2AXI_APM, "gout_imem_gate_aclk_ahb2axi_apm",
+	     "mout_imem_mux_aclk_imem_100_user",
+	     IMEM_GATE_ACLK_MC, 9, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_ASYNCAHBMSTS_APM, "gout_imem_gate_aclk_asyncahbmsts_apm",
+	     "mout_imem_mux_aclk_imem_100_user",
+	     IMEM_GATE_ACLK_ASYNCAHBSM_APM, 0, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_CM3_APM, "gout_imem_gate_aclk_cm3_apm",
+	     "mout_imem_mux_aclk_imem_100_user",
+	     IMEM_GATE_ACLK_CM3_APM, 0, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_AHB_BUSMATRIX_APM, "gout_imem_gate_aclk_ahb_busmatrix_apm",
+	     "mout_imem_mux_aclk_imem_100_user",
+	     IMEM_GATE_ACLK_AHB_BUSMATRIX_APM, 0, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_SCLK_CM3_APM, "gout_imem_gate_sclk_cm3_apm",
+	     "mout_imem_mux_aclk_imem_100_user",
+	     IMEM_GATE_ACLK_CM3_APM, 0, 0, 0),
+	GATE(CLK_GOUT_IMEM_GATE_ACLK_APM, "gout_imem_gate_aclk_apm",
+	     "mout_imem_mux_aclk_imem_100_user",
+	     IMEM_GATE_ACLK_AHB_BUSMATRIX_APM, 0, 0, 0),
+	GATE(CLK_GOUT_IMEM_HWACG_GIC, "gout_imem_hwacg_gic", "mout_imem_mux_aclk_imem_200_user",
+	     IMEM_HWACG_GIC, 1, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_IMEM_HWACG_ASYNCAHBM_SSS_ATLAS, "gout_imem_hwacg_asyncahbm_sss_atlas",
+	     "mout_imem_mux_aclk_imem_266_user",
+	     IMEM_HWACG_ASYNCAHBM_SSS_ATLAS, 1, 0, 0),
+};
+
+static const struct samsung_cmu_info imem_cmu_info __initconst = {
+	.mux_clks		= imem_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(imem_mux_clks),
+	.gate_clks		= imem_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(imem_gate_clks),
+	.nr_clk_ids		= CLKS_NR_IMEM,
+	.clk_regs		= imem_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(imem_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_imem_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &imem_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_imem, "samsung,exynos8890-cmu-imem",
+	       exynos8890_cmu_imem_init);
+
+/* ---- CMU_AUD ---------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_AUD (0x114c0000) */
+#define AUD_MUX_AUD_PLL_USER			0x0200
+#define AUD_MUX_SCLK_I2S			0x0204
+#define AUD_MUX_SCLK_PCM			0x0208
+#define AUD_MUX_CP2AP_AUD_CLK_USER			0x020c
+#define AUD_MUX_ACLK_CA5			0x0210
+#define AUD_MUX_CDCLK_AUD			0x0214
+#define AUD_DIV_AUD_CA5			0x0400
+#define AUD_DIV_ACLK_AUD			0x0404
+#define AUD_DIV_PCLK_DBG			0x0408
+#define AUD_DIV_ATCLK_AUD			0x040c
+#define AUD_DIV_AUD_CDCLK			0x0410
+#define AUD_DIV_SCLK_I2S			0x0414
+#define AUD_DIV_SCLK_PCM			0x0418
+#define AUD_DIV_SCLK_SLIMBUS			0x041c
+#define AUD_DIV_SCLK_CP_I2S			0x0424
+#define AUD_DIV_SCLK_ASRC			0x0428
+#define AUD_DIV_CP_CA5			0x042c
+#define AUD_DIV_CP_CDCLK			0x0430
+#define AUD_GATE_SCLK_CA5			0x0800
+#define AUD_GATE_PCLK_PPMU_AUD			0x0804
+#define AUD_GATE_PCLK_DBG			0x0808
+#define AUD_GATE_ACLK_ATCLK_AUD			0x080c
+#define AUD_GATE_SCLK_I2S			0x0810
+#define AUD_GATE_SCLK_PCM			0x0814
+#define AUD_GATE_SCLK_SLIMBUS			0x0818
+#define AUD_GATE_SCLK_CP_I2S			0x081c
+#define AUD_GATE_SCLK_ASRC			0x0820
+#define AUD_GATE_SCLK_SLIMBUS_CLKIN			0x0824
+#define AUD_GATE_SCLK_I2S_BCLK			0x0828
+
+static const unsigned long aud_clk_regs[] __initconst = {
+	AUD_MUX_AUD_PLL_USER,
+	AUD_MUX_SCLK_I2S,
+	AUD_MUX_SCLK_PCM,
+	AUD_MUX_CP2AP_AUD_CLK_USER,
+	AUD_MUX_ACLK_CA5,
+	AUD_MUX_CDCLK_AUD,
+	AUD_DIV_AUD_CA5,
+	AUD_DIV_ACLK_AUD,
+	AUD_DIV_PCLK_DBG,
+	AUD_DIV_ATCLK_AUD,
+	AUD_DIV_AUD_CDCLK,
+	AUD_DIV_SCLK_I2S,
+	AUD_DIV_SCLK_PCM,
+	AUD_DIV_SCLK_SLIMBUS,
+	AUD_DIV_SCLK_CP_I2S,
+	AUD_DIV_SCLK_ASRC,
+	AUD_DIV_CP_CA5,
+	AUD_DIV_CP_CDCLK,
+	AUD_GATE_SCLK_CA5,
+	AUD_GATE_PCLK_PPMU_AUD,
+	AUD_GATE_PCLK_DBG,
+	AUD_GATE_ACLK_ATCLK_AUD,
+	AUD_GATE_SCLK_I2S,
+	AUD_GATE_SCLK_PCM,
+	AUD_GATE_SCLK_SLIMBUS,
+	AUD_GATE_SCLK_CP_I2S,
+	AUD_GATE_SCLK_ASRC,
+	AUD_GATE_SCLK_SLIMBUS_CLKIN,
+	AUD_GATE_SCLK_I2S_BCLK,
+};
+
+static const struct samsung_fixed_rate_clock aud_fixed_clks[] __initconst = {
+	FRATE(CLK_SCLK_CP2AP_AUD_CLK, "sclk_cp2ap_aud_clk", NULL, 0, 30 * MHZ),
+	FRATE(CLK_IOCLK_AUDIOCDCLK0, "ioclk_audiocdclk0", NULL, 0, 30 * MHZ),
+	FRATE(CLK_IOCLK_SLIMBUS_CLK, "ioclk_slimbus_clk", NULL, 0, 30 * MHZ),
+	FRATE(CLK_IOCLK_I2S_BCLK, "ioclk_i2s_bclk", NULL, 0, 30 * MHZ),
+};
+
+/* List of parent clocks for Muxes in CMU_AUD */
+PNAME(mout_aud_mux_aud_pll_user_p) = { "oscclk", "fout_aud_pll" };
+PNAME(mout_aud_mux_sclk_i2s_p) = { "mout_aud_mux_cdclk_aud", "ioclk_audiocdclk0" };
+PNAME(mout_aud_mux_sclk_pcm_p) = { "mout_aud_mux_cdclk_aud", "ioclk_audiocdclk0" };
+PNAME(mout_aud_mux_cp2ap_aud_clk_user_p) = { "oscclk", "sclk_cp2ap_aud_clk" };
+PNAME(mout_aud_mux_aclk_ca5_p) = { "dout_aud_div_aud_ca5", "dout_aud_div_cp_ca5" };
+PNAME(mout_aud_mux_cdclk_aud_p) = { "dout_aud_div_aud_cdclk", "dout_aud_div_cp_cdclk" };
+
+static const struct samsung_mux_clock aud_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_AUD_MUX_AUD_PLL_USER, "mout_aud_mux_aud_pll_user", mout_aud_mux_aud_pll_user_p,
+	    AUD_MUX_AUD_PLL_USER, 12, 1),
+	MUX(CLK_MOUT_AUD_MUX_SCLK_I2S, "mout_aud_mux_sclk_i2s", mout_aud_mux_sclk_i2s_p,
+	    AUD_MUX_SCLK_I2S, 12, 1),
+	MUX(CLK_MOUT_AUD_MUX_SCLK_PCM, "mout_aud_mux_sclk_pcm", mout_aud_mux_sclk_pcm_p,
+	    AUD_MUX_SCLK_PCM, 12, 1),
+	MUX(CLK_MOUT_AUD_MUX_CP2AP_AUD_CLK_USER, "mout_aud_mux_cp2ap_aud_clk_user",
+	    mout_aud_mux_cp2ap_aud_clk_user_p,
+	    AUD_MUX_CP2AP_AUD_CLK_USER, 12, 1),
+	MUX(CLK_MOUT_AUD_MUX_ACLK_CA5, "mout_aud_mux_aclk_ca5", mout_aud_mux_aclk_ca5_p,
+	    AUD_MUX_ACLK_CA5, 12, 1),
+	MUX(CLK_MOUT_AUD_MUX_CDCLK_AUD, "mout_aud_mux_cdclk_aud", mout_aud_mux_cdclk_aud_p,
+	    AUD_MUX_CDCLK_AUD, 12, 1),
+};
+
+static const struct samsung_div_clock aud_div_clks[] __initconst = {
+	DIV(CLK_DOUT_AUD_DIV_AUD_CA5, "dout_aud_div_aud_ca5", "mout_aud_mux_aud_pll_user",
+	    AUD_DIV_AUD_CA5, 0, 4),
+	DIV(CLK_DOUT_AUD_DIV_ACLK_AUD, "dout_aud_div_aclk_aud", "mout_aud_mux_aclk_ca5",
+	    AUD_DIV_ACLK_AUD, 0, 4),
+	DIV(CLK_DOUT_AUD_DIV_PCLK_DBG, "dout_aud_div_pclk_dbg", "mout_aud_mux_aclk_ca5",
+	    AUD_DIV_PCLK_DBG, 0, 4),
+	DIV(CLK_DOUT_AUD_DIV_ATCLK_AUD, "dout_aud_div_atclk_aud", "mout_aud_mux_aclk_ca5",
+	    AUD_DIV_ATCLK_AUD, 0, 4),
+	DIV(CLK_DOUT_AUD_DIV_AUD_CDCLK, "dout_aud_div_aud_cdclk", "mout_aud_mux_aud_pll_user",
+	    AUD_DIV_AUD_CDCLK, 0, 4),
+	DIV(CLK_DOUT_AUD_DIV_SCLK_I2S, "dout_aud_div_sclk_i2s", "mout_aud_mux_sclk_i2s",
+	    AUD_DIV_SCLK_I2S, 0, 4),
+	DIV(CLK_DOUT_AUD_DIV_SCLK_PCM, "dout_aud_div_sclk_pcm", "mout_aud_mux_sclk_pcm",
+	    AUD_DIV_SCLK_PCM, 0, 8),
+	DIV(CLK_DOUT_AUD_DIV_SCLK_SLIMBUS, "dout_aud_div_sclk_slimbus", "mout_aud_mux_cdclk_aud",
+	    AUD_DIV_SCLK_SLIMBUS, 0, 5),
+	DIV(CLK_DOUT_AUD_DIV_SCLK_CP_I2S, "dout_aud_div_sclk_cp_i2s", "mout_aud_mux_cdclk_aud",
+	    AUD_DIV_SCLK_CP_I2S, 0, 6),
+	DIV(CLK_DOUT_AUD_DIV_SCLK_ASRC, "dout_aud_div_sclk_asrc", "mout_aud_mux_cdclk_aud",
+	    AUD_DIV_SCLK_ASRC, 0, 5),
+	DIV(CLK_DOUT_AUD_DIV_CP_CA5, "dout_aud_div_cp_ca5", "mout_aud_mux_cp2ap_aud_clk_user",
+	    AUD_DIV_CP_CA5, 0, 5),
+	DIV(CLK_DOUT_AUD_DIV_CP_CDCLK, "dout_aud_div_cp_cdclk", "mout_aud_mux_cp2ap_aud_clk_user",
+	    AUD_DIV_CP_CDCLK, 0, 5),
+};
+
+static const struct samsung_gate_clock aud_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_AUD_GATE_SCLK_CA5, "gout_aud_gate_sclk_ca5", "mout_aud_mux_aclk_ca5",
+	     AUD_GATE_SCLK_CA5, 0, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_PCLK_PPMU_AUD, "gout_aud_gate_pclk_ppmu_aud",
+	     "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 20, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_PCLK_CP_I2S, "gout_aud_gate_pclk_cp_i2s", "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 19, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_PCLK_SYSREG_AUD, "gout_aud_gate_pclk_sysreg_aud",
+	     "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 18, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_PCLK_GPIO_AUD, "gout_aud_gate_pclk_gpio_aud",
+	     "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 17, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_PCLK_PMU_AUD, "gout_aud_gate_pclk_pmu_aud", "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 16, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_PCLK_SLIMBUS, "gout_aud_gate_pclk_slimbus", "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 15, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_PCLK_PCM, "gout_aud_gate_pclk_pcm", "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 14, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_PCLK_I2S, "gout_aud_gate_pclk_i2s", "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 13, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_PCLK_TIMER, "gout_aud_gate_pclk_timer", "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 12, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_PCLK_SFR1, "gout_aud_gate_pclk_sfr1", "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 11, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_PCLK_SFR0, "gout_aud_gate_pclk_sfr0", "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 10, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_PCLK_SMMU, "gout_aud_gate_pclk_smmu", "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 9, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_ACLK_PPMU_AUD, "gout_aud_gate_aclk_ppmu_aud",
+	     "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 8, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_ACLK_INTR, "gout_aud_gate_aclk_intr", "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 7, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_ACLK_XIU_LPASSX, "gout_aud_gate_aclk_xiu_lpassx",
+	     "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 6, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_ACLK_SMMU, "gout_aud_gate_aclk_smmu", "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 5, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_ACLK_AXI_LH_ASYNC_SI_TOP, "gout_aud_gate_aclk_axi_lh_async_si_top",
+	     "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 4, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_ACLK_AXI_LH_ASYNC_MI_TOP, "gout_aud_gate_aclk_axi_lh_async_mi_top",
+	     "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 3, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_ACLK_AXI_US_32TO64, "gout_aud_gate_aclk_axi_us_32to64",
+	     "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 2, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_ACLK_SRAMC, "gout_aud_gate_aclk_sramc", "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 1, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_ACLK_DMAC, "gout_aud_gate_aclk_dmac", "dout_aud_div_aclk_aud",
+	     AUD_GATE_PCLK_PPMU_AUD, 0, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_PCLK_DBG, "gout_aud_gate_pclk_dbg", "dout_aud_div_pclk_dbg",
+	     AUD_GATE_PCLK_DBG, 0, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_ACLK_ATCLK_AUD, "gout_aud_gate_aclk_atclk_aud",
+	     "dout_aud_div_atclk_aud",
+	     AUD_GATE_ACLK_ATCLK_AUD, 0, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_SCLK_I2S, "gout_aud_gate_sclk_i2s", "dout_aud_div_sclk_i2s",
+	     AUD_GATE_SCLK_I2S, 0, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_SCLK_PCM, "gout_aud_gate_sclk_pcm", "dout_aud_div_sclk_pcm",
+	     AUD_GATE_SCLK_PCM, 0, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_SCLK_SLIMBUS, "gout_aud_gate_sclk_slimbus",
+	     "dout_aud_div_sclk_slimbus",
+	     AUD_GATE_SCLK_SLIMBUS, 0, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_SCLK_CP_I2S, "gout_aud_gate_sclk_cp_i2s", "dout_aud_div_sclk_cp_i2s",
+	     AUD_GATE_SCLK_CP_I2S, 0, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_SCLK_ASRC, "gout_aud_gate_sclk_asrc", "dout_aud_div_sclk_asrc",
+	     AUD_GATE_SCLK_ASRC, 0, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_SCLK_SLIMBUS_CLKIN, "gout_aud_gate_sclk_slimbus_clkin",
+	     "ioclk_slimbus_clk",
+	     AUD_GATE_SCLK_SLIMBUS_CLKIN, 0, 0, 0),
+	GATE(CLK_GOUT_AUD_GATE_SCLK_I2S_BCLK, "gout_aud_gate_sclk_i2s_bclk", "ioclk_i2s_bclk",
+	     AUD_GATE_SCLK_I2S_BCLK, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info aud_cmu_info __initconst = {
+	.mux_clks		= aud_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(aud_mux_clks),
+	.div_clks		= aud_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(aud_div_clks),
+	.gate_clks		= aud_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(aud_gate_clks),
+	.fixed_clks		= aud_fixed_clks,
+	.nr_fixed_clks		= ARRAY_SIZE(aud_fixed_clks),
+	.nr_clk_ids		= CLKS_NR_AUD,
+	.clk_regs		= aud_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(aud_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_aud_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &aud_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_aud, "samsung,exynos8890-cmu-aud",
+	       exynos8890_cmu_aud_init);
+
+/* ---- CMU_MNGS --------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_MNGS (0x11800000) */
+#define MNGS_PLL_LOCK			0x0000
+#define MNGS_PLL_CON0			0x0100
+#define MNGS_MUX_MNGS_PLL			0x0200
+#define MNGS_MUX_BUS_PLL_MNGS_USER			0x0204
+#define MNGS_MUX_MNGS			0x0208
+#define MNGS_DIV_MNGS			0x0400
+#define MNGS_DIV_ACLK_MNGS			0x0404
+#define MNGS_DIV_ATCLK_MNGS_CORE			0x0408
+#define MNGS_DIV_ATCLK_MNGS_SOC			0x040c
+#define MNGS_DIV_ATCLK_MNGS_CSSYS_TRACECLK			0x0410
+#define MNGS_DIV_ATCLK_MNGS_ASYNCATB_CAM1			0x0414
+#define MNGS_DIV_ATCLK_MNGS_ASYNCATB_AUD			0x0418
+#define MNGS_DIV_PCLK_DBG_MNGS			0x041c
+#define MNGS_DIV_PCLK_RUN_MONITOR			0x0420
+#define MNGS_DIV_PCLK_MNGS			0x0424
+#define MNGS_DIV_CNTCLK_MNGS			0x0428
+#define MNGS_DIV_MNGS_RUN_MONITOR			0x042c
+#define MNGS_DIV_SCLK_PROMISE_MNGS			0x0430
+#define MNGS_DIV_MNGS_PLL			0x0434
+#define MNGS_GATE_ACLK_ASYNCPACES_MNGS_SCI			0x0800
+#define MNGS_GATE_ATCLKS_ATB_MNGS3_CSSYS			0x0804
+#define MNGS_GATE_ATCLK_XIU_MNGSX_2x1			0x0808
+#define MNGS_GATE_ATCLK_CSSYS_TRACECLK			0x080c
+#define MNGS_GATE_ATCLK_ASYNCATB_CAM1			0x0810
+#define MNGS_GATE_ATCLK_ASYNCATB_AUD			0x0814
+#define MNGS_GATE_PCLKDBG_ASAPBMST_CCORE_CSSYS			0x0900
+#define MNGS_GATE_PCLK_SYSREG_MNGS			0x0904
+#define MNGS_GATE_PCLK_HPM_MNGS			0x0908
+#define MNGS_GATE_SCLK_MNGS			0x0a00
+#define MNGS_GATE_SCLK_PROMISE2_MNGS			0x0a04
+
+static const unsigned long mngs_clk_regs[] __initconst = {
+	MNGS_PLL_LOCK,
+	MNGS_PLL_CON0,
+	MNGS_MUX_MNGS_PLL,
+	MNGS_MUX_BUS_PLL_MNGS_USER,
+	MNGS_MUX_MNGS,
+	MNGS_DIV_MNGS,
+	MNGS_DIV_ACLK_MNGS,
+	MNGS_DIV_ATCLK_MNGS_CORE,
+	MNGS_DIV_ATCLK_MNGS_SOC,
+	MNGS_DIV_ATCLK_MNGS_CSSYS_TRACECLK,
+	MNGS_DIV_ATCLK_MNGS_ASYNCATB_CAM1,
+	MNGS_DIV_ATCLK_MNGS_ASYNCATB_AUD,
+	MNGS_DIV_PCLK_DBG_MNGS,
+	MNGS_DIV_PCLK_RUN_MONITOR,
+	MNGS_DIV_PCLK_MNGS,
+	MNGS_DIV_CNTCLK_MNGS,
+	MNGS_DIV_MNGS_RUN_MONITOR,
+	MNGS_DIV_SCLK_PROMISE_MNGS,
+	MNGS_DIV_MNGS_PLL,
+	MNGS_GATE_ACLK_ASYNCPACES_MNGS_SCI,
+	MNGS_GATE_ATCLKS_ATB_MNGS3_CSSYS,
+	MNGS_GATE_ATCLK_XIU_MNGSX_2x1,
+	MNGS_GATE_ATCLK_CSSYS_TRACECLK,
+	MNGS_GATE_ATCLK_ASYNCATB_CAM1,
+	MNGS_GATE_ATCLK_ASYNCATB_AUD,
+	MNGS_GATE_PCLKDBG_ASAPBMST_CCORE_CSSYS,
+	MNGS_GATE_PCLK_SYSREG_MNGS,
+	MNGS_GATE_PCLK_HPM_MNGS,
+	MNGS_GATE_SCLK_MNGS,
+	MNGS_GATE_SCLK_PROMISE2_MNGS,
+};
+
+static const struct samsung_pll_clock mngs_pll_clks[] __initconst = {
+	PLL(pll_1416x, CLK_FOUT_MNGS_PLL, "fout_mngs_pll", "oscclk",
+	    MNGS_PLL_LOCK, MNGS_PLL_CON0, NULL),
+};
+
+/* List of parent clocks for Muxes in CMU_MNGS */
+PNAME(mout_mngs_mux_mngs_pll_p) = { "oscclk", "fout_mngs_pll" };
+PNAME(mout_mngs_mux_bus_pll_mngs_user_p) = { "oscclk", "gout_top_gate_sclk_bus_pll_mngs" };
+PNAME(mout_mngs_mux_mngs_p) = { "mout_mngs_mux_mngs_pll", "mout_mngs_mux_bus_pll_mngs_user" };
+
+static const struct samsung_mux_clock mngs_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_MNGS_MUX_MNGS_PLL, "mout_mngs_mux_mngs_pll", mout_mngs_mux_mngs_pll_p,
+	    MNGS_MUX_MNGS_PLL, 12, 1),
+	MUX(CLK_MOUT_MNGS_MUX_BUS_PLL_MNGS_USER, "mout_mngs_mux_bus_pll_mngs_user",
+	    mout_mngs_mux_bus_pll_mngs_user_p,
+	    MNGS_MUX_BUS_PLL_MNGS_USER, 12, 1),
+	MUX(CLK_MOUT_MNGS_MUX_MNGS, "mout_mngs_mux_mngs", mout_mngs_mux_mngs_p,
+	    MNGS_MUX_MNGS, 12, 1),
+};
+
+static const struct samsung_div_clock mngs_div_clks[] __initconst = {
+	DIV(CLK_DOUT_MNGS_DIV_MNGS, "dout_mngs_div_mngs", "mout_mngs_mux_mngs",
+	    MNGS_DIV_MNGS, 0, 6),
+	DIV(CLK_DOUT_MNGS_DIV_ACLK_MNGS, "dout_mngs_div_aclk_mngs", "dout_mngs_div_mngs",
+	    MNGS_DIV_ACLK_MNGS, 0, 4),
+	DIV(CLK_DOUT_MNGS_DIV_ATCLK_MNGS_CORE, "dout_mngs_div_atclk_mngs_core",
+	    "dout_mngs_div_mngs",
+	    MNGS_DIV_ATCLK_MNGS_CORE, 0, 4),
+	DIV(CLK_DOUT_MNGS_DIV_ATCLK_MNGS_SOC, "dout_mngs_div_atclk_mngs_soc", "dout_mngs_div_mngs",
+	    MNGS_DIV_ATCLK_MNGS_SOC, 0, 6),
+	DIV(CLK_DOUT_MNGS_DIV_ATCLK_MNGS_CSSYS_TRACECLK, "dout_mngs_div_atclk_mngs_cssys_traceclk",
+	    "dout_mngs_div_atclk_mngs_soc",
+	    MNGS_DIV_ATCLK_MNGS_CSSYS_TRACECLK, 0, 4),
+	DIV(CLK_DOUT_MNGS_DIV_ATCLK_MNGS_ASYNCATB_CAM1, "dout_mngs_div_atclk_mngs_asyncatb_cam1",
+	    "dout_mngs_div_atclk_mngs_soc",
+	    MNGS_DIV_ATCLK_MNGS_ASYNCATB_CAM1, 0, 4),
+	DIV(CLK_DOUT_MNGS_DIV_ATCLK_MNGS_ASYNCATB_AUD, "dout_mngs_div_atclk_mngs_asyncatb_aud",
+	    "dout_mngs_div_atclk_mngs_soc",
+	    MNGS_DIV_ATCLK_MNGS_ASYNCATB_AUD, 0, 4),
+	DIV(CLK_DOUT_MNGS_DIV_PCLK_DBG_MNGS, "dout_mngs_div_pclk_dbg_mngs", "dout_mngs_div_mngs",
+	    MNGS_DIV_PCLK_DBG_MNGS, 0, 6),
+	DIV(CLK_DOUT_MNGS_DIV_PCLK_RUN_MONITOR, "dout_mngs_div_pclk_run_monitor",
+	    "dout_mngs_div_pclk_dbg_mngs",
+	    MNGS_DIV_PCLK_RUN_MONITOR, 0, 3),
+	DIV(CLK_DOUT_MNGS_DIV_PCLK_MNGS, "dout_mngs_div_pclk_mngs", "dout_mngs_div_mngs",
+	    MNGS_DIV_PCLK_MNGS, 0, 6),
+	DIV(CLK_DOUT_MNGS_DIV_CNTCLK_MNGS, "dout_mngs_div_cntclk_mngs", "dout_mngs_div_mngs",
+	    MNGS_DIV_CNTCLK_MNGS, 0, 4),
+	DIV(CLK_DOUT_MNGS_DIV_MNGS_RUN_MONITOR, "dout_mngs_div_mngs_run_monitor",
+	    "dout_mngs_div_mngs",
+	    MNGS_DIV_MNGS_RUN_MONITOR, 0, 3),
+	DIV(CLK_DOUT_MNGS_DIV_SCLK_PROMISE_MNGS, "dout_mngs_div_sclk_promise_mngs",
+	    "mout_mngs_mux_mngs",
+	    MNGS_DIV_SCLK_PROMISE_MNGS, 0, 3),
+	DIV(CLK_DOUT_MNGS_DIV_MNGS_PLL, "dout_mngs_div_mngs_pll", "mout_mngs_mux_mngs",
+	    MNGS_DIV_MNGS_PLL, 0, 3),
+};
+
+static const struct samsung_gate_clock mngs_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_MNGS_GATE_ACLK_ASYNCPACES_MNGS_SCI, "gout_mngs_gate_aclk_asyncpaces_mngs_sci",
+	     "dout_mngs_div_aclk_mngs",
+	     MNGS_GATE_ACLK_ASYNCPACES_MNGS_SCI, 0, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLKS_ATB_MNGS3_CSSYS, "gout_mngs_gate_atclks_atb_mngs3_cssys",
+	     "dout_mngs_div_atclk_mngs_core",
+	     MNGS_GATE_ATCLKS_ATB_MNGS3_CSSYS, 3, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLKS_ATB_MNGS2_CSSYS, "gout_mngs_gate_atclks_atb_mngs2_cssys",
+	     "dout_mngs_div_atclk_mngs_core",
+	     MNGS_GATE_ATCLKS_ATB_MNGS3_CSSYS, 2, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLKS_ATB_MNGS1_CSSYS, "gout_mngs_gate_atclks_atb_mngs1_cssys",
+	     "dout_mngs_div_atclk_mngs_core",
+	     MNGS_GATE_ATCLKS_ATB_MNGS3_CSSYS, 1, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLKS_ATB_MNGS0_CSSYS, "gout_mngs_gate_atclks_atb_mngs0_cssys",
+	     "dout_mngs_div_atclk_mngs_core",
+	     MNGS_GATE_ATCLKS_ATB_MNGS3_CSSYS, 0, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLK_XIU_MNGSX_2x1, "gout_mngs_gate_atclk_xiu_mngsx_2x1",
+	     "dout_mngs_div_atclk_mngs_soc",
+	     MNGS_GATE_ATCLK_XIU_MNGSX_2x1, 16, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLK_STM_TXACTOR, "gout_mngs_gate_atclk_stm_txactor",
+	     "dout_mngs_div_atclk_mngs_soc",
+	     MNGS_GATE_ATCLK_XIU_MNGSX_2x1, 15, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLK_ATB_BDU_CSSYS, "gout_mngs_gate_atclk_atb_bdu_cssys",
+	     "dout_mngs_div_atclk_mngs_soc",
+	     MNGS_GATE_ATCLK_XIU_MNGSX_2x1, 14, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLK_ATB_AUD_CSSYS, "gout_mngs_gate_atclk_atb_aud_cssys",
+	     "dout_mngs_div_atclk_mngs_soc",
+	     MNGS_GATE_ATCLK_XIU_MNGSX_2x1, 13, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLK_ATB_CAM1_CSSYS, "gout_mngs_gate_atclk_atb_cam1_cssys",
+	     "dout_mngs_div_atclk_mngs_soc",
+	     MNGS_GATE_ATCLK_XIU_MNGSX_2x1, 12, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLK_ATB_APOLLO3_CSSYS, "gout_mngs_gate_atclk_atb_apollo3_cssys",
+	     "dout_mngs_div_atclk_mngs_soc",
+	     MNGS_GATE_ATCLK_XIU_MNGSX_2x1, 11, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLK_ATB_APOLLO2_CSSYS, "gout_mngs_gate_atclk_atb_apollo2_cssys",
+	     "dout_mngs_div_atclk_mngs_soc",
+	     MNGS_GATE_ATCLK_XIU_MNGSX_2x1, 10, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLK_ATB_APOLLO1_CSSYS, "gout_mngs_gate_atclk_atb_apollo1_cssys",
+	     "dout_mngs_div_atclk_mngs_soc",
+	     MNGS_GATE_ATCLK_XIU_MNGSX_2x1, 9, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLK_ATB_APOLLO0_CSSYS, "gout_mngs_gate_atclk_atb_apollo0_cssys",
+	     "dout_mngs_div_atclk_mngs_soc",
+	     MNGS_GATE_ATCLK_XIU_MNGSX_2x1, 8, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLKM_ATB_MNGS3_CSSYS, "gout_mngs_gate_atclkm_atb_mngs3_cssys",
+	     "dout_mngs_div_atclk_mngs_soc",
+	     MNGS_GATE_ATCLK_XIU_MNGSX_2x1, 7, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLKM_ATB_MNGS2_CSSYS, "gout_mngs_gate_atclkm_atb_mngs2_cssys",
+	     "dout_mngs_div_atclk_mngs_soc",
+	     MNGS_GATE_ATCLK_XIU_MNGSX_2x1, 6, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLKM_ATB_MNGS1_CSSYS, "gout_mngs_gate_atclkm_atb_mngs1_cssys",
+	     "dout_mngs_div_atclk_mngs_soc",
+	     MNGS_GATE_ATCLK_XIU_MNGSX_2x1, 5, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLKM_ATB_MNGS0_CSSYS, "gout_mngs_gate_atclkm_atb_mngs0_cssys",
+	     "dout_mngs_div_atclk_mngs_soc",
+	     MNGS_GATE_ATCLK_XIU_MNGSX_2x1, 4, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLK_ASYNCAHB_CSSYS_SSS_ACLK, "gout_mngs_gate_atclk_asyncahb_cssys_sss_aclk",
+	     "dout_mngs_div_atclk_mngs_soc",
+	     MNGS_GATE_ATCLK_XIU_MNGSX_2x1, 3, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLK_ASYNCLHAXI_CSSYS_ETR_ACLK, "gout_mngs_gate_atclk_asynclhaxi_cssys_etr_aclk",
+	     "dout_mngs_div_atclk_mngs_soc",
+	     MNGS_GATE_ATCLK_XIU_MNGSX_2x1, 2, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLK_CSSYS_HCLK, "gout_mngs_gate_atclk_cssys_hclk",
+	     "dout_mngs_div_atclk_mngs_soc",
+	     MNGS_GATE_ATCLK_XIU_MNGSX_2x1, 1, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLK_CSSYS, "gout_mngs_gate_atclk_cssys",
+	     "dout_mngs_div_atclk_mngs_soc",
+	     MNGS_GATE_ATCLK_XIU_MNGSX_2x1, 0, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLK_CSSYS_TRACECLK, "gout_mngs_gate_atclk_cssys_traceclk",
+	     "dout_mngs_div_atclk_mngs_cssys_traceclk",
+	     MNGS_GATE_ATCLK_CSSYS_TRACECLK, 0, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLK_ASYNCATB_CAM1, "gout_mngs_gate_atclk_asyncatb_cam1",
+	     "dout_mngs_div_atclk_mngs_asyncatb_cam1",
+	     MNGS_GATE_ATCLK_ASYNCATB_CAM1, 0, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_ATCLK_ASYNCATB_AUD, "gout_mngs_gate_atclk_asyncatb_aud",
+	     "dout_mngs_div_atclk_mngs_asyncatb_aud",
+	     MNGS_GATE_ATCLK_ASYNCATB_AUD, 0, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLKDBG_ASAPBMST_CCORE_CSSYS, "gout_mngs_gate_pclkdbg_asapbmst_ccore_cssys",
+	     "dout_mngs_div_pclk_dbg_mngs",
+	     MNGS_GATE_PCLKDBG_ASAPBMST_CCORE_CSSYS, 11, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLKDBG_ASAPBSLV_CSSYS_BDU, "gout_mngs_gate_pclkdbg_asapbslv_cssys_bdu",
+	     "dout_mngs_div_pclk_dbg_mngs",
+	     MNGS_GATE_PCLKDBG_ASAPBMST_CCORE_CSSYS, 10, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLKDBG_ASAPBSLV_CSSYS_CAM1, "gout_mngs_gate_pclkdbg_asapbslv_cssys_cam1",
+	     "dout_mngs_div_pclk_dbg_mngs",
+	     MNGS_GATE_PCLKDBG_ASAPBMST_CCORE_CSSYS, 9, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLKDBG_ASAPBSLV_CSSYS_AUD, "gout_mngs_gate_pclkdbg_asapbslv_cssys_aud",
+	     "dout_mngs_div_pclk_dbg_mngs",
+	     MNGS_GATE_PCLKDBG_ASAPBMST_CCORE_CSSYS, 8, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLKDBG_ASAPBSLV_CSSYS_APOLLO, "gout_mngs_gate_pclkdbg_asapbslv_cssys_apollo",
+	     "dout_mngs_div_pclk_dbg_mngs",
+	     MNGS_GATE_PCLKDBG_ASAPBMST_CCORE_CSSYS, 7, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLKDBG_DUMP_PC_MNGS, "gout_mngs_gate_pclkdbg_dump_pc_mngs",
+	     "dout_mngs_div_pclk_dbg_mngs",
+	     MNGS_GATE_PCLKDBG_ASAPBMST_CCORE_CSSYS, 6, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLKDBG_SECJTAG, "gout_mngs_gate_pclkdbg_secjtag",
+	     "dout_mngs_div_pclk_dbg_mngs",
+	     MNGS_GATE_PCLKDBG_ASAPBMST_CCORE_CSSYS, 5, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLKDBG_AXIAP, "gout_mngs_gate_pclkdbg_axiap",
+	     "dout_mngs_div_pclk_dbg_mngs",
+	     MNGS_GATE_PCLKDBG_ASAPBMST_CCORE_CSSYS, 4, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLKDBG_CSSYS_CTMCLK, "gout_mngs_gate_pclkdbg_cssys_ctmclk",
+	     "dout_mngs_div_pclk_dbg_mngs",
+	     MNGS_GATE_PCLKDBG_ASAPBMST_CCORE_CSSYS, 3, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLKDBG_CSSYS, "gout_mngs_gate_pclkdbg_cssys",
+	     "dout_mngs_div_pclk_dbg_mngs",
+	     MNGS_GATE_PCLKDBG_ASAPBMST_CCORE_CSSYS, 2, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLKDBG_MNGS, "gout_mngs_gate_pclkdbg_mngs",
+	     "dout_mngs_div_pclk_dbg_mngs",
+	     MNGS_GATE_PCLKDBG_ASAPBMST_CCORE_CSSYS, 1, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLKDBG_ASYNCDAPSLV, "gout_mngs_gate_pclkdbg_asyncdapslv",
+	     "dout_mngs_div_pclk_dbg_mngs",
+	     MNGS_GATE_PCLKDBG_ASAPBMST_CCORE_CSSYS, 0, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLK_SYSREG_MNGS, "gout_mngs_gate_pclk_sysreg_mngs",
+	     "dout_mngs_div_pclk_mngs",
+	     MNGS_GATE_PCLK_SYSREG_MNGS, 5, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLK_STM_TXACTOR, "gout_mngs_gate_pclk_stm_txactor",
+	     "dout_mngs_div_pclk_mngs",
+	     MNGS_GATE_PCLK_SYSREG_MNGS, 4, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLK_XIU_PERI_MNGS_ACLK, "gout_mngs_gate_pclk_xiu_peri_mngs_aclk",
+	     "dout_mngs_div_pclk_mngs",
+	     MNGS_GATE_PCLK_SYSREG_MNGS, 3, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLK_PMU_MNGS, "gout_mngs_gate_pclk_pmu_mngs",
+	     "dout_mngs_div_pclk_mngs",
+	     MNGS_GATE_PCLK_SYSREG_MNGS, 2, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLK_XIU_MNGSSFRX_1x2, "gout_mngs_gate_pclk_xiu_mngssfrx_1x2",
+	     "dout_mngs_div_pclk_mngs",
+	     MNGS_GATE_PCLK_SYSREG_MNGS, 1, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLK_AXI2APB_MNGS_ACLK, "gout_mngs_gate_pclk_axi2apb_mngs_aclk",
+	     "dout_mngs_div_pclk_mngs",
+	     MNGS_GATE_PCLK_SYSREG_MNGS, 0, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_PCLK_HPM_MNGS, "gout_mngs_gate_pclk_hpm_mngs",
+	     "dout_mngs_div_pclk_mngs",
+	     MNGS_GATE_PCLK_HPM_MNGS, 0, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_SCLK_MNGS, "gout_mngs_gate_sclk_mngs", "dout_mngs_div_mngs",
+	     MNGS_GATE_SCLK_MNGS, 0, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_SCLK_PROMISE2_MNGS, "gout_mngs_gate_sclk_promise2_mngs",
+	     "dout_mngs_div_sclk_promise_mngs",
+	     MNGS_GATE_SCLK_PROMISE2_MNGS, 2, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_SCLK_PROMISE1_MNGS, "gout_mngs_gate_sclk_promise1_mngs",
+	     "dout_mngs_div_sclk_promise_mngs",
+	     MNGS_GATE_SCLK_PROMISE2_MNGS, 1, 0, 0),
+	GATE(CLK_GOUT_MNGS_GATE_SCLK_PROMISE0_MNGS, "gout_mngs_gate_sclk_promise0_mngs",
+	     "dout_mngs_div_sclk_promise_mngs",
+	     MNGS_GATE_SCLK_PROMISE2_MNGS, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info mngs_cmu_info __initconst = {
+	.pll_clks		= mngs_pll_clks,
+	.nr_pll_clks		= ARRAY_SIZE(mngs_pll_clks),
+	.mux_clks		= mngs_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(mngs_mux_clks),
+	.div_clks		= mngs_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(mngs_div_clks),
+	.gate_clks		= mngs_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(mngs_gate_clks),
+	.nr_clk_ids		= CLKS_NR_MNGS,
+	.clk_regs		= mngs_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(mngs_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_mngs_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &mngs_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_mngs, "samsung,exynos8890-cmu-mngs",
+	       exynos8890_cmu_mngs_init);
+
+/* ---- CMU_APOLLO ------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_APOLLO (0x11900000) */
+#define APOLLO_PLL_LOCK			0x0000
+#define APOLLO_PLL_CON0			0x0100
+#define APOLLO_MUX_APOLLO_PLL			0x0200
+#define APOLLO_MUX_BUS_PLL_APOLLO_USER			0x0204
+#define APOLLO_MUX_APOLLO			0x0208
+#define APOLLO_DIV_APOLLO			0x0400
+#define APOLLO_DIV_ACLK_APOLLO			0x0404
+#define APOLLO_DIV_ATCLK_APOLLO			0x0408
+#define APOLLO_DIV_PCLK_DBG_APOLLO			0x040c
+#define APOLLO_DIV_PCLK_APOLLO			0x0410
+#define APOLLO_DIV_CNTCLK_APOLLO			0x0414
+#define APOLLO_DIV_APOLLO_RUN_MONITOR			0x0418
+#define APOLLO_DIV_SCLK_PROMISE_APOLLO			0x041c
+#define APOLLO_DIV_APOLLO_PLL			0x0420
+#define APOLLO_GATE_ACLK_ASYNCACES_APOLLO_CCI			0x0800
+#define APOLLO_GATE_ACLK_ASATBSLV_APOLLO3_CSSYS			0x0804
+#define APOLLO_GATE_PCLKDBG_DUMP_PC_APOLLO			0x0900
+#define APOLLO_GATE_PCLK_SYSREG_APOLLO			0x0904
+#define APOLLO_GATE_PCLK_HPM_APOLLO			0x0908
+#define APOLLO_GATE_SCLK_APOLLO			0x0a00
+#define APOLLO_GATE_SCLK_PROMISE_APOLLO			0x0a04
+
+static const unsigned long apollo_clk_regs[] __initconst = {
+	APOLLO_PLL_LOCK,
+	APOLLO_PLL_CON0,
+	APOLLO_MUX_APOLLO_PLL,
+	APOLLO_MUX_BUS_PLL_APOLLO_USER,
+	APOLLO_MUX_APOLLO,
+	APOLLO_DIV_APOLLO,
+	APOLLO_DIV_ACLK_APOLLO,
+	APOLLO_DIV_ATCLK_APOLLO,
+	APOLLO_DIV_PCLK_DBG_APOLLO,
+	APOLLO_DIV_PCLK_APOLLO,
+	APOLLO_DIV_CNTCLK_APOLLO,
+	APOLLO_DIV_APOLLO_RUN_MONITOR,
+	APOLLO_DIV_SCLK_PROMISE_APOLLO,
+	APOLLO_DIV_APOLLO_PLL,
+	APOLLO_GATE_ACLK_ASYNCACES_APOLLO_CCI,
+	APOLLO_GATE_ACLK_ASATBSLV_APOLLO3_CSSYS,
+	APOLLO_GATE_PCLKDBG_DUMP_PC_APOLLO,
+	APOLLO_GATE_PCLK_SYSREG_APOLLO,
+	APOLLO_GATE_PCLK_HPM_APOLLO,
+	APOLLO_GATE_SCLK_APOLLO,
+	APOLLO_GATE_SCLK_PROMISE_APOLLO,
+};
+
+static const struct samsung_pll_clock apollo_pll_clks[] __initconst = {
+	PLL(pll_1417x, CLK_FOUT_APOLLO_PLL, "fout_apollo_pll", "oscclk",
+	    APOLLO_PLL_LOCK, APOLLO_PLL_CON0, NULL),
+};
+
+/* List of parent clocks for Muxes in CMU_APOLLO */
+PNAME(mout_apollo_mux_apollo_pll_p) = { "oscclk", "fout_apollo_pll" };
+PNAME(mout_apollo_mux_bus_pll_apollo_user_p) = { "oscclk", "gout_top_gate_sclk_bus_pll_apollo" };
+PNAME(mout_apollo_mux_apollo_p) = { "mout_apollo_mux_apollo_pll", "mout_apollo_mux_bus_pll_apollo_user" };
+
+static const struct samsung_mux_clock apollo_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_APOLLO_MUX_APOLLO_PLL, "mout_apollo_mux_apollo_pll",
+	    mout_apollo_mux_apollo_pll_p,
+	    APOLLO_MUX_APOLLO_PLL, 12, 1),
+	MUX(CLK_MOUT_APOLLO_MUX_BUS_PLL_APOLLO_USER, "mout_apollo_mux_bus_pll_apollo_user",
+	    mout_apollo_mux_bus_pll_apollo_user_p,
+	    APOLLO_MUX_BUS_PLL_APOLLO_USER, 12, 1),
+	MUX(CLK_MOUT_APOLLO_MUX_APOLLO, "mout_apollo_mux_apollo", mout_apollo_mux_apollo_p,
+	    APOLLO_MUX_APOLLO, 12, 1),
+};
+
+static const struct samsung_div_clock apollo_div_clks[] __initconst = {
+	DIV(CLK_DOUT_APOLLO_DIV_APOLLO, "dout_apollo_div_apollo", "mout_apollo_mux_apollo",
+	    APOLLO_DIV_APOLLO, 0, 6),
+	DIV(CLK_DOUT_APOLLO_DIV_ACLK_APOLLO, "dout_apollo_div_aclk_apollo",
+	    "dout_apollo_div_apollo",
+	    APOLLO_DIV_ACLK_APOLLO, 0, 3),
+	DIV(CLK_DOUT_APOLLO_DIV_ATCLK_APOLLO, "dout_apollo_div_atclk_apollo",
+	    "dout_apollo_div_apollo",
+	    APOLLO_DIV_ATCLK_APOLLO, 0, 4),
+	DIV(CLK_DOUT_APOLLO_DIV_PCLK_DBG_APOLLO, "dout_apollo_div_pclk_dbg_apollo",
+	    "dout_apollo_div_apollo",
+	    APOLLO_DIV_PCLK_DBG_APOLLO, 0, 4),
+	DIV(CLK_DOUT_APOLLO_DIV_PCLK_APOLLO, "dout_apollo_div_pclk_apollo",
+	    "dout_apollo_div_apollo",
+	    APOLLO_DIV_PCLK_APOLLO, 0, 4),
+	DIV(CLK_DOUT_APOLLO_DIV_CNTCLK_APOLLO, "dout_apollo_div_cntclk_apollo",
+	    "dout_apollo_div_apollo",
+	    APOLLO_DIV_CNTCLK_APOLLO, 0, 4),
+	DIV(CLK_DOUT_APOLLO_DIV_APOLLO_RUN_MONITOR, "dout_apollo_div_apollo_run_monitor",
+	    "dout_apollo_div_apollo",
+	    APOLLO_DIV_APOLLO_RUN_MONITOR, 0, 3),
+	DIV(CLK_DOUT_APOLLO_DIV_SCLK_PROMISE_APOLLO, "dout_apollo_div_sclk_promise_apollo",
+	    "mout_apollo_mux_apollo",
+	    APOLLO_DIV_SCLK_PROMISE_APOLLO, 0, 3),
+	DIV(CLK_DOUT_APOLLO_DIV_APOLLO_PLL, "dout_apollo_div_apollo_pll", "mout_apollo_mux_apollo",
+	    APOLLO_DIV_APOLLO_PLL, 0, 3),
+};
+
+static const struct samsung_gate_clock apollo_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_APOLLO_GATE_ACLK_ASYNCACES_APOLLO_CCI, "gout_apollo_gate_aclk_asyncaces_apollo_cci",
+	     "dout_apollo_div_aclk_apollo",
+	     APOLLO_GATE_ACLK_ASYNCACES_APOLLO_CCI, 0, 0, 0),
+	GATE(CLK_GOUT_APOLLO_GATE_ACLK_ASATBSLV_APOLLO3_CSSYS, "gout_apollo_gate_aclk_asatbslv_apollo3_cssys",
+	     "dout_apollo_div_atclk_apollo",
+	     APOLLO_GATE_ACLK_ASATBSLV_APOLLO3_CSSYS, 3, 0, 0),
+	GATE(CLK_GOUT_APOLLO_GATE_ACLK_ASATBSLV_APOLLO2_CSSYS, "gout_apollo_gate_aclk_asatbslv_apollo2_cssys",
+	     "dout_apollo_div_atclk_apollo",
+	     APOLLO_GATE_ACLK_ASATBSLV_APOLLO3_CSSYS, 2, 0, 0),
+	GATE(CLK_GOUT_APOLLO_GATE_ACLK_ASATBSLV_APOLLO1_CSSYS, "gout_apollo_gate_aclk_asatbslv_apollo1_cssys",
+	     "dout_apollo_div_atclk_apollo",
+	     APOLLO_GATE_ACLK_ASATBSLV_APOLLO3_CSSYS, 1, 0, 0),
+	GATE(CLK_GOUT_APOLLO_GATE_ACLK_ASATBSLV_APOLLO0_CSSYS, "gout_apollo_gate_aclk_asatbslv_apollo0_cssys",
+	     "dout_apollo_div_atclk_apollo",
+	     APOLLO_GATE_ACLK_ASATBSLV_APOLLO3_CSSYS, 0, 0, 0),
+	GATE(CLK_GOUT_APOLLO_GATE_PCLKDBG_DUMP_PC_APOLLO, "gout_apollo_gate_pclkdbg_dump_pc_apollo",
+	     "dout_apollo_div_pclk_dbg_apollo",
+	     APOLLO_GATE_PCLKDBG_DUMP_PC_APOLLO, 1, 0, 0),
+	GATE(CLK_GOUT_APOLLO_GATE_PCLKDBG_ASAPBMST_CSSYS_APOLLO, "gout_apollo_gate_pclkdbg_asapbmst_cssys_apollo",
+	     "dout_apollo_div_pclk_dbg_apollo",
+	     APOLLO_GATE_PCLKDBG_DUMP_PC_APOLLO, 0, 0, 0),
+	GATE(CLK_GOUT_APOLLO_GATE_PCLK_SYSREG_APOLLO, "gout_apollo_gate_pclk_sysreg_apollo",
+	     "dout_apollo_div_pclk_apollo",
+	     APOLLO_GATE_PCLK_SYSREG_APOLLO, 3, 0, 0),
+	GATE(CLK_GOUT_APOLLO_GATE_PCLK_PMU_APOLLO, "gout_apollo_gate_pclk_pmu_apollo",
+	     "dout_apollo_div_pclk_apollo",
+	     APOLLO_GATE_PCLK_SYSREG_APOLLO, 2, 0, 0),
+	GATE(CLK_GOUT_APOLLO_GATE_PCLK_AXI2APB_APOLLO_ACLK, "gout_apollo_gate_pclk_axi2apb_apollo_aclk",
+	     "dout_apollo_div_pclk_apollo",
+	     APOLLO_GATE_PCLK_SYSREG_APOLLO, 1, 0, 0),
+	GATE(CLK_GOUT_APOLLO_GATE_PCLK_XIU_PERI_APOLLO_ACLK, "gout_apollo_gate_pclk_xiu_peri_apollo_aclk",
+	     "dout_apollo_div_pclk_apollo",
+	     APOLLO_GATE_PCLK_SYSREG_APOLLO, 0, 0, 0),
+	GATE(CLK_GOUT_APOLLO_GATE_PCLK_HPM_APOLLO, "gout_apollo_gate_pclk_hpm_apollo",
+	     "dout_apollo_div_pclk_apollo",
+	     APOLLO_GATE_PCLK_HPM_APOLLO, 0, 0, 0),
+	GATE(CLK_GOUT_APOLLO_GATE_SCLK_APOLLO, "gout_apollo_gate_sclk_apollo",
+	     "dout_apollo_div_apollo",
+	     APOLLO_GATE_SCLK_APOLLO, 0, 0, 0),
+	GATE(CLK_GOUT_APOLLO_GATE_SCLK_PROMISE_APOLLO, "gout_apollo_gate_sclk_promise_apollo",
+	     "dout_apollo_div_sclk_promise_apollo",
+	     APOLLO_GATE_SCLK_PROMISE_APOLLO, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info apollo_cmu_info __initconst = {
+	.pll_clks		= apollo_pll_clks,
+	.nr_pll_clks		= ARRAY_SIZE(apollo_pll_clks),
+	.mux_clks		= apollo_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(apollo_mux_clks),
+	.div_clks		= apollo_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(apollo_div_clks),
+	.gate_clks		= apollo_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(apollo_gate_clks),
+	.nr_clk_ids		= CLKS_NR_APOLLO,
+	.clk_regs		= apollo_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(apollo_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_apollo_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &apollo_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_apollo, "samsung,exynos8890-cmu-apollo",
+	       exynos8890_cmu_apollo_init);
+
+/* ---- CMU_BUS0 --------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_BUS0 (0x13400000) */
+#define BUS0_MUX_ACLK_BUS0_528_USER			0x0200
+#define BUS0_MUX_ACLK_BUS0_200_USER			0x0204
+#define BUS0_MUX_PCLK_BUS0_132_USER			0x0208
+#define BUS0_GATE_ACLK_ACE_FSYS1			0x0800
+#define BUS0_GATE_ACLK_LH_FSYS1			0x0804
+#define BUS0_GATE_PCLK_CMU_BUS0			0x0900
+
+static const unsigned long bus0_clk_regs[] __initconst = {
+	BUS0_MUX_ACLK_BUS0_528_USER,
+	BUS0_MUX_ACLK_BUS0_200_USER,
+	BUS0_MUX_PCLK_BUS0_132_USER,
+	BUS0_GATE_ACLK_ACE_FSYS1,
+	BUS0_GATE_ACLK_LH_FSYS1,
+	BUS0_GATE_PCLK_CMU_BUS0,
+};
+
+/* List of parent clocks for Muxes in CMU_BUS0 */
+PNAME(mout_bus0_mux_aclk_bus0_528_user_p) = { "oscclk", "gout_top_gate_aclk_bus0_528" };
+PNAME(mout_bus0_mux_aclk_bus0_200_user_p) = { "oscclk", "gout_top_gate_aclk_bus0_200" };
+PNAME(mout_bus0_mux_pclk_bus0_132_user_p) = { "oscclk", "gout_top_gate_pclk_bus0_132" };
+
+static const struct samsung_mux_clock bus0_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_BUS0_MUX_ACLK_BUS0_528_USER, "mout_bus0_mux_aclk_bus0_528_user",
+	    mout_bus0_mux_aclk_bus0_528_user_p,
+	    BUS0_MUX_ACLK_BUS0_528_USER, 12, 1),
+	MUX(CLK_MOUT_BUS0_MUX_ACLK_BUS0_200_USER, "mout_bus0_mux_aclk_bus0_200_user",
+	    mout_bus0_mux_aclk_bus0_200_user_p,
+	    BUS0_MUX_ACLK_BUS0_200_USER, 12, 1),
+	MUX(CLK_MOUT_BUS0_MUX_PCLK_BUS0_132_USER, "mout_bus0_mux_pclk_bus0_132_user",
+	    mout_bus0_mux_pclk_bus0_132_user_p,
+	    BUS0_MUX_PCLK_BUS0_132_USER, 12, 1),
+};
+
+static const struct samsung_gate_clock bus0_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_BUS0_GATE_ACLK_ACE_FSYS1, "gout_bus0_gate_aclk_ace_fsys1",
+	     "mout_bus0_mux_aclk_bus0_528_user",
+	     BUS0_GATE_ACLK_ACE_FSYS1, 8, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_ACLK_LH_ISP0, "gout_bus0_gate_aclk_lh_isp0",
+	     "mout_bus0_mux_aclk_bus0_528_user",
+	     BUS0_GATE_ACLK_ACE_FSYS1, 7, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_ACLK_LH_DISP11, "gout_bus0_gate_aclk_lh_disp11",
+	     "mout_bus0_mux_aclk_bus0_528_user",
+	     BUS0_GATE_ACLK_ACE_FSYS1, 6, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_ACLK_LH_DISP10, "gout_bus0_gate_aclk_lh_disp10",
+	     "mout_bus0_mux_aclk_bus0_528_user",
+	     BUS0_GATE_ACLK_ACE_FSYS1, 5, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_ACLK_LH_DISP01, "gout_bus0_gate_aclk_lh_disp01",
+	     "mout_bus0_mux_aclk_bus0_528_user",
+	     BUS0_GATE_ACLK_ACE_FSYS1, 4, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_ACLK_LH_DISP00, "gout_bus0_gate_aclk_lh_disp00",
+	     "mout_bus0_mux_aclk_bus0_528_user",
+	     BUS0_GATE_ACLK_ACE_FSYS1, 3, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_ACLK_LH_CAM1, "gout_bus0_gate_aclk_lh_cam1",
+	     "mout_bus0_mux_aclk_bus0_528_user",
+	     BUS0_GATE_ACLK_ACE_FSYS1, 2, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_ACLK_LH_CAM0, "gout_bus0_gate_aclk_lh_cam0",
+	     "mout_bus0_mux_aclk_bus0_528_user",
+	     BUS0_GATE_ACLK_ACE_FSYS1, 1, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_ACLK_TREX_BUS0, "gout_bus0_gate_aclk_trex_bus0",
+	     "mout_bus0_mux_aclk_bus0_528_user",
+	     BUS0_GATE_ACLK_ACE_FSYS1, 0, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_ACLK_LH_FSYS1, "gout_bus0_gate_aclk_lh_fsys1",
+	     "mout_bus0_mux_aclk_bus0_200_user",
+	     BUS0_GATE_ACLK_LH_FSYS1, 0, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_PCLK_CMU_BUS0, "gout_bus0_gate_pclk_cmu_bus0",
+	     "mout_bus0_mux_pclk_bus0_132_user",
+	     BUS0_GATE_PCLK_CMU_BUS0, 16, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_BUS0_GATE_PCLK_TREX_BUS0, "gout_bus0_gate_pclk_trex_bus0",
+	     "mout_bus0_mux_pclk_bus0_132_user",
+	     BUS0_GATE_PCLK_CMU_BUS0, 15, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_PCLK_PMU_BUS0, "gout_bus0_gate_pclk_pmu_bus0",
+	     "mout_bus0_mux_pclk_bus0_132_user",
+	     BUS0_GATE_PCLK_CMU_BUS0, 14, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_PCLK_SYSREG_BUS0, "gout_bus0_gate_pclk_sysreg_bus0",
+	     "mout_bus0_mux_pclk_bus0_132_user",
+	     BUS0_GATE_PCLK_CMU_BUS0, 13, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_PCLK_LH_FSYS1SFRX, "gout_bus0_gate_pclk_lh_fsys1sfrx",
+	     "mout_bus0_mux_pclk_bus0_132_user",
+	     BUS0_GATE_PCLK_CMU_BUS0, 12, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_PCLK_LH_PERIC1P, "gout_bus0_gate_pclk_lh_peric1p",
+	     "mout_bus0_mux_pclk_bus0_132_user",
+	     BUS0_GATE_PCLK_CMU_BUS0, 11, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_PCLK_LH_PERIC0P, "gout_bus0_gate_pclk_lh_peric0p",
+	     "mout_bus0_mux_pclk_bus0_132_user",
+	     BUS0_GATE_PCLK_CMU_BUS0, 10, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_PCLK_LH_PERISFRX, "gout_bus0_gate_pclk_lh_perisfrx",
+	     "mout_bus0_mux_pclk_bus0_132_user",
+	     BUS0_GATE_PCLK_CMU_BUS0, 9, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_PCLK_LH_DISP1SFRX, "gout_bus0_gate_pclk_lh_disp1sfrx",
+	     "mout_bus0_mux_pclk_bus0_132_user",
+	     BUS0_GATE_PCLK_CMU_BUS0, 8, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_PCLK_LH_DISP0SFRX, "gout_bus0_gate_pclk_lh_disp0sfrx",
+	     "mout_bus0_mux_pclk_bus0_132_user",
+	     BUS0_GATE_PCLK_CMU_BUS0, 7, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_PCLK_LH_ISPHX, "gout_bus0_gate_pclk_lh_isphx",
+	     "mout_bus0_mux_pclk_bus0_132_user",
+	     BUS0_GATE_PCLK_CMU_BUS0, 6, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_PCLK_LH_IS0X, "gout_bus0_gate_pclk_lh_is0x",
+	     "mout_bus0_mux_pclk_bus0_132_user",
+	     BUS0_GATE_PCLK_CMU_BUS0, 5, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_PCLK_AXI2APB_2MB_BUS0_TP, "gout_bus0_gate_pclk_axi2apb_2mb_bus0_tp",
+	     "mout_bus0_mux_pclk_bus0_132_user",
+	     BUS0_GATE_PCLK_CMU_BUS0, 4, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_PCLK_AHB2APB_BUS0P, "gout_bus0_gate_pclk_ahb2apb_bus0p",
+	     "mout_bus0_mux_pclk_bus0_132_user",
+	     BUS0_GATE_PCLK_CMU_BUS0, 3, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_PCLK_AXI2APB_2MB_BUS0_TD, "gout_bus0_gate_pclk_axi2apb_2mb_bus0_td",
+	     "mout_bus0_mux_pclk_bus0_132_user",
+	     BUS0_GATE_PCLK_CMU_BUS0, 2, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_PCLK_TREX_P_BUS0, "gout_bus0_gate_pclk_trex_p_bus0",
+	     "mout_bus0_mux_pclk_bus0_132_user",
+	     BUS0_GATE_PCLK_CMU_BUS0, 1, 0, 0),
+	GATE(CLK_GOUT_BUS0_GATE_ACLK_TREX_P_BUS0, "gout_bus0_gate_aclk_trex_p_bus0",
+	     "mout_bus0_mux_pclk_bus0_132_user",
+	     BUS0_GATE_PCLK_CMU_BUS0, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info bus0_cmu_info __initconst = {
+	.mux_clks		= bus0_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(bus0_mux_clks),
+	.gate_clks		= bus0_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(bus0_gate_clks),
+	.nr_clk_ids		= CLKS_NR_BUS0,
+	.clk_regs		= bus0_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(bus0_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_bus0_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &bus0_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_bus0, "samsung,exynos8890-cmu-bus0",
+	       exynos8890_cmu_bus0_init);
+
+/* ---- CMU_BUS1 --------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_BUS1 (0x14800000) */
+#define BUS1_MUX_ACLK_BUS1_528_USER			0x0200
+#define BUS1_MUX_PCLK_BUS1_132_USER			0x0204
+#define BUS1_GATE_ACLK_LH_MSCL1			0x0800
+#define BUS1_GATE_PCLK_CMU_BUS1			0x0900
+
+static const unsigned long bus1_clk_regs[] __initconst = {
+	BUS1_MUX_ACLK_BUS1_528_USER,
+	BUS1_MUX_PCLK_BUS1_132_USER,
+	BUS1_GATE_ACLK_LH_MSCL1,
+	BUS1_GATE_PCLK_CMU_BUS1,
+};
+
+/* List of parent clocks for Muxes in CMU_BUS1 */
+PNAME(mout_bus1_mux_aclk_bus1_528_user_p) = { "oscclk", "gout_top_gate_aclk_bus1_528" };
+PNAME(mout_bus1_mux_pclk_bus1_132_user_p) = { "oscclk", "gout_top_gate_pclk_bus1_132" };
+
+static const struct samsung_mux_clock bus1_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_BUS1_MUX_ACLK_BUS1_528_USER, "mout_bus1_mux_aclk_bus1_528_user",
+	    mout_bus1_mux_aclk_bus1_528_user_p,
+	    BUS1_MUX_ACLK_BUS1_528_USER, 12, 1),
+	MUX(CLK_MOUT_BUS1_MUX_PCLK_BUS1_132_USER, "mout_bus1_mux_pclk_bus1_132_user",
+	    mout_bus1_mux_pclk_bus1_132_user_p,
+	    BUS1_MUX_PCLK_BUS1_132_USER, 12, 1),
+};
+
+static const struct samsung_gate_clock bus1_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_BUS1_GATE_ACLK_LH_MSCL1, "gout_bus1_gate_aclk_lh_mscl1",
+	     "mout_bus1_mux_aclk_bus1_528_user",
+	     BUS1_GATE_ACLK_LH_MSCL1, 5, 0, 0),
+	GATE(CLK_GOUT_BUS1_GATE_ACLK_LH_MSCL0, "gout_bus1_gate_aclk_lh_mscl0",
+	     "mout_bus1_mux_aclk_bus1_528_user",
+	     BUS1_GATE_ACLK_LH_MSCL1, 4, 0, 0),
+	GATE(CLK_GOUT_BUS1_GATE_ACLK_LH_MFC1, "gout_bus1_gate_aclk_lh_mfc1",
+	     "mout_bus1_mux_aclk_bus1_528_user",
+	     BUS1_GATE_ACLK_LH_MSCL1, 3, 0, 0),
+	GATE(CLK_GOUT_BUS1_GATE_ACLK_LH_MFC0, "gout_bus1_gate_aclk_lh_mfc0",
+	     "mout_bus1_mux_aclk_bus1_528_user",
+	     BUS1_GATE_ACLK_LH_MSCL1, 2, 0, 0),
+	GATE(CLK_GOUT_BUS1_GATE_ACLK_LH_FSYS0, "gout_bus1_gate_aclk_lh_fsys0",
+	     "mout_bus1_mux_aclk_bus1_528_user",
+	     BUS1_GATE_ACLK_LH_MSCL1, 1, 0, 0),
+	GATE(CLK_GOUT_BUS1_GATE_ACLK_TREX_BUS1, "gout_bus1_gate_aclk_trex_bus1",
+	     "mout_bus1_mux_aclk_bus1_528_user",
+	     BUS1_GATE_ACLK_LH_MSCL1, 0, 0, 0),
+	GATE(CLK_GOUT_BUS1_GATE_PCLK_CMU_BUS1, "gout_bus1_gate_pclk_cmu_bus1",
+	     "mout_bus1_mux_pclk_bus1_132_user",
+	     BUS1_GATE_PCLK_CMU_BUS1, 11, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_BUS1_GATE_PCLK_TREX_BUS1, "gout_bus1_gate_pclk_trex_bus1",
+	     "mout_bus1_mux_pclk_bus1_132_user",
+	     BUS1_GATE_PCLK_CMU_BUS1, 10, 0, 0),
+	GATE(CLK_GOUT_BUS1_GATE_PCLK_SYSREG_BUS1, "gout_bus1_gate_pclk_sysreg_bus1",
+	     "mout_bus1_mux_pclk_bus1_132_user",
+	     BUS1_GATE_PCLK_CMU_BUS1, 9, 0, 0),
+	GATE(CLK_GOUT_BUS1_GATE_PCLK_PMU_BUS1, "gout_bus1_gate_pclk_pmu_bus1",
+	     "mout_bus1_mux_pclk_bus1_132_user",
+	     BUS1_GATE_PCLK_CMU_BUS1, 8, 0, 0),
+	GATE(CLK_GOUT_BUS1_GATE_PCLK_LH_MSCLSFRX, "gout_bus1_gate_pclk_lh_msclsfrx",
+	     "mout_bus1_mux_pclk_bus1_132_user",
+	     BUS1_GATE_PCLK_CMU_BUS1, 7, 0, 0),
+	GATE(CLK_GOUT_BUS1_GATE_PCLK_LH_MFCP, "gout_bus1_gate_pclk_lh_mfcp",
+	     "mout_bus1_mux_pclk_bus1_132_user",
+	     BUS1_GATE_PCLK_CMU_BUS1, 6, 0, 0),
+	GATE(CLK_GOUT_BUS1_GATE_PCLK_LH_FSYS0SFRX, "gout_bus1_gate_pclk_lh_fsys0sfrx",
+	     "mout_bus1_mux_pclk_bus1_132_user",
+	     BUS1_GATE_PCLK_CMU_BUS1, 5, 0, 0),
+	GATE(CLK_GOUT_BUS1_GATE_PCLK_AHB2APB_BUS1P, "gout_bus1_gate_pclk_ahb2apb_bus1p",
+	     "mout_bus1_mux_pclk_bus1_132_user",
+	     BUS1_GATE_PCLK_CMU_BUS1, 4, 0, 0),
+	GATE(CLK_GOUT_BUS1_GATE_PCLK_AXI2APB_2MB_BUS1_TP, "gout_bus1_gate_pclk_axi2apb_2mb_bus1_tp",
+	     "mout_bus1_mux_pclk_bus1_132_user",
+	     BUS1_GATE_PCLK_CMU_BUS1, 3, 0, 0),
+	GATE(CLK_GOUT_BUS1_GATE_PCLK_AXI2APB_2MB_BUS1_TD, "gout_bus1_gate_pclk_axi2apb_2mb_bus1_td",
+	     "mout_bus1_mux_pclk_bus1_132_user",
+	     BUS1_GATE_PCLK_CMU_BUS1, 2, 0, 0),
+	GATE(CLK_GOUT_BUS1_GATE_PCLK_TREX_P_BUS1, "gout_bus1_gate_pclk_trex_p_bus1",
+	     "mout_bus1_mux_pclk_bus1_132_user",
+	     BUS1_GATE_PCLK_CMU_BUS1, 1, 0, 0),
+	GATE(CLK_GOUT_BUS1_GATE_ACLK_TREX_P_BUS1, "gout_bus1_gate_aclk_trex_p_bus1",
+	     "mout_bus1_mux_pclk_bus1_132_user",
+	     BUS1_GATE_PCLK_CMU_BUS1, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info bus1_cmu_info __initconst = {
+	.mux_clks		= bus1_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(bus1_mux_clks),
+	.gate_clks		= bus1_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(bus1_gate_clks),
+	.nr_clk_ids		= CLKS_NR_BUS1,
+	.clk_regs		= bus1_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(bus1_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_bus1_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &bus1_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_bus1, "samsung,exynos8890-cmu-bus1",
+	       exynos8890_cmu_bus1_init);
+
+/* ---- CMU_PERIC0 ------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_PERIC0 (0x13610000) */
+#define PERIC0_MUX_ACLK_PERIC0_66_USER			0x0200
+#define PERIC0_MUX_SCLK_UART0_USER			0x0204
+#define PERIC0_GATE_PCLK_HSI2C11			0x0800
+#define PERIC0_GATE_SCLK_UART0			0x0840
+#define PERIC0_GATE_SCLK_PWM			0x0844
+#define PERIC0_HWACG_GPIO_BUS0			0x2404
+#define PERIC0_HWACG_UART0			0x2408
+#define PERIC0_HWACG_ADCIF			0x240c
+#define PERIC0_HWACG_PWM			0x2410
+#define PERIC0_HWACG_HSI2C0			0x2414
+#define PERIC0_HWACG_HSI2C1			0x2418
+#define PERIC0_HWACG_HSI2C4			0x241c
+#define PERIC0_HWACG_HSI2C5			0x2420
+#define PERIC0_HWACG_HSI2C9			0x2424
+#define PERIC0_HWACG_HSI2C10			0x2428
+#define PERIC0_HWACG_HSI2C11			0x242c
+
+static const unsigned long peric0_clk_regs[] __initconst = {
+	PERIC0_MUX_ACLK_PERIC0_66_USER,
+	PERIC0_MUX_SCLK_UART0_USER,
+	PERIC0_GATE_PCLK_HSI2C11,
+	PERIC0_GATE_SCLK_UART0,
+	PERIC0_GATE_SCLK_PWM,
+	PERIC0_HWACG_GPIO_BUS0,
+	PERIC0_HWACG_UART0,
+	PERIC0_HWACG_ADCIF,
+	PERIC0_HWACG_PWM,
+	PERIC0_HWACG_HSI2C0,
+	PERIC0_HWACG_HSI2C1,
+	PERIC0_HWACG_HSI2C4,
+	PERIC0_HWACG_HSI2C5,
+	PERIC0_HWACG_HSI2C9,
+	PERIC0_HWACG_HSI2C10,
+	PERIC0_HWACG_HSI2C11,
+};
+
+/* List of parent clocks for Muxes in CMU_PERIC0 */
+PNAME(mout_peric0_mux_aclk_peric0_66_user_p) = { "oscclk", "gout_top_gate_aclk_peric0_66" };
+PNAME(mout_peric0_mux_sclk_uart0_user_p) = { "oscclk", "gout_top_gate_sclk_peric0_uart0" };
+
+static const struct samsung_mux_clock peric0_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_PERIC0_MUX_ACLK_PERIC0_66_USER, "mout_peric0_mux_aclk_peric0_66_user",
+	    mout_peric0_mux_aclk_peric0_66_user_p,
+	    PERIC0_MUX_ACLK_PERIC0_66_USER, 12, 1),
+	MUX(CLK_MOUT_PERIC0_MUX_SCLK_UART0_USER, "mout_peric0_mux_sclk_uart0_user",
+	    mout_peric0_mux_sclk_uart0_user_p,
+	    PERIC0_MUX_SCLK_UART0_USER, 12, 1),
+};
+
+static const struct samsung_gate_clock peric0_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_PERIC0_GATE_PCLK_HSI2C11, "gout_peric0_gate_pclk_hsi2c11",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_GATE_PCLK_HSI2C11, 15, 0, 0),
+	GATE(CLK_GOUT_PERIC0_GATE_PCLK_HSI2C10, "gout_peric0_gate_pclk_hsi2c10",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_GATE_PCLK_HSI2C11, 14, 0, 0),
+	GATE(CLK_GOUT_PERIC0_GATE_PCLK_HSI2C9, "gout_peric0_gate_pclk_hsi2c9",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_GATE_PCLK_HSI2C11, 13, 0, 0),
+	GATE(CLK_GOUT_PERIC0_GATE_PCLK_HSI2C5, "gout_peric0_gate_pclk_hsi2c5",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_GATE_PCLK_HSI2C11, 12, 0, 0),
+	GATE(CLK_GOUT_PERIC0_GATE_PCLK_HSI2C4, "gout_peric0_gate_pclk_hsi2c4",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_GATE_PCLK_HSI2C11, 11, 0, 0),
+	GATE(CLK_GOUT_PERIC0_GATE_PCLK_HSI2C1, "gout_peric0_gate_pclk_hsi2c1",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_GATE_PCLK_HSI2C11, 10, 0, 0),
+	GATE(CLK_GOUT_PERIC0_GATE_PCLK_HSI2C0, "gout_peric0_gate_pclk_hsi2c0",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_GATE_PCLK_HSI2C11, 9, 0, 0),
+	GATE(CLK_GOUT_PERIC0_GATE_PCLK_PWM, "gout_peric0_gate_pclk_pwm",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_GATE_PCLK_HSI2C11, 8, 0, 0),
+	GATE(CLK_GOUT_PERIC0_GATE_PCLK_ADCIF, "gout_peric0_gate_pclk_adcif",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_GATE_PCLK_HSI2C11, 7, 0, 0),
+	GATE(CLK_GOUT_PERIC0_GATE_PCLK_UART0, "gout_peric0_gate_pclk_uart0",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_GATE_PCLK_HSI2C11, 6, 0, 0),
+	GATE(CLK_GOUT_PERIC0_GATE_PCLK_GPIO_BUS0, "gout_peric0_gate_pclk_gpio_bus0",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_GATE_PCLK_HSI2C11, 5, 0, 0),
+	GATE(CLK_GOUT_PERIC0_GATE_PCLK_SYSREG_PERIC0, "gout_peric0_gate_pclk_sysreg_peric0",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_GATE_PCLK_HSI2C11, 4, 0, 0),
+	GATE(CLK_GOUT_PERIC0_GATE_PCLK_PMU_PERIC0, "gout_peric0_gate_pclk_pmu_peric0",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_GATE_PCLK_HSI2C11, 3, 0, 0),
+	GATE(CLK_GOUT_PERIC0_GATE_PCLK_CMU_PERIC0, "gout_peric0_gate_pclk_cmu_peric0",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_GATE_PCLK_HSI2C11, 2, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_PERIC0_GATE_ACLK_AXI2APB_PERIC0P, "gout_peric0_gate_aclk_axi2apb_peric0p",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_GATE_PCLK_HSI2C11, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC0_GATE_ACLK_AXILHASYNCM_PERIC0, "gout_peric0_gate_aclk_axilhasyncm_peric0",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_GATE_PCLK_HSI2C11, 0, 0, 0),
+	GATE(CLK_GOUT_PERIC0_GATE_SCLK_UART0, "gout_peric0_gate_sclk_uart0",
+	     "mout_peric0_mux_sclk_uart0_user",
+	     PERIC0_GATE_SCLK_UART0, 0, 0, 0),
+	GATE(CLK_GOUT_PERIC0_GATE_SCLK_PWM, "gout_peric0_gate_sclk_pwm", "oscclk",
+	     PERIC0_GATE_SCLK_PWM, 0, 0, 0),
+	GATE(CLK_GOUT_PERIC0_HWACG_GPIO_BUS0, "gout_peric0_hwacg_gpio_bus0",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_HWACG_GPIO_BUS0, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC0_HWACG_UART0, "gout_peric0_hwacg_uart0",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_HWACG_UART0, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC0_HWACG_ADCIF, "gout_peric0_hwacg_adcif",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_HWACG_ADCIF, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC0_HWACG_PWM, "gout_peric0_hwacg_pwm",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_HWACG_PWM, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC0_HWACG_HSI2C0, "gout_peric0_hwacg_hsi2c0",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_HWACG_HSI2C0, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC0_HWACG_HSI2C1, "gout_peric0_hwacg_hsi2c1",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_HWACG_HSI2C1, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC0_HWACG_HSI2C4, "gout_peric0_hwacg_hsi2c4",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_HWACG_HSI2C4, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC0_HWACG_HSI2C5, "gout_peric0_hwacg_hsi2c5",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_HWACG_HSI2C5, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC0_HWACG_HSI2C9, "gout_peric0_hwacg_hsi2c9",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_HWACG_HSI2C9, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC0_HWACG_HSI2C10, "gout_peric0_hwacg_hsi2c10",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_HWACG_HSI2C10, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC0_HWACG_HSI2C11, "gout_peric0_hwacg_hsi2c11",
+	     "mout_peric0_mux_aclk_peric0_66_user",
+	     PERIC0_HWACG_HSI2C11, 1, 0, 0),
+};
+
+static const struct samsung_cmu_info peric0_cmu_info __initconst = {
+	.mux_clks		= peric0_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(peric0_mux_clks),
+	.gate_clks		= peric0_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(peric0_gate_clks),
+	.nr_clk_ids		= CLKS_NR_PERIC0,
+	.clk_regs		= peric0_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(peric0_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_peric0_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &peric0_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_peric0, "samsung,exynos8890-cmu-peric0",
+	       exynos8890_cmu_peric0_init);
+
+/* ---- CMU_DISP0 -------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_DISP0 (0x13ad0000) */
+#define DISP_PLL_LOCK			0x0000
+#define DISP_PLL_CON0			0x0100
+#define DISP0_MUX_DISP_PLL			0x0200
+#define DISP0_MUX_ACLK_DISP0_0_400_USER			0x0204
+#define DISP0_MUX_ACLK_DISP0_1_400_USER			0x0208
+#define DISP0_MUX_SCLK_DISP0_DECON0_ECLK0_USER			0x020c
+#define DISP0_MUX_SCLK_DISP0_DECON0_VCLK0_USER			0x0210
+#define DISP0_MUX_SCLK_DISP0_DECON0_VCLK1_USER			0x0214
+#define DISP0_MUX_SCLK_DISP0_HDMI_AUDIO_USER			0x0218
+#define DISP0_MUX_PHYCLK_HDMIPHY_PIXEL_CLKO_USER	0x021c
+#define DISP0_MUX_PHYCLK_HDMIPHY_TMDS_CLKO_USER			0x0220
+#define DISP0_MUX_PHYCLK_MIPIDPHY0_RXCLKESC0_USER	0x0224
+#define DISP0_MUX_PHYCLK_MIPIDPHY0_BITCLKDIV2_USER	0x0228
+#define DISP0_MUX_PHYCLK_MIPIDPHY0_BITCLKDIV8_USER	0x022c
+#define DISP0_MUX_PHYCLK_MIPIDPHY1_RXCLKESC0_USER	0x0230
+#define DISP0_MUX_PHYCLK_MIPIDPHY1_BITCLKDIV2_USER	0x0234
+#define DISP0_MUX_PHYCLK_MIPIDPHY1_BITCLKDIV8_USER	0x0238
+#define DISP0_MUX_PHYCLK_MIPIDPHY2_RXCLKESC0_USER	0x023c
+#define DISP0_MUX_PHYCLK_MIPIDPHY2_BITCLKDIV2_USER	0x0240
+#define DISP0_MUX_PHYCLK_MIPIDPHY2_BITCLKDIV8_USER	0x0244
+#define DISP0_MUX_PHYCLK_DPPHY_CH0_TXD_CLK_USER			0x0248
+#define DISP0_MUX_PHYCLK_DPPHY_CH1_TXD_CLK_USER			0x024c
+#define DISP0_MUX_PHYCLK_DPPHY_CH2_TXD_CLK_USER			0x0250
+#define DISP0_MUX_PHYCLK_DPPHY_CH3_TXD_CLK_USER			0x0254
+#define DISP0_MUX_ACLK_DISP0_1_400			0x0258
+#define DISP0_MUX_SCLK_DISP0_DECON0_ECLK0			0x025c
+#define DISP0_MUX_SCLK_DISP0_DECON0_VCLK0			0x0260
+#define DISP0_MUX_SCLK_DISP0_DECON0_VCLK1			0x0264
+#define DISP0_MUX_SCLK_DISP0_HDMI_AUDIO			0x0268
+#define DISP0_DIV_PCLK_DISP0_0_133			0x0400
+#define DISP0_DIV_SCLK_DECON0_ECLK0			0x0404
+#define DISP0_DIV_SCLK_DECON0_VCLK0			0x0408
+#define DISP0_DIV_SCLK_DECON0_VCLK1			0x040c
+#define DISP0_DIV_PHYCLK_HDMIPHY_PIXEL_CLKO			0x0410
+#define DISP0_DIV_PHYCLK_HDMIPHY_TMDS_20B_CLKO			0x0414
+#define DISP0_GATE_ACLK_PPMU_DISP0_0			0x0800
+#define DISP0_GATE_ACLK_PPMU_DISP0_1			0x0804
+#define DISP0_GATE_ACLK_SFW_DISP0_0			0x0808
+#define DISP0_GATE_ACLK_SFW_DISP0_1			0x080c
+#define DISP0_GATE_PCLK_VPP0_1			0x0820
+#define DISP0_GATE_PCLK_HPM_APBIF_DISP0			0x0824
+#define DISP0_GATE_PCLK_DECON0			0x0828
+#define DISP0_GATE_PCLK_VPP0_0			0x082c
+#define DISP0_GATE_PCLK_SFW_DISP0_0			0x0830
+#define DISP0_GATE_PCLK_SFW_DISP0_1			0x0834
+#define DISP0_GATE_SCLK_DISP1_400			0x0840
+#define DISP0_GATE_SCLK_DECON0_ECLK0			0x0844
+#define DISP0_GATE_SCLK_DECON0_VCLK0			0x0848
+#define DISP0_GATE_SCLK_DECON0_VCLK1			0x084c
+#define DISP0_GATE_SCLK_HDMI_AUDIO			0x0850
+#define DISP0_GATE_SCLK_PROMISE_DISP0			0x0854
+#define DISP0_GATE_PHYCLK_HDMIPHY_TMDS_20B_CLKO			0x0858
+#define DISP0_GATE_PHYCLK_MIPIDPHY0_BITCLKDIV8			0x085c
+#define DISP0_GATE_PHYCLK_MIPIDPHY1_BITCLKDIV8			0x0860
+#define DISP0_GATE_PHYCLK_MIPIDPHY2_BITCLKDIV8			0x0864
+#define DISP0_GATE_PHYCLK_DPPHY_CH3_TXD_CLK			0x0868
+#define DISP0_GATE_OSCCLK_I_MIPI_DPHY_M4S4_M_XI			0x086c
+#define DISP0_HWACG_DSIM0			0x240c
+#define DISP0_HWACG_DSIM1			0x2410
+#define DISP0_HWACG_DSIM2			0x2414
+#define DISP0_HWACG_HDMI			0x2418
+#define DISP0_HWACG_HDMI_AUDIO			0x241c
+#define DISP0_HWACG_DP			0x2420
+#define DISP0_HWACG_DISP0_MUX			0x2424
+#define DISP0_HWACG_HDMI_PHY			0x2428
+#define DISP0_HWACG_DISP1_400			0x2434
+#define DISP0_HWACG_DECON0			0x2438
+#define DISP0_HWACG_HPM_APBIF_DISP0			0x2444
+#define DISP0_HWACG_PROMISE_DISP0			0x2448
+#define DISP0_HWACG_DPTX_PHY			0x2484
+#define DISP0_HWACG_MIPI_DPHY_M1S0			0x2488
+#define DISP0_HWACG_MIPI_DPHY_M4S0			0x248c
+#define DISP0_HWACG_MIPI_DPHY_M4S4			0x2490
+
+static const unsigned long disp0_clk_regs[] __initconst = {
+	DISP_PLL_LOCK,
+	DISP_PLL_CON0,
+	DISP0_MUX_DISP_PLL,
+	DISP0_MUX_ACLK_DISP0_0_400_USER,
+	DISP0_MUX_ACLK_DISP0_1_400_USER,
+	DISP0_MUX_SCLK_DISP0_DECON0_ECLK0_USER,
+	DISP0_MUX_SCLK_DISP0_DECON0_VCLK0_USER,
+	DISP0_MUX_SCLK_DISP0_DECON0_VCLK1_USER,
+	DISP0_MUX_SCLK_DISP0_HDMI_AUDIO_USER,
+	DISP0_MUX_PHYCLK_HDMIPHY_PIXEL_CLKO_USER,
+	DISP0_MUX_PHYCLK_HDMIPHY_TMDS_CLKO_USER,
+	DISP0_MUX_PHYCLK_MIPIDPHY0_RXCLKESC0_USER,
+	DISP0_MUX_PHYCLK_MIPIDPHY0_BITCLKDIV2_USER,
+	DISP0_MUX_PHYCLK_MIPIDPHY0_BITCLKDIV8_USER,
+	DISP0_MUX_PHYCLK_MIPIDPHY1_RXCLKESC0_USER,
+	DISP0_MUX_PHYCLK_MIPIDPHY1_BITCLKDIV2_USER,
+	DISP0_MUX_PHYCLK_MIPIDPHY1_BITCLKDIV8_USER,
+	DISP0_MUX_PHYCLK_MIPIDPHY2_RXCLKESC0_USER,
+	DISP0_MUX_PHYCLK_MIPIDPHY2_BITCLKDIV2_USER,
+	DISP0_MUX_PHYCLK_MIPIDPHY2_BITCLKDIV8_USER,
+	DISP0_MUX_PHYCLK_DPPHY_CH0_TXD_CLK_USER,
+	DISP0_MUX_PHYCLK_DPPHY_CH1_TXD_CLK_USER,
+	DISP0_MUX_PHYCLK_DPPHY_CH2_TXD_CLK_USER,
+	DISP0_MUX_PHYCLK_DPPHY_CH3_TXD_CLK_USER,
+	DISP0_MUX_ACLK_DISP0_1_400,
+	DISP0_MUX_SCLK_DISP0_DECON0_ECLK0,
+	DISP0_MUX_SCLK_DISP0_DECON0_VCLK0,
+	DISP0_MUX_SCLK_DISP0_DECON0_VCLK1,
+	DISP0_MUX_SCLK_DISP0_HDMI_AUDIO,
+	DISP0_DIV_PCLK_DISP0_0_133,
+	DISP0_DIV_SCLK_DECON0_ECLK0,
+	DISP0_DIV_SCLK_DECON0_VCLK0,
+	DISP0_DIV_SCLK_DECON0_VCLK1,
+	DISP0_DIV_PHYCLK_HDMIPHY_PIXEL_CLKO,
+	DISP0_DIV_PHYCLK_HDMIPHY_TMDS_20B_CLKO,
+	DISP0_GATE_ACLK_PPMU_DISP0_0,
+	DISP0_GATE_ACLK_PPMU_DISP0_1,
+	DISP0_GATE_ACLK_SFW_DISP0_0,
+	DISP0_GATE_ACLK_SFW_DISP0_1,
+	DISP0_GATE_PCLK_VPP0_1,
+	DISP0_GATE_PCLK_HPM_APBIF_DISP0,
+	DISP0_GATE_PCLK_DECON0,
+	DISP0_GATE_PCLK_VPP0_0,
+	DISP0_GATE_PCLK_SFW_DISP0_0,
+	DISP0_GATE_PCLK_SFW_DISP0_1,
+	DISP0_GATE_SCLK_DISP1_400,
+	DISP0_GATE_SCLK_DECON0_ECLK0,
+	DISP0_GATE_SCLK_DECON0_VCLK0,
+	DISP0_GATE_SCLK_DECON0_VCLK1,
+	DISP0_GATE_SCLK_HDMI_AUDIO,
+	DISP0_GATE_SCLK_PROMISE_DISP0,
+	DISP0_GATE_PHYCLK_HDMIPHY_TMDS_20B_CLKO,
+	DISP0_GATE_PHYCLK_MIPIDPHY0_BITCLKDIV8,
+	DISP0_GATE_PHYCLK_MIPIDPHY1_BITCLKDIV8,
+	DISP0_GATE_PHYCLK_MIPIDPHY2_BITCLKDIV8,
+	DISP0_GATE_PHYCLK_DPPHY_CH3_TXD_CLK,
+	DISP0_GATE_OSCCLK_I_MIPI_DPHY_M4S4_M_XI,
+	DISP0_HWACG_DSIM0,
+	DISP0_HWACG_DSIM1,
+	DISP0_HWACG_DSIM2,
+	DISP0_HWACG_HDMI,
+	DISP0_HWACG_HDMI_AUDIO,
+	DISP0_HWACG_DP,
+	DISP0_HWACG_DISP0_MUX,
+	DISP0_HWACG_HDMI_PHY,
+	DISP0_HWACG_DISP1_400,
+	DISP0_HWACG_DECON0,
+	DISP0_HWACG_HPM_APBIF_DISP0,
+	DISP0_HWACG_PROMISE_DISP0,
+	DISP0_HWACG_DPTX_PHY,
+	DISP0_HWACG_MIPI_DPHY_M1S0,
+	DISP0_HWACG_MIPI_DPHY_M4S0,
+	DISP0_HWACG_MIPI_DPHY_M4S4,
+};
+
+static const struct samsung_fixed_rate_clock disp0_fixed_clks[] __initconst = {
+	FRATE(CLK_PHYCLK_MIPIDPHY0_BITCLKDIV2_PHY, "phyclk_mipidphy0_bitclkdiv2_phy", NULL, 0, 30 * MHZ),
+	FRATE(CLK_PHYCLK_MIPIDPHY1_BITCLKDIV2_PHY, "phyclk_mipidphy1_bitclkdiv2_phy", NULL, 0, 30 * MHZ),
+	FRATE(CLK_PHYCLK_MIPIDPHY2_BITCLKDIV2_PHY, "phyclk_mipidphy2_bitclkdiv2_phy", NULL, 0, 30 * MHZ),
+	FRATE(CLK_PHYCLK_HDMIPHY_PIXEL_CLKO_PHY, "phyclk_hdmiphy_pixel_clko_phy", NULL, 0, 300 * MHZ),
+	FRATE(CLK_PHYCLK_HDMIPHY_TMDS_CLKO_PHY, "phyclk_hdmiphy_tmds_clko_phy", NULL, 0, 300 * MHZ),
+	FRATE(CLK_PHYCLK_MIPIDPHY0_RXCLKESC0_PHY, "phyclk_mipidphy0_rxclkesc0_phy", NULL, 0, 20 * MHZ),
+	FRATE(CLK_PHYCLK_MIPIDPHY0_BITCLKDIV8_PHY, "phyclk_mipidphy0_bitclkdiv8_phy", NULL, 0, 187.5 * MHZ),
+	FRATE(CLK_PHYCLK_MIPIDPHY1_RXCLKESC0_PHY, "phyclk_mipidphy1_rxclkesc0_phy", NULL, 0, 20 * MHZ),
+	FRATE(CLK_PHYCLK_MIPIDPHY1_BITCLKDIV8_PHY, "phyclk_mipidphy1_bitclkdiv8_phy", NULL, 0, 187.5 * MHZ),
+	FRATE(CLK_PHYCLK_MIPIDPHY2_RXCLKESC0_PHY, "phyclk_mipidphy2_rxclkesc0_phy", NULL, 0, 20 * MHZ),
+	FRATE(CLK_PHYCLK_MIPIDPHY2_BITCLKDIV8_PHY, "phyclk_mipidphy2_bitclkdiv8_phy", NULL, 0, 187.5 * MHZ),
+	FRATE(CLK_PHYCLK_DPPHY_CH0_TXD_CLK_PHY, "phyclk_dpphy_ch0_txd_clk_phy", NULL, 0, 270 * MHZ),
+	FRATE(CLK_PHYCLK_DPPHY_CH1_TXD_CLK_PHY, "phyclk_dpphy_ch1_txd_clk_phy", NULL, 0, 270 * MHZ),
+	FRATE(CLK_PHYCLK_DPPHY_CH2_TXD_CLK_PHY, "phyclk_dpphy_ch2_txd_clk_phy", NULL, 0, 270 * MHZ),
+	FRATE(CLK_PHYCLK_DPPHY_CH3_TXD_CLK_PHY, "phyclk_dpphy_ch3_txd_clk_phy", NULL, 0, 270 * MHZ),
+};
+
+static const struct samsung_pll_clock disp0_pll_clks[] __initconst = {
+	PLL(pll_1418x, CLK_FOUT_DISP_PLL, "fout_disp_pll", "oscclk",
+	    DISP_PLL_LOCK, DISP_PLL_CON0, NULL),
+};
+
+/* List of parent clocks for Muxes in CMU_DISP0 */
+PNAME(mout_disp0_mux_disp_pll_p) = { "oscclk", "fout_disp_pll" };
+PNAME(mout_disp0_mux_aclk_disp0_0_400_user_p) = { "oscclk", "gout_top_gate_aclk_disp0_0_400" };
+PNAME(mout_disp0_mux_aclk_disp0_1_400_user_p) = { "oscclk", "gout_top_gate_aclk_disp0_1_400" };
+PNAME(mout_disp0_mux_sclk_disp0_decon0_eclk0_user_p) = { "oscclk", "gout_top_gate_sclk_disp0_decon0_eclk0" };
+PNAME(mout_disp0_mux_sclk_disp0_decon0_vclk0_user_p) = { "oscclk", "gout_top_gate_sclk_disp0_decon0_vclk0" };
+PNAME(mout_disp0_mux_sclk_disp0_decon0_vclk1_user_p) = { "oscclk", "gout_top_gate_sclk_disp0_decon0_vclk1" };
+PNAME(mout_disp0_mux_sclk_disp0_hdmi_audio_user_p) = { "oscclk", "gout_top_gate_sclk_disp0_hdmi_audio" };
+PNAME(mout_disp0_mux_phyclk_hdmiphy_pixel_clko_user_p) = { "oscclk", "phyclk_hdmiphy_pixel_clko_phy" };
+PNAME(mout_disp0_mux_phyclk_hdmiphy_tmds_clko_user_p) = { "oscclk", "phyclk_hdmiphy_tmds_clko_phy" };
+PNAME(mout_disp0_mux_phyclk_mipidphy0_rxclkesc0_user_p) = { "oscclk", "phyclk_mipidphy0_rxclkesc0_phy" };
+PNAME(mout_disp0_mux_phyclk_mipidphy0_bitclkdiv2_user_p) = { "oscclk", "phyclk_mipidphy0_bitclkdiv2_phy" };
+PNAME(mout_disp0_mux_phyclk_mipidphy0_bitclkdiv8_user_p) = { "oscclk", "phyclk_mipidphy0_bitclkdiv8_phy" };
+PNAME(mout_disp0_mux_phyclk_mipidphy1_rxclkesc0_user_p) = { "oscclk", "phyclk_mipidphy1_rxclkesc0_phy" };
+PNAME(mout_disp0_mux_phyclk_mipidphy1_bitclkdiv2_user_p) = { "oscclk", "phyclk_mipidphy1_bitclkdiv2_phy" };
+PNAME(mout_disp0_mux_phyclk_mipidphy1_bitclkdiv8_user_p) = { "oscclk", "phyclk_mipidphy1_bitclkdiv8_phy" };
+PNAME(mout_disp0_mux_phyclk_mipidphy2_rxclkesc0_user_p) = { "oscclk", "phyclk_mipidphy2_rxclkesc0_phy" };
+PNAME(mout_disp0_mux_phyclk_mipidphy2_bitclkdiv2_user_p) = { "oscclk", "phyclk_mipidphy2_bitclkdiv2_phy" };
+PNAME(mout_disp0_mux_phyclk_mipidphy2_bitclkdiv8_user_p) = { "oscclk", "phyclk_mipidphy2_bitclkdiv8_phy" };
+PNAME(mout_disp0_mux_phyclk_dpphy_ch0_txd_clk_user_p) = { "oscclk", "phyclk_dpphy_ch0_txd_clk_phy" };
+PNAME(mout_disp0_mux_phyclk_dpphy_ch1_txd_clk_user_p) = { "oscclk", "phyclk_dpphy_ch1_txd_clk_phy" };
+PNAME(mout_disp0_mux_phyclk_dpphy_ch2_txd_clk_user_p) = { "oscclk", "phyclk_dpphy_ch2_txd_clk_phy" };
+PNAME(mout_disp0_mux_phyclk_dpphy_ch3_txd_clk_user_p) = { "oscclk", "phyclk_dpphy_ch3_txd_clk_phy" };
+PNAME(mout_disp0_mux_aclk_disp0_1_400_p) = { "mout_disp0_mux_aclk_disp0_0_400_user", "mout_disp0_mux_aclk_disp0_1_400_user" };
+PNAME(mout_disp0_mux_sclk_disp0_decon0_eclk0_p) = { "mout_disp0_mux_sclk_disp0_decon0_eclk0_user", "mout_disp0_mux_disp_pll", "mout_disp0_mux_phyclk_mipidphy0_bitclkdiv2_user", "mout_disp0_mux_phyclk_mipidphy1_bitclkdiv2_user", "mout_disp0_mux_phyclk_mipidphy2_bitclkdiv2_user" };
+PNAME(mout_disp0_mux_sclk_disp0_decon0_vclk0_p) = { "mout_disp0_mux_sclk_disp0_decon0_vclk0_user", "mout_disp0_mux_disp_pll", "mout_disp0_mux_phyclk_mipidphy0_bitclkdiv2_user", "mout_disp0_mux_phyclk_mipidphy1_bitclkdiv2_user", "mout_disp0_mux_phyclk_mipidphy2_bitclkdiv2_user" };
+PNAME(mout_disp0_mux_sclk_disp0_decon0_vclk1_p) = { "mout_disp0_mux_sclk_disp0_decon0_vclk1_user", "mout_disp0_mux_disp_pll", "mout_disp0_mux_phyclk_mipidphy0_bitclkdiv2_user", "mout_disp0_mux_phyclk_mipidphy1_bitclkdiv2_user", "mout_disp0_mux_phyclk_mipidphy2_bitclkdiv2_user" };
+PNAME(mout_disp0_mux_sclk_disp0_hdmi_audio_p) = { "mout_disp0_mux_phyclk_hdmiphy_tmds_clko_user", "mout_disp0_mux_sclk_disp0_hdmi_audio_user" };
+
+static const struct samsung_mux_clock disp0_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_DISP0_MUX_DISP_PLL, "mout_disp0_mux_disp_pll", mout_disp0_mux_disp_pll_p,
+	    DISP0_MUX_DISP_PLL, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_ACLK_DISP0_0_400_USER, "mout_disp0_mux_aclk_disp0_0_400_user",
+	    mout_disp0_mux_aclk_disp0_0_400_user_p,
+	    DISP0_MUX_ACLK_DISP0_0_400_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_ACLK_DISP0_1_400_USER, "mout_disp0_mux_aclk_disp0_1_400_user",
+	    mout_disp0_mux_aclk_disp0_1_400_user_p,
+	    DISP0_MUX_ACLK_DISP0_1_400_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_SCLK_DISP0_DECON0_ECLK0_USER, "mout_disp0_mux_sclk_disp0_decon0_eclk0_user",
+	    mout_disp0_mux_sclk_disp0_decon0_eclk0_user_p,
+	    DISP0_MUX_SCLK_DISP0_DECON0_ECLK0_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_SCLK_DISP0_DECON0_VCLK0_USER, "mout_disp0_mux_sclk_disp0_decon0_vclk0_user",
+	    mout_disp0_mux_sclk_disp0_decon0_vclk0_user_p,
+	    DISP0_MUX_SCLK_DISP0_DECON0_VCLK0_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_SCLK_DISP0_DECON0_VCLK1_USER, "mout_disp0_mux_sclk_disp0_decon0_vclk1_user",
+	    mout_disp0_mux_sclk_disp0_decon0_vclk1_user_p,
+	    DISP0_MUX_SCLK_DISP0_DECON0_VCLK1_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_SCLK_DISP0_HDMI_AUDIO_USER, "mout_disp0_mux_sclk_disp0_hdmi_audio_user",
+	    mout_disp0_mux_sclk_disp0_hdmi_audio_user_p,
+	    DISP0_MUX_SCLK_DISP0_HDMI_AUDIO_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_PHYCLK_HDMIPHY_PIXEL_CLKO_USER, "mout_disp0_mux_phyclk_hdmiphy_pixel_clko_user",
+	    mout_disp0_mux_phyclk_hdmiphy_pixel_clko_user_p,
+	    DISP0_MUX_PHYCLK_HDMIPHY_PIXEL_CLKO_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_PHYCLK_HDMIPHY_TMDS_CLKO_USER, "mout_disp0_mux_phyclk_hdmiphy_tmds_clko_user",
+	    mout_disp0_mux_phyclk_hdmiphy_tmds_clko_user_p,
+	    DISP0_MUX_PHYCLK_HDMIPHY_TMDS_CLKO_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_PHYCLK_MIPIDPHY0_RXCLKESC0_USER, "mout_disp0_mux_phyclk_mipidphy0_rxclkesc0_user",
+	    mout_disp0_mux_phyclk_mipidphy0_rxclkesc0_user_p,
+	    DISP0_MUX_PHYCLK_MIPIDPHY0_RXCLKESC0_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_PHYCLK_MIPIDPHY0_BITCLKDIV2_USER, "mout_disp0_mux_phyclk_mipidphy0_bitclkdiv2_user",
+	    mout_disp0_mux_phyclk_mipidphy0_bitclkdiv2_user_p,
+	    DISP0_MUX_PHYCLK_MIPIDPHY0_BITCLKDIV2_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_PHYCLK_MIPIDPHY0_BITCLKDIV8_USER, "mout_disp0_mux_phyclk_mipidphy0_bitclkdiv8_user",
+	    mout_disp0_mux_phyclk_mipidphy0_bitclkdiv8_user_p,
+	    DISP0_MUX_PHYCLK_MIPIDPHY0_BITCLKDIV8_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_PHYCLK_MIPIDPHY1_RXCLKESC0_USER, "mout_disp0_mux_phyclk_mipidphy1_rxclkesc0_user",
+	    mout_disp0_mux_phyclk_mipidphy1_rxclkesc0_user_p,
+	    DISP0_MUX_PHYCLK_MIPIDPHY1_RXCLKESC0_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_PHYCLK_MIPIDPHY1_BITCLKDIV2_USER, "mout_disp0_mux_phyclk_mipidphy1_bitclkdiv2_user",
+	    mout_disp0_mux_phyclk_mipidphy1_bitclkdiv2_user_p,
+	    DISP0_MUX_PHYCLK_MIPIDPHY1_BITCLKDIV2_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_PHYCLK_MIPIDPHY1_BITCLKDIV8_USER, "mout_disp0_mux_phyclk_mipidphy1_bitclkdiv8_user",
+	    mout_disp0_mux_phyclk_mipidphy1_bitclkdiv8_user_p,
+	    DISP0_MUX_PHYCLK_MIPIDPHY1_BITCLKDIV8_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_PHYCLK_MIPIDPHY2_RXCLKESC0_USER, "mout_disp0_mux_phyclk_mipidphy2_rxclkesc0_user",
+	    mout_disp0_mux_phyclk_mipidphy2_rxclkesc0_user_p,
+	    DISP0_MUX_PHYCLK_MIPIDPHY2_RXCLKESC0_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_PHYCLK_MIPIDPHY2_BITCLKDIV2_USER, "mout_disp0_mux_phyclk_mipidphy2_bitclkdiv2_user",
+	    mout_disp0_mux_phyclk_mipidphy2_bitclkdiv2_user_p,
+	    DISP0_MUX_PHYCLK_MIPIDPHY2_BITCLKDIV2_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_PHYCLK_MIPIDPHY2_BITCLKDIV8_USER, "mout_disp0_mux_phyclk_mipidphy2_bitclkdiv8_user",
+	    mout_disp0_mux_phyclk_mipidphy2_bitclkdiv8_user_p,
+	    DISP0_MUX_PHYCLK_MIPIDPHY2_BITCLKDIV8_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_PHYCLK_DPPHY_CH0_TXD_CLK_USER, "mout_disp0_mux_phyclk_dpphy_ch0_txd_clk_user",
+	    mout_disp0_mux_phyclk_dpphy_ch0_txd_clk_user_p,
+	    DISP0_MUX_PHYCLK_DPPHY_CH0_TXD_CLK_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_PHYCLK_DPPHY_CH1_TXD_CLK_USER, "mout_disp0_mux_phyclk_dpphy_ch1_txd_clk_user",
+	    mout_disp0_mux_phyclk_dpphy_ch1_txd_clk_user_p,
+	    DISP0_MUX_PHYCLK_DPPHY_CH1_TXD_CLK_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_PHYCLK_DPPHY_CH2_TXD_CLK_USER, "mout_disp0_mux_phyclk_dpphy_ch2_txd_clk_user",
+	    mout_disp0_mux_phyclk_dpphy_ch2_txd_clk_user_p,
+	    DISP0_MUX_PHYCLK_DPPHY_CH2_TXD_CLK_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_PHYCLK_DPPHY_CH3_TXD_CLK_USER, "mout_disp0_mux_phyclk_dpphy_ch3_txd_clk_user",
+	    mout_disp0_mux_phyclk_dpphy_ch3_txd_clk_user_p,
+	    DISP0_MUX_PHYCLK_DPPHY_CH3_TXD_CLK_USER, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_ACLK_DISP0_1_400, "mout_disp0_mux_aclk_disp0_1_400",
+	    mout_disp0_mux_aclk_disp0_1_400_p,
+	    DISP0_MUX_ACLK_DISP0_1_400, 12, 1),
+	MUX(CLK_MOUT_DISP0_MUX_SCLK_DISP0_DECON0_ECLK0, "mout_disp0_mux_sclk_disp0_decon0_eclk0",
+	    mout_disp0_mux_sclk_disp0_decon0_eclk0_p,
+	    DISP0_MUX_SCLK_DISP0_DECON0_ECLK0, 12, 3),
+	MUX(CLK_MOUT_DISP0_MUX_SCLK_DISP0_DECON0_VCLK0, "mout_disp0_mux_sclk_disp0_decon0_vclk0",
+	    mout_disp0_mux_sclk_disp0_decon0_vclk0_p,
+	    DISP0_MUX_SCLK_DISP0_DECON0_VCLK0, 12, 3),
+	MUX(CLK_MOUT_DISP0_MUX_SCLK_DISP0_DECON0_VCLK1, "mout_disp0_mux_sclk_disp0_decon0_vclk1",
+	    mout_disp0_mux_sclk_disp0_decon0_vclk1_p,
+	    DISP0_MUX_SCLK_DISP0_DECON0_VCLK1, 12, 3),
+	MUX(CLK_MOUT_DISP0_MUX_SCLK_DISP0_HDMI_AUDIO, "mout_disp0_mux_sclk_disp0_hdmi_audio",
+	    mout_disp0_mux_sclk_disp0_hdmi_audio_p,
+	    DISP0_MUX_SCLK_DISP0_HDMI_AUDIO, 12, 1),
+};
+
+static const struct samsung_div_clock disp0_div_clks[] __initconst = {
+	DIV(CLK_DOUT_DISP0_DIV_PCLK_DISP0_0_133, "dout_disp0_div_pclk_disp0_0_133",
+	    "mout_disp0_mux_aclk_disp0_0_400_user",
+	    DISP0_DIV_PCLK_DISP0_0_133, 0, 3),
+	DIV(CLK_DOUT_DISP0_DIV_SCLK_DECON0_ECLK0, "dout_disp0_div_sclk_decon0_eclk0",
+	    "mout_disp0_mux_sclk_disp0_decon0_eclk0",
+	    DISP0_DIV_SCLK_DECON0_ECLK0, 0, 3),
+	DIV(CLK_DOUT_DISP0_DIV_SCLK_DECON0_VCLK0, "dout_disp0_div_sclk_decon0_vclk0",
+	    "mout_disp0_mux_sclk_disp0_decon0_vclk0",
+	    DISP0_DIV_SCLK_DECON0_VCLK0, 0, 3),
+	DIV(CLK_DOUT_DISP0_DIV_SCLK_DECON0_VCLK1, "dout_disp0_div_sclk_decon0_vclk1",
+	    "mout_disp0_mux_sclk_disp0_decon0_vclk1",
+	    DISP0_DIV_SCLK_DECON0_VCLK1, 0, 3),
+	DIV(CLK_DOUT_DISP0_DIV_PHYCLK_HDMIPHY_PIXEL_CLKO, "dout_disp0_div_phyclk_hdmiphy_pixel_clko",
+	    "mout_disp0_mux_phyclk_hdmiphy_pixel_clko_user",
+	    DISP0_DIV_PHYCLK_HDMIPHY_PIXEL_CLKO, 0, 1),
+	DIV(CLK_DOUT_DISP0_DIV_PHYCLK_HDMIPHY_TMDS_20B_CLKO, "dout_disp0_div_phyclk_hdmiphy_tmds_20b_clko",
+	    "mout_disp0_mux_phyclk_hdmiphy_tmds_clko_user",
+	    DISP0_DIV_PHYCLK_HDMIPHY_TMDS_20B_CLKO, 0, 1),
+};
+
+static const struct samsung_gate_clock disp0_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_DISP0_GATE_ACLK_PPMU_DISP0_0, "gout_disp0_gate_aclk_ppmu_disp0_0",
+	     "mout_disp0_mux_aclk_disp0_0_400_user",
+	     DISP0_GATE_ACLK_PPMU_DISP0_0, 5, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_ACLK_SMMU_DISP0_0, "gout_disp0_gate_aclk_smmu_disp0_0",
+	     "mout_disp0_mux_aclk_disp0_0_400_user",
+	     DISP0_GATE_ACLK_PPMU_DISP0_0, 3, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_ACLK_XIU_DISP0_0, "gout_disp0_gate_aclk_xiu_disp0_0",
+	     "mout_disp0_mux_aclk_disp0_0_400_user",
+	     DISP0_GATE_ACLK_PPMU_DISP0_0, 2, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_ACLK_LH_ASYNC_SI_R_TOP_DISP, "gout_disp0_gate_aclk_lh_async_si_r_top_disp",
+	     "mout_disp0_mux_aclk_disp0_0_400_user",
+	     DISP0_GATE_ACLK_PPMU_DISP0_0, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_ACLK_VPP0_ACLK_0, "gout_disp0_gate_aclk_vpp0_aclk_0",
+	     "mout_disp0_mux_aclk_disp0_0_400_user",
+	     DISP0_GATE_ACLK_PPMU_DISP0_0, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_ACLK_PPMU_DISP0_1, "gout_disp0_gate_aclk_ppmu_disp0_1",
+	     "mout_disp0_mux_aclk_disp0_1_400",
+	     DISP0_GATE_ACLK_PPMU_DISP0_1, 5, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_ACLK_SMMU_DISP0_1, "gout_disp0_gate_aclk_smmu_disp0_1",
+	     "mout_disp0_mux_aclk_disp0_1_400",
+	     DISP0_GATE_ACLK_PPMU_DISP0_1, 3, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_ACLK_XIU_DISP0_1, "gout_disp0_gate_aclk_xiu_disp0_1",
+	     "mout_disp0_mux_aclk_disp0_1_400",
+	     DISP0_GATE_ACLK_PPMU_DISP0_1, 2, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_ACLK_LH_ASYNC_SI_TOP_DISP, "gout_disp0_gate_aclk_lh_async_si_top_disp",
+	     "mout_disp0_mux_aclk_disp0_1_400",
+	     DISP0_GATE_ACLK_PPMU_DISP0_1, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_ACLK_VPP0_ACLK_1, "gout_disp0_gate_aclk_vpp0_aclk_1",
+	     "mout_disp0_mux_aclk_disp0_1_400",
+	     DISP0_GATE_ACLK_PPMU_DISP0_1, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_ACLK_SFW_DISP0_0, "gout_disp0_gate_aclk_sfw_disp0_0",
+	     "mout_disp0_mux_aclk_disp0_0_400_user",
+	     DISP0_GATE_ACLK_SFW_DISP0_0, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_ACLK_SFW_DISP0_1, "gout_disp0_gate_aclk_sfw_disp0_1",
+	     "mout_disp0_mux_aclk_disp0_1_400",
+	     DISP0_GATE_ACLK_SFW_DISP0_1, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_VPP0_1, "gout_disp0_gate_pclk_vpp0_1",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 19, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_SMMU_DISP0_1, "gout_disp0_gate_pclk_smmu_disp0_1",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 18, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_SMMU_DISP0_0, "gout_disp0_gate_pclk_smmu_disp0_0",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 17, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_PPMU_DISP0_1, "gout_disp0_gate_pclk_ppmu_disp0_1",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 16, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_PPMU_DISP0_0, "gout_disp0_gate_pclk_ppmu_disp0_0",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 15, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_HDMI_PHY, "gout_disp0_gate_pclk_hdmi_phy",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 14, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_DISP0_MUX, "gout_disp0_gate_pclk_disp0_mux",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 13, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_DP, "gout_disp0_gate_pclk_dp",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 12, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_HDMI_AUDIO, "gout_disp0_gate_pclk_hdmi_audio",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 11, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_HDMI, "gout_disp0_gate_pclk_hdmi",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 10, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_DSIM2, "gout_disp0_gate_pclk_dsim2",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 9, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_DSIM1, "gout_disp0_gate_pclk_dsim1",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 8, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_DSIM0, "gout_disp0_gate_pclk_dsim0",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 7, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_SYSREG_DISP0, "gout_disp0_gate_pclk_sysreg_disp0",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 6, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_PMU_DISP0, "gout_disp0_gate_pclk_pmu_disp0",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 5, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_CMU_DISP0, "gout_disp0_gate_pclk_cmu_disp0",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 4, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_DISP0_GATE_ACLK_XIU_DISP0SFRX, "gout_disp0_gate_aclk_xiu_disp0sfrx",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 3, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_ACLK_AXI2APB_DISP0_1P, "gout_disp0_gate_aclk_axi2apb_disp0_1p",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 2, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_ACLK_AXI2APB_DISP0_0P, "gout_disp0_gate_aclk_axi2apb_disp0_0p",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_ACLK_AXI_LH_ASYNC_MI_DISP0SFR, "gout_disp0_gate_aclk_axi_lh_async_mi_disp0sfr",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_1, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_HPM_APBIF_DISP0, "gout_disp0_gate_pclk_hpm_apbif_disp0",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_HPM_APBIF_DISP0, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_DECON0, "gout_disp0_gate_pclk_decon0",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_DECON0, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_VPP0_0, "gout_disp0_gate_pclk_vpp0_0",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_VPP0_0, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_SFW_DISP0_0, "gout_disp0_gate_pclk_sfw_disp0_0",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_SFW_DISP0_0, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PCLK_SFW_DISP0_1, "gout_disp0_gate_pclk_sfw_disp0_1",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_GATE_PCLK_SFW_DISP0_1, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_SCLK_DISP1_400, "gout_disp0_gate_sclk_disp1_400",
+	     "mout_disp0_mux_disp_pll",
+	     DISP0_GATE_SCLK_DISP1_400, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_SCLK_DECON0_ECLK0, "gout_disp0_gate_sclk_decon0_eclk0",
+	     "dout_disp0_div_sclk_decon0_eclk0",
+	     DISP0_GATE_SCLK_DECON0_ECLK0, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_SCLK_DECON0_VCLK0, "gout_disp0_gate_sclk_decon0_vclk0",
+	     "dout_disp0_div_sclk_decon0_vclk0",
+	     DISP0_GATE_SCLK_DECON0_VCLK0, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_SCLK_DECON0_VCLK1, "gout_disp0_gate_sclk_decon0_vclk1",
+	     "dout_disp0_div_sclk_decon0_vclk1",
+	     DISP0_GATE_SCLK_DECON0_VCLK1, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_SCLK_HDMI_AUDIO, "gout_disp0_gate_sclk_hdmi_audio",
+	     "mout_disp0_mux_sclk_disp0_hdmi_audio",
+	     DISP0_GATE_SCLK_HDMI_AUDIO, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_SCLK_PROMISE_DISP0, "gout_disp0_gate_sclk_promise_disp0",
+	     "gout_top_gate_sclk_promise_disp",
+	     DISP0_GATE_SCLK_PROMISE_DISP0, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PHYCLK_HDMIPHY_TMDS_20B_CLKO, "gout_disp0_gate_phyclk_hdmiphy_tmds_20b_clko",
+	     "dout_disp0_div_phyclk_hdmiphy_tmds_20b_clko",
+	     DISP0_GATE_PHYCLK_HDMIPHY_TMDS_20B_CLKO, 2, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PHYCLK_HDMIPHY_TMDS_10B_CLKO, "gout_disp0_gate_phyclk_hdmiphy_tmds_10b_clko",
+	     "mout_disp0_mux_phyclk_hdmiphy_tmds_clko_user",
+	     DISP0_GATE_PHYCLK_HDMIPHY_TMDS_20B_CLKO, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PHYCLK_HDMIPHY_PIXEL_CLKO, "gout_disp0_gate_phyclk_hdmiphy_pixel_clko",
+	     "dout_disp0_div_phyclk_hdmiphy_pixel_clko",
+	     DISP0_GATE_PHYCLK_HDMIPHY_TMDS_20B_CLKO, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PHYCLK_MIPIDPHY0_BITCLKDIV8, "gout_disp0_gate_phyclk_mipidphy0_bitclkdiv8",
+	     "mout_disp0_mux_phyclk_mipidphy0_bitclkdiv8_user",
+	     DISP0_GATE_PHYCLK_MIPIDPHY0_BITCLKDIV8, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PHYCLK_MIPIDPHY0_RXCLKESC0, "gout_disp0_gate_phyclk_mipidphy0_rxclkesc0",
+	     "mout_disp0_mux_phyclk_mipidphy0_rxclkesc0_user",
+	     DISP0_GATE_PHYCLK_MIPIDPHY0_BITCLKDIV8, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PHYCLK_MIPIDPHY1_BITCLKDIV8, "gout_disp0_gate_phyclk_mipidphy1_bitclkdiv8",
+	     "mout_disp0_mux_phyclk_mipidphy1_bitclkdiv8_user",
+	     DISP0_GATE_PHYCLK_MIPIDPHY1_BITCLKDIV8, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PHYCLK_MIPIDPHY1_RXCLKESC0, "gout_disp0_gate_phyclk_mipidphy1_rxclkesc0",
+	     "mout_disp0_mux_phyclk_mipidphy1_rxclkesc0_user",
+	     DISP0_GATE_PHYCLK_MIPIDPHY1_BITCLKDIV8, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PHYCLK_MIPIDPHY2_BITCLKDIV8, "gout_disp0_gate_phyclk_mipidphy2_bitclkdiv8",
+	     "mout_disp0_mux_phyclk_mipidphy2_bitclkdiv8_user",
+	     DISP0_GATE_PHYCLK_MIPIDPHY2_BITCLKDIV8, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PHYCLK_MIPIDPHY2_RXCLKESC0, "gout_disp0_gate_phyclk_mipidphy2_rxclkesc0",
+	     "mout_disp0_mux_phyclk_mipidphy2_rxclkesc0_user",
+	     DISP0_GATE_PHYCLK_MIPIDPHY2_BITCLKDIV8, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PHYCLK_DPPHY_CH3_TXD_CLK, "gout_disp0_gate_phyclk_dpphy_ch3_txd_clk",
+	     "mout_disp0_mux_phyclk_dpphy_ch3_txd_clk_user",
+	     DISP0_GATE_PHYCLK_DPPHY_CH3_TXD_CLK, 3, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PHYCLK_DPPHY_CH2_TXD_CLK, "gout_disp0_gate_phyclk_dpphy_ch2_txd_clk",
+	     "mout_disp0_mux_phyclk_dpphy_ch2_txd_clk_user",
+	     DISP0_GATE_PHYCLK_DPPHY_CH3_TXD_CLK, 2, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PHYCLK_DPPHY_CH1_TXD_CLK, "gout_disp0_gate_phyclk_dpphy_ch1_txd_clk",
+	     "mout_disp0_mux_phyclk_dpphy_ch1_txd_clk_user",
+	     DISP0_GATE_PHYCLK_DPPHY_CH3_TXD_CLK, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_PHYCLK_DPPHY_CH0_TXD_CLK, "gout_disp0_gate_phyclk_dpphy_ch0_txd_clk",
+	     "mout_disp0_mux_phyclk_dpphy_ch0_txd_clk_user",
+	     DISP0_GATE_PHYCLK_DPPHY_CH3_TXD_CLK, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_OSCCLK_I_MIPI_DPHY_M4S4_M_XI, "gout_disp0_gate_oscclk_i_mipi_dphy_m4s4_m_xi",
+	     "oscclk",
+	     DISP0_GATE_OSCCLK_I_MIPI_DPHY_M4S4_M_XI, 4, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_OSCCLK_I_MIPI_DPHY_M4S0_M_XI, "gout_disp0_gate_oscclk_i_mipi_dphy_m4s0_m_xi",
+	     "oscclk",
+	     DISP0_GATE_OSCCLK_I_MIPI_DPHY_M4S4_M_XI, 3, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_OSCCLK_I_MIPI_DPHY_M1S0_M_XI, "gout_disp0_gate_oscclk_i_mipi_dphy_m1s0_m_xi",
+	     "oscclk",
+	     DISP0_GATE_OSCCLK_I_MIPI_DPHY_M4S4_M_XI, 2, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_OSCCLK_I_DPTX_PHY_I_REF_CLK_24M, "gout_disp0_gate_oscclk_i_dptx_phy_i_ref_clk_24m",
+	     "oscclk",
+	     DISP0_GATE_OSCCLK_I_MIPI_DPHY_M4S4_M_XI, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_GATE_OSCCLK_DP_I_CLK_24M, "gout_disp0_gate_oscclk_dp_i_clk_24m",
+	     "oscclk",
+	     DISP0_GATE_OSCCLK_I_MIPI_DPHY_M4S4_M_XI, 0, 0, 0),
+	GATE(CLK_GOUT_DISP0_HWACG_DSIM0, "gout_disp0_hwacg_dsim0",
+	     "mout_disp0_mux_aclk_disp0_0_400_user",
+	     DISP0_HWACG_DSIM0, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_HWACG_DSIM1, "gout_disp0_hwacg_dsim1",
+	     "mout_disp0_mux_aclk_disp0_0_400_user",
+	     DISP0_HWACG_DSIM1, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_HWACG_DSIM2, "gout_disp0_hwacg_dsim2",
+	     "mout_disp0_mux_aclk_disp0_0_400_user",
+	     DISP0_HWACG_DSIM2, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_HWACG_HDMI, "gout_disp0_hwacg_hdmi",
+	     "mout_disp0_mux_aclk_disp0_0_400_user",
+	     DISP0_HWACG_HDMI, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_HWACG_HDMI_AUDIO, "gout_disp0_hwacg_hdmi_audio",
+	     "mout_disp0_mux_sclk_disp0_hdmi_audio",
+	     DISP0_HWACG_HDMI_AUDIO, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_HWACG_DP, "gout_disp0_hwacg_dp", "mout_disp0_mux_aclk_disp0_0_400_user",
+	     DISP0_HWACG_DP, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_HWACG_DISP0_MUX, "gout_disp0_hwacg_disp0_mux",
+	     "mout_disp0_mux_aclk_disp0_0_400_user",
+	     DISP0_HWACG_DISP0_MUX, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_HWACG_HDMI_PHY, "gout_disp0_hwacg_hdmi_phy",
+	     "mout_disp0_mux_aclk_disp0_0_400_user",
+	     DISP0_HWACG_HDMI_PHY, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_HWACG_DISP1_400, "gout_disp0_hwacg_disp1_400",
+	     "mout_disp0_mux_aclk_disp0_1_400",
+	     DISP0_HWACG_DISP1_400, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_HWACG_DECON0, "gout_disp0_hwacg_decon0",
+	     "mout_disp0_mux_aclk_disp0_0_400_user",
+	     DISP0_HWACG_DECON0, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_HWACG_HPM_APBIF_DISP0, "gout_disp0_hwacg_hpm_apbif_disp0",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP0_HWACG_HPM_APBIF_DISP0, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_HWACG_PROMISE_DISP0, "gout_disp0_hwacg_promise_disp0",
+	     "gout_top_gate_sclk_promise_int",
+	     DISP0_HWACG_PROMISE_DISP0, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_HWACG_DPTX_PHY, "gout_disp0_hwacg_dptx_phy", "oscclk",
+	     DISP0_HWACG_DPTX_PHY, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_HWACG_MIPI_DPHY_M1S0, "gout_disp0_hwacg_mipi_dphy_m1s0", "oscclk",
+	     DISP0_HWACG_MIPI_DPHY_M1S0, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_HWACG_MIPI_DPHY_M4S0, "gout_disp0_hwacg_mipi_dphy_m4s0", "oscclk",
+	     DISP0_HWACG_MIPI_DPHY_M4S0, 1, 0, 0),
+	GATE(CLK_GOUT_DISP0_HWACG_MIPI_DPHY_M4S4, "gout_disp0_hwacg_mipi_dphy_m4s4", "oscclk",
+	     DISP0_HWACG_MIPI_DPHY_M4S4, 1, 0, 0),
+};
+
+static const struct samsung_cmu_info disp0_cmu_info __initconst = {
+	.pll_clks		= disp0_pll_clks,
+	.nr_pll_clks		= ARRAY_SIZE(disp0_pll_clks),
+	.mux_clks		= disp0_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(disp0_mux_clks),
+	.div_clks		= disp0_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(disp0_div_clks),
+	.gate_clks		= disp0_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(disp0_gate_clks),
+	.fixed_clks		= disp0_fixed_clks,
+	.nr_fixed_clks		= ARRAY_SIZE(disp0_fixed_clks),
+	.nr_clk_ids		= CLKS_NR_DISP0,
+	.clk_regs		= disp0_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(disp0_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_disp0_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &disp0_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_disp0, "samsung,exynos8890-cmu-disp0",
+	       exynos8890_cmu_disp0_init);
+
+/* ---- CMU_DISP1 -------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_DISP1 (0x13f00000) */
+#define DISP1_MUX_ACLK_DISP1_0_400_USER			0x0200
+#define DISP1_MUX_ACLK_DISP1_1_400_USER			0x0204
+#define DISP1_MUX_SCLK_DISP1_DECON1_ECLK0_USER			0x0208
+#define DISP1_MUX_SCLK_DISP1_DECON1_ECLK1_USER			0x020c
+#define DISP1_MUX_SCLK_DISP1_600_USER			0x0210
+#define DISP1_MUX_PHYCLK_MIPIDPHY0_BITCLKDIV2_USER	0x0214
+#define DISP1_MUX_PHYCLK_MIPIDPHY1_BITCLKDIV2_USER	0x0218
+#define DISP1_MUX_PHYCLK_MIPIDPHY2_BITCLKDIV2_USER	0x021c
+#define DISP1_MUX_PHYCLK_DISP1_HDMIPHY_PIXEL_CLKO_USER	0x0220
+#define DISP1_MUX_ACLK_DISP1_1_400			0x0224
+#define DISP1_MUX_SCLK_DISP1_DECON1_ECLK0			0x0228
+#define DISP1_MUX_SCLK_DISP1_DECON1_ECLK1			0x022c
+#define DISP1_MUX_SCLK_DECON1_ECLK1			0x0230
+#define DISP1_DIV_PCLK_DISP1_0_133			0x0400
+#define DISP1_DIV_SCLK_DECON1_ECLK0			0x0404
+#define DISP1_DIV_SCLK_DECON1_ECLK1			0x0408
+#define DISP1_GATE_ACLK_XIU_DISP1X0			0x0800
+#define DISP1_GATE_ACLK_XIU_DISP1X1			0x0804
+#define DISP1_GATE_ACLK_SFW_DISP1_0			0x0808
+#define DISP1_GATE_ACLK_SFW_DISP1_1			0x080c
+#define DISP1_GATE_PCLK_VPP1_1			0x0820
+#define DISP1_GATE_PCLK_HPM_APBIF_DISP1			0x0824
+#define DISP1_GATE_PCLK_SFW_DISP1_0			0x0828
+#define DISP1_GATE_PCLK_SFW_DISP1_1			0x082c
+#define DISP1_GATE_SCLK_DECON1_ECLK_0			0x0840
+#define DISP1_GATE_SCLK_DECON1_ECLK_1			0x0844
+#define DISP1_GATE_SCLK_PROMISE_DISP1			0x0848
+#define DISP1_HWACG_DECON1_ECLK_0			0x240c
+#define DISP1_HWACG_DECON1_ECLK_1			0x2410
+#define DISP1_HWACG_HPM_APBIF_DISP1			0x241c
+#define DISP1_HWACG_PROMISE_DISP1			0x2420
+
+static const unsigned long disp1_clk_regs[] __initconst = {
+	DISP1_MUX_ACLK_DISP1_0_400_USER,
+	DISP1_MUX_ACLK_DISP1_1_400_USER,
+	DISP1_MUX_SCLK_DISP1_DECON1_ECLK0_USER,
+	DISP1_MUX_SCLK_DISP1_DECON1_ECLK1_USER,
+	DISP1_MUX_SCLK_DISP1_600_USER,
+	DISP1_MUX_PHYCLK_MIPIDPHY0_BITCLKDIV2_USER,
+	DISP1_MUX_PHYCLK_MIPIDPHY1_BITCLKDIV2_USER,
+	DISP1_MUX_PHYCLK_MIPIDPHY2_BITCLKDIV2_USER,
+	DISP1_MUX_PHYCLK_DISP1_HDMIPHY_PIXEL_CLKO_USER,
+	DISP1_MUX_ACLK_DISP1_1_400,
+	DISP1_MUX_SCLK_DISP1_DECON1_ECLK0,
+	DISP1_MUX_SCLK_DISP1_DECON1_ECLK1,
+	DISP1_MUX_SCLK_DECON1_ECLK1,
+	DISP1_DIV_PCLK_DISP1_0_133,
+	DISP1_DIV_SCLK_DECON1_ECLK0,
+	DISP1_DIV_SCLK_DECON1_ECLK1,
+	DISP1_GATE_ACLK_XIU_DISP1X0,
+	DISP1_GATE_ACLK_XIU_DISP1X1,
+	DISP1_GATE_ACLK_SFW_DISP1_0,
+	DISP1_GATE_ACLK_SFW_DISP1_1,
+	DISP1_GATE_PCLK_VPP1_1,
+	DISP1_GATE_PCLK_HPM_APBIF_DISP1,
+	DISP1_GATE_PCLK_SFW_DISP1_0,
+	DISP1_GATE_PCLK_SFW_DISP1_1,
+	DISP1_GATE_SCLK_DECON1_ECLK_0,
+	DISP1_GATE_SCLK_DECON1_ECLK_1,
+	DISP1_GATE_SCLK_PROMISE_DISP1,
+	DISP1_HWACG_DECON1_ECLK_0,
+	DISP1_HWACG_DECON1_ECLK_1,
+	DISP1_HWACG_HPM_APBIF_DISP1,
+	DISP1_HWACG_PROMISE_DISP1,
+};
+
+static const struct samsung_fixed_rate_clock disp1_fixed_clks[] __initconst = {
+	FRATE(CLK_PHYCLK_DISP1_HDMIPHY_PIXEL_CLKO_PHY, "phyclk_disp1_hdmiphy_pixel_clko_phy", NULL, 0, 0 * MHZ),
+};
+
+/* List of parent clocks for Muxes in CMU_DISP1 */
+PNAME(mout_disp1_mux_aclk_disp1_0_400_user_p) = { "oscclk", "gout_top_gate_aclk_disp1_0_400" };
+PNAME(mout_disp1_mux_aclk_disp1_1_400_user_p) = { "oscclk", "gout_top_gate_aclk_disp1_1_400" };
+PNAME(mout_disp1_mux_sclk_disp1_decon1_eclk0_user_p) = { "oscclk", "gout_top_gate_sclk_disp1_decon1_eclk0" };
+PNAME(mout_disp1_mux_sclk_disp1_decon1_eclk1_user_p) = { "oscclk", "gout_top_gate_sclk_disp1_decon1_eclk1" };
+PNAME(mout_disp1_mux_sclk_disp1_600_user_p) = { "oscclk", "gout_disp0_gate_sclk_disp1_400" };
+PNAME(mout_disp1_mux_phyclk_mipidphy0_bitclkdiv2_user_p) = { "oscclk", "phyclk_mipidphy0_bitclkdiv2_phy" };
+PNAME(mout_disp1_mux_phyclk_mipidphy1_bitclkdiv2_user_p) = { "oscclk", "phyclk_mipidphy1_bitclkdiv2_phy" };
+PNAME(mout_disp1_mux_phyclk_mipidphy2_bitclkdiv2_user_p) = { "oscclk", "phyclk_mipidphy2_bitclkdiv2_phy" };
+PNAME(mout_disp1_mux_phyclk_disp1_hdmiphy_pixel_clko_user_p) = { "oscclk", "phyclk_disp1_hdmiphy_pixel_clko_phy" };
+PNAME(mout_disp1_mux_aclk_disp1_1_400_p) = { "mout_disp1_mux_aclk_disp1_0_400_user", "mout_disp1_mux_aclk_disp1_1_400_user" };
+PNAME(mout_disp1_mux_sclk_disp1_decon1_eclk0_p) = { "mout_disp1_mux_sclk_disp1_decon1_eclk0_user", "oscclk", "mout_disp1_mux_sclk_disp1_600_user", "mout_disp1_mux_phyclk_mipidphy0_bitclkdiv2_user", "mout_disp1_mux_phyclk_mipidphy1_bitclkdiv2_user", "mout_disp1_mux_phyclk_mipidphy2_bitclkdiv2_user" };
+PNAME(mout_disp1_mux_sclk_disp1_decon1_eclk1_p) = { "mout_disp1_mux_sclk_disp1_decon1_eclk1_user", "oscclk", "mout_disp1_mux_sclk_disp1_600_user" };
+PNAME(mout_disp1_mux_sclk_decon1_eclk1_p) = { "dout_disp1_div_sclk_decon1_eclk1", "mout_disp1_mux_phyclk_disp1_hdmiphy_pixel_clko_user" };
+
+static const struct samsung_mux_clock disp1_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_DISP1_MUX_ACLK_DISP1_0_400_USER, "mout_disp1_mux_aclk_disp1_0_400_user",
+	    mout_disp1_mux_aclk_disp1_0_400_user_p,
+	    DISP1_MUX_ACLK_DISP1_0_400_USER, 12, 1),
+	MUX(CLK_MOUT_DISP1_MUX_ACLK_DISP1_1_400_USER, "mout_disp1_mux_aclk_disp1_1_400_user",
+	    mout_disp1_mux_aclk_disp1_1_400_user_p,
+	    DISP1_MUX_ACLK_DISP1_1_400_USER, 12, 1),
+	MUX(CLK_MOUT_DISP1_MUX_SCLK_DISP1_DECON1_ECLK0_USER, "mout_disp1_mux_sclk_disp1_decon1_eclk0_user",
+	    mout_disp1_mux_sclk_disp1_decon1_eclk0_user_p,
+	    DISP1_MUX_SCLK_DISP1_DECON1_ECLK0_USER, 12, 1),
+	MUX(CLK_MOUT_DISP1_MUX_SCLK_DISP1_DECON1_ECLK1_USER, "mout_disp1_mux_sclk_disp1_decon1_eclk1_user",
+	    mout_disp1_mux_sclk_disp1_decon1_eclk1_user_p,
+	    DISP1_MUX_SCLK_DISP1_DECON1_ECLK1_USER, 12, 1),
+	MUX(CLK_MOUT_DISP1_MUX_SCLK_DISP1_600_USER, "mout_disp1_mux_sclk_disp1_600_user",
+	    mout_disp1_mux_sclk_disp1_600_user_p,
+	    DISP1_MUX_SCLK_DISP1_600_USER, 12, 1),
+	MUX(CLK_MOUT_DISP1_MUX_PHYCLK_MIPIDPHY0_BITCLKDIV2_USER, "mout_disp1_mux_phyclk_mipidphy0_bitclkdiv2_user",
+	    mout_disp1_mux_phyclk_mipidphy0_bitclkdiv2_user_p,
+	    DISP1_MUX_PHYCLK_MIPIDPHY0_BITCLKDIV2_USER, 12, 1),
+	MUX(CLK_MOUT_DISP1_MUX_PHYCLK_MIPIDPHY1_BITCLKDIV2_USER, "mout_disp1_mux_phyclk_mipidphy1_bitclkdiv2_user",
+	    mout_disp1_mux_phyclk_mipidphy1_bitclkdiv2_user_p,
+	    DISP1_MUX_PHYCLK_MIPIDPHY1_BITCLKDIV2_USER, 12, 1),
+	MUX(CLK_MOUT_DISP1_MUX_PHYCLK_MIPIDPHY2_BITCLKDIV2_USER, "mout_disp1_mux_phyclk_mipidphy2_bitclkdiv2_user",
+	    mout_disp1_mux_phyclk_mipidphy2_bitclkdiv2_user_p,
+	    DISP1_MUX_PHYCLK_MIPIDPHY2_BITCLKDIV2_USER, 12, 1),
+	MUX(CLK_MOUT_DISP1_MUX_PHYCLK_DISP1_HDMIPHY_PIXEL_CLKO_USER, "mout_disp1_mux_phyclk_disp1_hdmiphy_pixel_clko_user",
+	    mout_disp1_mux_phyclk_disp1_hdmiphy_pixel_clko_user_p,
+	    DISP1_MUX_PHYCLK_DISP1_HDMIPHY_PIXEL_CLKO_USER, 12, 1),
+	MUX(CLK_MOUT_DISP1_MUX_ACLK_DISP1_1_400, "mout_disp1_mux_aclk_disp1_1_400",
+	    mout_disp1_mux_aclk_disp1_1_400_p,
+	    DISP1_MUX_ACLK_DISP1_1_400, 12, 1),
+	MUX(CLK_MOUT_DISP1_MUX_SCLK_DISP1_DECON1_ECLK0, "mout_disp1_mux_sclk_disp1_decon1_eclk0",
+	    mout_disp1_mux_sclk_disp1_decon1_eclk0_p,
+	    DISP1_MUX_SCLK_DISP1_DECON1_ECLK0, 12, 3),
+	MUX(CLK_MOUT_DISP1_MUX_SCLK_DISP1_DECON1_ECLK1, "mout_disp1_mux_sclk_disp1_decon1_eclk1",
+	    mout_disp1_mux_sclk_disp1_decon1_eclk1_p,
+	    DISP1_MUX_SCLK_DISP1_DECON1_ECLK1, 12, 2),
+	MUX(CLK_MOUT_DISP1_MUX_SCLK_DECON1_ECLK1, "mout_disp1_mux_sclk_decon1_eclk1",
+	    mout_disp1_mux_sclk_decon1_eclk1_p,
+	    DISP1_MUX_SCLK_DECON1_ECLK1, 12, 1),
+};
+
+static const struct samsung_div_clock disp1_div_clks[] __initconst = {
+	DIV(CLK_DOUT_DISP1_DIV_PCLK_DISP1_0_133, "dout_disp1_div_pclk_disp1_0_133",
+	    "mout_disp1_mux_aclk_disp1_0_400_user",
+	    DISP1_DIV_PCLK_DISP1_0_133, 0, 3),
+	DIV(CLK_DOUT_DISP1_DIV_SCLK_DECON1_ECLK0, "dout_disp1_div_sclk_decon1_eclk0",
+	    "mout_disp1_mux_sclk_disp1_decon1_eclk0",
+	    DISP1_DIV_SCLK_DECON1_ECLK0, 0, 3),
+	DIV(CLK_DOUT_DISP1_DIV_SCLK_DECON1_ECLK1, "dout_disp1_div_sclk_decon1_eclk1",
+	    "mout_disp1_mux_sclk_disp1_decon1_eclk1",
+	    DISP1_DIV_SCLK_DECON1_ECLK1, 0, 3),
+};
+
+static const struct samsung_gate_clock disp1_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_DISP1_GATE_ACLK_XIU_DISP1X0, "gout_disp1_gate_aclk_xiu_disp1x0",
+	     "mout_disp1_mux_aclk_disp1_0_400_user",
+	     DISP1_GATE_ACLK_XIU_DISP1X0, 5, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_ACLK_AXI_LH_ASYNC_SI_DISP1_0, "gout_disp1_gate_aclk_axi_lh_async_si_disp1_0",
+	     "mout_disp1_mux_aclk_disp1_0_400_user",
+	     DISP1_GATE_ACLK_XIU_DISP1X0, 4, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_ACLK_PPMU_DISP1_0, "gout_disp1_gate_aclk_ppmu_disp1_0",
+	     "mout_disp1_mux_aclk_disp1_0_400_user",
+	     DISP1_GATE_ACLK_XIU_DISP1X0, 3, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_ACLK_SMMU_DISP1_0, "gout_disp1_gate_aclk_smmu_disp1_0",
+	     "mout_disp1_mux_aclk_disp1_0_400_user",
+	     DISP1_GATE_ACLK_XIU_DISP1X0, 1, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_ACLK_VPP1_0, "gout_disp1_gate_aclk_vpp1_0",
+	     "mout_disp1_mux_aclk_disp1_0_400_user",
+	     DISP1_GATE_ACLK_XIU_DISP1X0, 0, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_ACLK_XIU_DISP1X1, "gout_disp1_gate_aclk_xiu_disp1x1",
+	     "mout_disp1_mux_aclk_disp1_1_400",
+	     DISP1_GATE_ACLK_XIU_DISP1X1, 6, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_ACLK_AXI_LH_ASYNC_SI_DISP1_1, "gout_disp1_gate_aclk_axi_lh_async_si_disp1_1",
+	     "mout_disp1_mux_aclk_disp1_1_400",
+	     DISP1_GATE_ACLK_XIU_DISP1X1, 5, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_ACLK_QE_DISP1_WDMA, "gout_disp1_gate_aclk_qe_disp1_wdma",
+	     "mout_disp1_mux_aclk_disp1_1_400",
+	     DISP1_GATE_ACLK_XIU_DISP1X1, 4, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_ACLK_PPMU_DISP1_1, "gout_disp1_gate_aclk_ppmu_disp1_1",
+	     "mout_disp1_mux_aclk_disp1_1_400",
+	     DISP1_GATE_ACLK_XIU_DISP1X1, 3, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_ACLK_SMMU_DISP1_1, "gout_disp1_gate_aclk_smmu_disp1_1",
+	     "mout_disp1_mux_aclk_disp1_1_400",
+	     DISP1_GATE_ACLK_XIU_DISP1X1, 1, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_ACLK_VPP1_1, "gout_disp1_gate_aclk_vpp1_1",
+	     "mout_disp1_mux_aclk_disp1_1_400",
+	     DISP1_GATE_ACLK_XIU_DISP1X1, 0, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_ACLK_SFW_DISP1_0, "gout_disp1_gate_aclk_sfw_disp1_0",
+	     "mout_disp1_mux_aclk_disp1_0_400_user",
+	     DISP1_GATE_ACLK_SFW_DISP1_0, 0, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_ACLK_SFW_DISP1_1, "gout_disp1_gate_aclk_sfw_disp1_1",
+	     "mout_disp1_mux_aclk_disp1_1_400",
+	     DISP1_GATE_ACLK_SFW_DISP1_1, 0, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_PCLK_VPP1_1, "gout_disp1_gate_pclk_vpp1_1",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_VPP1_1, 15, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_PCLK_DECON1_1, "gout_disp1_gate_pclk_decon1_1",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_VPP1_1, 14, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_PCLK_DECON1_0, "gout_disp1_gate_pclk_decon1_0",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_VPP1_1, 13, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_PCLK_QE_DISP1_WDMA, "gout_disp1_gate_pclk_qe_disp1_wdma",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_VPP1_1, 12, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_PCLK_PPMU_DISP1_1, "gout_disp1_gate_pclk_ppmu_disp1_1",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_VPP1_1, 11, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_PCLK_PPMU_DISP1_0, "gout_disp1_gate_pclk_ppmu_disp1_0",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_VPP1_1, 10, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_PCLK_SMMU_DISP1_1, "gout_disp1_gate_pclk_smmu_disp1_1",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_VPP1_1, 9, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_PCLK_SMMU_DISP1_0, "gout_disp1_gate_pclk_smmu_disp1_0",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_VPP1_1, 8, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_PCLK_SYSREG_DISP1, "gout_disp1_gate_pclk_sysreg_disp1",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_VPP1_1, 7, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_PCLK_PMU_DISP1, "gout_disp1_gate_pclk_pmu_disp1",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_VPP1_1, 6, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_PCLK_CMU_DISP1, "gout_disp1_gate_pclk_cmu_disp1",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_VPP1_1, 5, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_DISP1_GATE_PCLK_VPP1_0, "gout_disp1_gate_pclk_vpp1_0",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_VPP1_1, 4, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_ACLK_AXI2APB_DISP1_1X, "gout_disp1_gate_aclk_axi2apb_disp1_1x",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_VPP1_1, 3, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_ACLK_AXI2APB_DISP1_0X, "gout_disp1_gate_aclk_axi2apb_disp1_0x",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_VPP1_1, 2, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_ACLK_XIU_DISP1SFRX, "gout_disp1_gate_aclk_xiu_disp1sfrx",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_VPP1_1, 1, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_ACLK_AXI_LH_ASYNC_MI_DISP1SFR, "gout_disp1_gate_aclk_axi_lh_async_mi_disp1sfr",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_VPP1_1, 0, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_PCLK_HPM_APBIF_DISP1, "gout_disp1_gate_pclk_hpm_apbif_disp1",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_HPM_APBIF_DISP1, 0, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_PCLK_SFW_DISP1_0, "gout_disp1_gate_pclk_sfw_disp1_0",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_SFW_DISP1_0, 10, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_PCLK_SFW_DISP1_1, "gout_disp1_gate_pclk_sfw_disp1_1",
+	     "dout_disp1_div_pclk_disp1_0_133",
+	     DISP1_GATE_PCLK_SFW_DISP1_1, 11, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_SCLK_DECON1_ECLK_0, "gout_disp1_gate_sclk_decon1_eclk_0",
+	     "dout_disp1_div_sclk_decon1_eclk0",
+	     DISP1_GATE_SCLK_DECON1_ECLK_0, 0, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_SCLK_DECON1_ECLK_1, "gout_disp1_gate_sclk_decon1_eclk_1",
+	     "dout_disp1_div_sclk_decon1_eclk1",
+	     DISP1_GATE_SCLK_DECON1_ECLK_1, 0, 0, 0),
+	GATE(CLK_GOUT_DISP1_GATE_SCLK_PROMISE_DISP1, "gout_disp1_gate_sclk_promise_disp1",
+	     "gout_top_gate_sclk_promise_disp",
+	     DISP1_GATE_SCLK_PROMISE_DISP1, 0, 0, 0),
+	GATE(CLK_GOUT_DISP1_HWACG_DECON1_ECLK_0, "gout_disp1_hwacg_decon1_eclk_0",
+	     "dout_disp1_div_sclk_decon1_eclk0",
+	     DISP1_HWACG_DECON1_ECLK_0, 1, 0, 0),
+	GATE(CLK_GOUT_DISP1_HWACG_DECON1_ECLK_1, "gout_disp1_hwacg_decon1_eclk_1",
+	     "dout_disp1_div_sclk_decon1_eclk1",
+	     DISP1_HWACG_DECON1_ECLK_1, 1, 0, 0),
+	GATE(CLK_GOUT_DISP1_HWACG_HPM_APBIF_DISP1, "gout_disp1_hwacg_hpm_apbif_disp1",
+	     "dout_disp0_div_pclk_disp0_0_133",
+	     DISP1_HWACG_HPM_APBIF_DISP1, 1, 0, 0),
+	GATE(CLK_GOUT_DISP1_HWACG_PROMISE_DISP1, "gout_disp1_hwacg_promise_disp1",
+	     "gout_top_gate_sclk_promise_int",
+	     DISP1_HWACG_PROMISE_DISP1, 1, 0, 0),
+};
+
+static const struct samsung_cmu_info disp1_cmu_info __initconst = {
+	.mux_clks		= disp1_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(disp1_mux_clks),
+	.div_clks		= disp1_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(disp1_div_clks),
+	.gate_clks		= disp1_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(disp1_gate_clks),
+	.fixed_clks		= disp1_fixed_clks,
+	.nr_fixed_clks		= ARRAY_SIZE(disp1_fixed_clks),
+	.nr_clk_ids		= CLKS_NR_DISP1,
+	.clk_regs		= disp1_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(disp1_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_disp1_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &disp1_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_disp1, "samsung,exynos8890-cmu-disp1",
+	       exynos8890_cmu_disp1_init);
+
+/* ---- CMU_CAM0_LOCAL --------------------------------------------------*/
+
+/* Register Offset definitions for CMU_CAM0_LOCAL (0x140f0000) */
+#define CAM0_LOCAL_GATE_ACLK_BNS			0x0800
+#define CAM0_LOCAL_GATE_PCLK_BNS			0x0804
+#define CAM0_LOCAL_GATE_ACLK_CSIS1			0x080c
+#define CAM0_LOCAL_GATE_ACLK_CSIS2			0x0818
+#define CAM0_LOCAL_GATE_ACLK_CSIS3			0x081c
+#define CAM0_LOCAL_GATE_ACLK_3AA0			0x0828
+#define CAM0_LOCAL_GATE_PCLK_3AA0			0x082c
+#define CAM0_LOCAL_GATE_ACLK_3AA1			0x0830
+#define CAM0_LOCAL_GATE_PCLK_3AA1			0x0834
+#define CAM0_LOCAL_GATE_PCLK_CSIS1			0x083c
+
+static const unsigned long cam0_local_clk_regs[] __initconst = {
+	CAM0_LOCAL_GATE_ACLK_BNS,
+	CAM0_LOCAL_GATE_PCLK_BNS,
+	CAM0_LOCAL_GATE_ACLK_CSIS1,
+	CAM0_LOCAL_GATE_ACLK_CSIS2,
+	CAM0_LOCAL_GATE_ACLK_CSIS3,
+	CAM0_LOCAL_GATE_ACLK_3AA0,
+	CAM0_LOCAL_GATE_PCLK_3AA0,
+	CAM0_LOCAL_GATE_ACLK_3AA1,
+	CAM0_LOCAL_GATE_PCLK_3AA1,
+	CAM0_LOCAL_GATE_PCLK_CSIS1,
+};
+
+/* List of parent clocks for Muxes in CMU_CAM0_LOCAL */
+
+static const struct samsung_gate_clock cam0_local_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_CAM0_LOCAL_GATE_ACLK_BNS, "gout_cam0_local_gate_aclk_bns",
+	     "gout_cam0_gate_aclk_bns",
+	     CAM0_LOCAL_GATE_ACLK_BNS, 2, 0, 0),
+	GATE(CLK_GOUT_CAM0_LOCAL_GATE_ACLK_PXL_ASBS_CSIS2_int, "gout_cam0_local_gate_aclk_pxl_asbs_csis2_int",
+	     "gout_cam0_gate_aclk_pxl_asbs_csis2_int",
+	     CAM0_LOCAL_GATE_ACLK_BNS, 1, 0, 0),
+	GATE(CLK_GOUT_CAM0_LOCAL_GATE_ACLK_CSIS0, "gout_cam0_local_gate_aclk_csis0",
+	     "gout_cam0_gate_aclk_csis0",
+	     CAM0_LOCAL_GATE_ACLK_BNS, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_LOCAL_GATE_PCLK_BNS, "gout_cam0_local_gate_pclk_bns",
+	     "gout_cam0_gate_pclk_bns",
+	     CAM0_LOCAL_GATE_PCLK_BNS, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_LOCAL_GATE_ACLK_CSIS1, "gout_cam0_local_gate_aclk_csis1",
+	     "gout_cam0_gate_aclk_csis1",
+	     CAM0_LOCAL_GATE_ACLK_CSIS1, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_LOCAL_GATE_ACLK_CSIS2, "gout_cam0_local_gate_aclk_csis2",
+	     "gout_cam0_gate_aclk_csis2",
+	     CAM0_LOCAL_GATE_ACLK_CSIS2, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_LOCAL_GATE_ACLK_CSIS3, "gout_cam0_local_gate_aclk_csis3",
+	     "gout_cam0_gate_aclk_csis3",
+	     CAM0_LOCAL_GATE_ACLK_CSIS3, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_LOCAL_GATE_ACLK_3AA0, "gout_cam0_local_gate_aclk_3aa0",
+	     "gout_cam0_gate_aclk_3aa0",
+	     CAM0_LOCAL_GATE_ACLK_3AA0, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_LOCAL_GATE_PCLK_3AA0, "gout_cam0_local_gate_pclk_3aa0",
+	     "gout_cam0_gate_pclk_3aa0",
+	     CAM0_LOCAL_GATE_PCLK_3AA0, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_LOCAL_GATE_ACLK_3AA1, "gout_cam0_local_gate_aclk_3aa1",
+	     "gout_cam0_gate_aclk_3aa1",
+	     CAM0_LOCAL_GATE_ACLK_3AA1, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_LOCAL_GATE_PCLK_3AA1, "gout_cam0_local_gate_pclk_3aa1",
+	     "gout_cam0_gate_pclk_3aa1",
+	     CAM0_LOCAL_GATE_PCLK_3AA1, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_LOCAL_GATE_PCLK_CSIS1, "gout_cam0_local_gate_pclk_csis1",
+	     "gout_cam0_gate_pclk_csis1",
+	     CAM0_LOCAL_GATE_PCLK_CSIS1, 1, 0, 0),
+	GATE(CLK_GOUT_CAM0_LOCAL_GATE_PCLK_CSIS0, "gout_cam0_local_gate_pclk_csis0",
+	     "gout_cam0_gate_pclk_csis0",
+	     CAM0_LOCAL_GATE_PCLK_CSIS1, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info cam0_local_cmu_info __initconst = {
+	.gate_clks		= cam0_local_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(cam0_local_gate_clks),
+	.nr_clk_ids		= CLKS_NR_CAM0_LOCAL,
+	.clk_regs		= cam0_local_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(cam0_local_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_cam0_local_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &cam0_local_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_cam0_local, "samsung,exynos8890-cmu-cam0_local",
+	       exynos8890_cmu_cam0_local_init);
+
+/* ---- CMU_CAM0 --------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_CAM0 (0x144d0000) */
+#define CAM0_MUX_ACLK_CAM0_CSIS0_414_USER			0x0200
+#define CAM0_MUX_ACLK_CAM0_CSIS1_168_USER			0x0204
+#define CAM0_MUX_ACLK_CAM0_CSIS2_234_USER			0x0208
+#define CAM0_MUX_ACLK_CAM0_CSIS3_132_USER			0x020c
+#define CAM0_MUX_ACLK_CAM0_3AA0_414_USER			0x0214
+#define CAM0_MUX_ACLK_CAM0_3AA1_414_USER			0x0218
+#define CAM0_MUX_ACLK_CAM0_TREX_528_USER			0x021c
+#define CAM0_MUX_PHYCLK_RXBYTECLKHS0_CSIS0_USER			0x0220
+#define CAM0_MUX_PHYCLK_RXBYTECLKHS1_CSIS0_USER			0x0224
+#define CAM0_MUX_PHYCLK_RXBYTECLKHS2_CSIS0_USER			0x0228
+#define CAM0_MUX_PHYCLK_RXBYTECLKHS3_CSIS0_USER			0x022c
+#define CAM0_MUX_PHYCLK_RXBYTECLKHS0_CSIS1_USER			0x0230
+#define CAM0_MUX_PHYCLK_RXBYTECLKHS1_CSIS1_USER			0x0234
+#define CAM0_DIV_PCLK_CAM0_CSIS0_207			0x0400
+#define CAM0_DIV_PCLK_CAM0_3AA0_207			0x040c
+#define CAM0_DIV_PCLK_CAM0_3AA1_207			0x0410
+#define CAM0_DIV_PCLK_CAM0_TREX_264			0x0414
+#define CAM0_DIV_PCLK_CAM0_TREX_132			0x0418
+#define CAM0_GATE_ACLK_BNS			0x0800
+#define CAM0_GATE_PCLK_BNS			0x0804
+#define CAM0_GATE_ACLK_CSIS1			0x080c
+#define CAM0_GATE_ACLK_CSIS2			0x0818
+#define CAM0_GATE_ACLK_CSIS3			0x081c
+#define CAM0_GATE_ACLK_3AA0			0x0828
+#define CAM0_GATE_PCLK_3AA0			0x082c
+#define CAM0_GATE_ACLK_3AA1			0x0830
+#define CAM0_GATE_PCLK_3AA1			0x0834
+#define CAM0_GATE_ACLK_SFW110_IS_A			0x0838
+#define CAM0_GATE_PCLK_PMU_CAM0			0x083c
+#define CAM0_GATE_PCLK_XIUASYNC_MI_CAM0			0x0840
+#define CAM0_GATE_SCLK_PROMISE_CAM0			0x0844
+#define CAM0_GATE_PHYCLK_HS0_CSIS0_RX_BYTE			0x0848
+#define CAM0_GATE_PHYCLK_HS1_CSIS0_RX_BYTE			0x084c
+#define CAM0_GATE_PHYCLK_HS2_CSIS0_RX_BYTE			0x0850
+#define CAM0_GATE_PHYCLK_HS3_CSIS0_RX_BYTE			0x0854
+#define CAM0_GATE_PHYCLK_HS0_CSIS1_RX_BYTE			0x0858
+#define CAM0_GATE_PHYCLK_HS1_CSIS1_RX_BYTE			0x085c
+#define CAM0_GATE_PCLK_HPM_APBIF_CAM0			0x0860
+
+static const unsigned long cam0_clk_regs[] __initconst = {
+	CAM0_MUX_ACLK_CAM0_CSIS0_414_USER,
+	CAM0_MUX_ACLK_CAM0_CSIS1_168_USER,
+	CAM0_MUX_ACLK_CAM0_CSIS2_234_USER,
+	CAM0_MUX_ACLK_CAM0_CSIS3_132_USER,
+	CAM0_MUX_ACLK_CAM0_3AA0_414_USER,
+	CAM0_MUX_ACLK_CAM0_3AA1_414_USER,
+	CAM0_MUX_ACLK_CAM0_TREX_528_USER,
+	CAM0_MUX_PHYCLK_RXBYTECLKHS0_CSIS0_USER,
+	CAM0_MUX_PHYCLK_RXBYTECLKHS1_CSIS0_USER,
+	CAM0_MUX_PHYCLK_RXBYTECLKHS2_CSIS0_USER,
+	CAM0_MUX_PHYCLK_RXBYTECLKHS3_CSIS0_USER,
+	CAM0_MUX_PHYCLK_RXBYTECLKHS0_CSIS1_USER,
+	CAM0_MUX_PHYCLK_RXBYTECLKHS1_CSIS1_USER,
+	CAM0_DIV_PCLK_CAM0_CSIS0_207,
+	CAM0_DIV_PCLK_CAM0_3AA0_207,
+	CAM0_DIV_PCLK_CAM0_3AA1_207,
+	CAM0_DIV_PCLK_CAM0_TREX_264,
+	CAM0_DIV_PCLK_CAM0_TREX_132,
+	CAM0_GATE_ACLK_BNS,
+	CAM0_GATE_PCLK_BNS,
+	CAM0_GATE_ACLK_CSIS1,
+	CAM0_GATE_ACLK_CSIS2,
+	CAM0_GATE_ACLK_CSIS3,
+	CAM0_GATE_ACLK_3AA0,
+	CAM0_GATE_PCLK_3AA0,
+	CAM0_GATE_ACLK_3AA1,
+	CAM0_GATE_PCLK_3AA1,
+	CAM0_GATE_ACLK_SFW110_IS_A,
+	CAM0_GATE_PCLK_PMU_CAM0,
+	CAM0_GATE_PCLK_XIUASYNC_MI_CAM0,
+	CAM0_GATE_SCLK_PROMISE_CAM0,
+	CAM0_GATE_PHYCLK_HS0_CSIS0_RX_BYTE,
+	CAM0_GATE_PHYCLK_HS1_CSIS0_RX_BYTE,
+	CAM0_GATE_PHYCLK_HS2_CSIS0_RX_BYTE,
+	CAM0_GATE_PHYCLK_HS3_CSIS0_RX_BYTE,
+	CAM0_GATE_PHYCLK_HS0_CSIS1_RX_BYTE,
+	CAM0_GATE_PHYCLK_HS1_CSIS1_RX_BYTE,
+	CAM0_GATE_PCLK_HPM_APBIF_CAM0,
+};
+
+static const struct samsung_fixed_rate_clock cam0_fixed_clks[] __initconst = {
+	FRATE(CLK_PHYCLK_RXBYTECLKHS0_CSIS0, "phyclk_rxbyteclkhs0_csis0", NULL, 0, 250 * MHZ),
+	FRATE(CLK_PHYCLK_RXBYTECLKHS1_CSIS0, "phyclk_rxbyteclkhs1_csis0", NULL, 0, 250 * MHZ),
+	FRATE(CLK_PHYCLK_RXBYTECLKHS2_CSIS0, "phyclk_rxbyteclkhs2_csis0", NULL, 0, 250 * MHZ),
+	FRATE(CLK_PHYCLK_RXBYTECLKHS3_CSIS0, "phyclk_rxbyteclkhs3_csis0", NULL, 0, 250 * MHZ),
+	FRATE(CLK_PHYCLK_RXBYTECLKHS0_CSIS1, "phyclk_rxbyteclkhs0_csis1", NULL, 0, 250 * MHZ),
+	FRATE(CLK_PHYCLK_RXBYTECLKHS1_CSIS1, "phyclk_rxbyteclkhs1_csis1", NULL, 0, 250 * MHZ),
+};
+
+/* List of parent clocks for Muxes in CMU_CAM0 */
+PNAME(mout_cam0_mux_aclk_cam0_csis0_414_user_p) = { "oscclk", "gout_top_gate_aclk_cam0_csis0_414" };
+PNAME(mout_cam0_mux_aclk_cam0_csis1_168_user_p) = { "oscclk", "gout_top_gate_aclk_cam0_csis1_168" };
+PNAME(mout_cam0_mux_aclk_cam0_csis2_234_user_p) = { "oscclk", "gout_top_gate_aclk_cam0_csis2_234" };
+PNAME(mout_cam0_mux_aclk_cam0_csis3_132_user_p) = { "oscclk", "gout_top_gate_aclk_cam0_csis3_132" };
+PNAME(mout_cam0_mux_aclk_cam0_3aa0_414_user_p) = { "oscclk", "gout_top_gate_aclk_cam0_3aa0_414" };
+PNAME(mout_cam0_mux_aclk_cam0_3aa1_414_user_p) = { "oscclk", "gout_top_gate_aclk_cam0_3aa1_414" };
+PNAME(mout_cam0_mux_aclk_cam0_trex_528_user_p) = { "oscclk", "gout_top_gate_aclk_cam0_trex_528" };
+PNAME(mout_cam0_mux_phyclk_rxbyteclkhs0_csis0_user_p) = { "oscclk", "phyclk_rxbyteclkhs0_csis0" };
+PNAME(mout_cam0_mux_phyclk_rxbyteclkhs1_csis0_user_p) = { "oscclk", "phyclk_rxbyteclkhs1_csis0" };
+PNAME(mout_cam0_mux_phyclk_rxbyteclkhs2_csis0_user_p) = { "oscclk", "phyclk_rxbyteclkhs2_csis0" };
+PNAME(mout_cam0_mux_phyclk_rxbyteclkhs3_csis0_user_p) = { "oscclk", "phyclk_rxbyteclkhs3_csis0" };
+PNAME(mout_cam0_mux_phyclk_rxbyteclkhs0_csis1_user_p) = { "oscclk", "phyclk_rxbyteclkhs0_csis1" };
+PNAME(mout_cam0_mux_phyclk_rxbyteclkhs1_csis1_user_p) = { "oscclk", "phyclk_rxbyteclkhs1_csis1" };
+
+static const struct samsung_mux_clock cam0_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_CAM0_MUX_ACLK_CAM0_CSIS0_414_USER, "mout_cam0_mux_aclk_cam0_csis0_414_user",
+	    mout_cam0_mux_aclk_cam0_csis0_414_user_p,
+	    CAM0_MUX_ACLK_CAM0_CSIS0_414_USER, 12, 1),
+	MUX(CLK_MOUT_CAM0_MUX_ACLK_CAM0_CSIS1_168_USER, "mout_cam0_mux_aclk_cam0_csis1_168_user",
+	    mout_cam0_mux_aclk_cam0_csis1_168_user_p,
+	    CAM0_MUX_ACLK_CAM0_CSIS1_168_USER, 12, 1),
+	MUX(CLK_MOUT_CAM0_MUX_ACLK_CAM0_CSIS2_234_USER, "mout_cam0_mux_aclk_cam0_csis2_234_user",
+	    mout_cam0_mux_aclk_cam0_csis2_234_user_p,
+	    CAM0_MUX_ACLK_CAM0_CSIS2_234_USER, 12, 1),
+	MUX(CLK_MOUT_CAM0_MUX_ACLK_CAM0_CSIS3_132_USER, "mout_cam0_mux_aclk_cam0_csis3_132_user",
+	    mout_cam0_mux_aclk_cam0_csis3_132_user_p,
+	    CAM0_MUX_ACLK_CAM0_CSIS3_132_USER, 12, 1),
+	MUX(CLK_MOUT_CAM0_MUX_ACLK_CAM0_3AA0_414_USER, "mout_cam0_mux_aclk_cam0_3aa0_414_user",
+	    mout_cam0_mux_aclk_cam0_3aa0_414_user_p,
+	    CAM0_MUX_ACLK_CAM0_3AA0_414_USER, 12, 1),
+	MUX(CLK_MOUT_CAM0_MUX_ACLK_CAM0_3AA1_414_USER, "mout_cam0_mux_aclk_cam0_3aa1_414_user",
+	    mout_cam0_mux_aclk_cam0_3aa1_414_user_p,
+	    CAM0_MUX_ACLK_CAM0_3AA1_414_USER, 12, 1),
+	MUX(CLK_MOUT_CAM0_MUX_ACLK_CAM0_TREX_528_USER, "mout_cam0_mux_aclk_cam0_trex_528_user",
+	    mout_cam0_mux_aclk_cam0_trex_528_user_p,
+	    CAM0_MUX_ACLK_CAM0_TREX_528_USER, 12, 1),
+	MUX(CLK_MOUT_CAM0_MUX_PHYCLK_RXBYTECLKHS0_CSIS0_USER, "mout_cam0_mux_phyclk_rxbyteclkhs0_csis0_user",
+	    mout_cam0_mux_phyclk_rxbyteclkhs0_csis0_user_p,
+	    CAM0_MUX_PHYCLK_RXBYTECLKHS0_CSIS0_USER, 12, 1),
+	MUX(CLK_MOUT_CAM0_MUX_PHYCLK_RXBYTECLKHS1_CSIS0_USER, "mout_cam0_mux_phyclk_rxbyteclkhs1_csis0_user",
+	    mout_cam0_mux_phyclk_rxbyteclkhs1_csis0_user_p,
+	    CAM0_MUX_PHYCLK_RXBYTECLKHS1_CSIS0_USER, 12, 1),
+	MUX(CLK_MOUT_CAM0_MUX_PHYCLK_RXBYTECLKHS2_CSIS0_USER, "mout_cam0_mux_phyclk_rxbyteclkhs2_csis0_user",
+	    mout_cam0_mux_phyclk_rxbyteclkhs2_csis0_user_p,
+	    CAM0_MUX_PHYCLK_RXBYTECLKHS2_CSIS0_USER, 12, 1),
+	MUX(CLK_MOUT_CAM0_MUX_PHYCLK_RXBYTECLKHS3_CSIS0_USER, "mout_cam0_mux_phyclk_rxbyteclkhs3_csis0_user",
+	    mout_cam0_mux_phyclk_rxbyteclkhs3_csis0_user_p,
+	    CAM0_MUX_PHYCLK_RXBYTECLKHS3_CSIS0_USER, 12, 1),
+	MUX(CLK_MOUT_CAM0_MUX_PHYCLK_RXBYTECLKHS0_CSIS1_USER, "mout_cam0_mux_phyclk_rxbyteclkhs0_csis1_user",
+	    mout_cam0_mux_phyclk_rxbyteclkhs0_csis1_user_p,
+	    CAM0_MUX_PHYCLK_RXBYTECLKHS0_CSIS1_USER, 12, 1),
+	MUX(CLK_MOUT_CAM0_MUX_PHYCLK_RXBYTECLKHS1_CSIS1_USER, "mout_cam0_mux_phyclk_rxbyteclkhs1_csis1_user",
+	    mout_cam0_mux_phyclk_rxbyteclkhs1_csis1_user_p,
+	    CAM0_MUX_PHYCLK_RXBYTECLKHS1_CSIS1_USER, 12, 1),
+};
+
+static const struct samsung_div_clock cam0_div_clks[] __initconst = {
+	DIV(CLK_DOUT_CAM0_DIV_PCLK_CAM0_CSIS0_207, "dout_cam0_div_pclk_cam0_csis0_207",
+	    "mout_cam0_mux_aclk_cam0_csis0_414_user",
+	    CAM0_DIV_PCLK_CAM0_CSIS0_207, 0, 3),
+	DIV(CLK_DOUT_CAM0_DIV_PCLK_CAM0_3AA0_207, "dout_cam0_div_pclk_cam0_3aa0_207",
+	    "mout_cam0_mux_aclk_cam0_3aa0_414_user",
+	    CAM0_DIV_PCLK_CAM0_3AA0_207, 0, 3),
+	DIV(CLK_DOUT_CAM0_DIV_PCLK_CAM0_3AA1_207, "dout_cam0_div_pclk_cam0_3aa1_207",
+	    "mout_cam0_mux_aclk_cam0_3aa1_414_user",
+	    CAM0_DIV_PCLK_CAM0_3AA1_207, 0, 3),
+	DIV(CLK_DOUT_CAM0_DIV_PCLK_CAM0_TREX_264, "dout_cam0_div_pclk_cam0_trex_264",
+	    "mout_cam0_mux_aclk_cam0_trex_528_user",
+	    CAM0_DIV_PCLK_CAM0_TREX_264, 0, 3),
+	DIV(CLK_DOUT_CAM0_DIV_PCLK_CAM0_TREX_132, "dout_cam0_div_pclk_cam0_trex_132",
+	    "mout_cam0_mux_aclk_cam0_trex_528_user",
+	    CAM0_DIV_PCLK_CAM0_TREX_132, 0, 3),
+};
+
+static const struct samsung_gate_clock cam0_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_CAM0_GATE_ACLK_BNS, "gout_cam0_gate_aclk_bns",
+	     "mout_cam0_mux_aclk_cam0_csis0_414_user",
+	     CAM0_GATE_ACLK_BNS, 2, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_ACLK_PXL_ASBS_CSIS2_int, "gout_cam0_gate_aclk_pxl_asbs_csis2_int",
+	     "mout_cam0_mux_aclk_cam0_csis0_414_user",
+	     CAM0_GATE_ACLK_BNS, 1, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_ACLK_CSIS0, "gout_cam0_gate_aclk_csis0",
+	     "mout_cam0_mux_aclk_cam0_csis0_414_user",
+	     CAM0_GATE_ACLK_BNS, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PCLK_BNS, "gout_cam0_gate_pclk_bns",
+	     "dout_cam0_div_pclk_cam0_csis0_207",
+	     CAM0_GATE_PCLK_BNS, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_ACLK_CSIS1, "gout_cam0_gate_aclk_csis1",
+	     "mout_cam0_mux_aclk_cam0_csis1_168_user",
+	     CAM0_GATE_ACLK_CSIS1, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_ACLK_CSIS2, "gout_cam0_gate_aclk_csis2",
+	     "mout_cam0_mux_aclk_cam0_csis2_234_user",
+	     CAM0_GATE_ACLK_CSIS2, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_ACLK_CSIS3, "gout_cam0_gate_aclk_csis3",
+	     "mout_cam0_mux_aclk_cam0_csis3_132_user",
+	     CAM0_GATE_ACLK_CSIS3, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_ACLK_3AA0, "gout_cam0_gate_aclk_3aa0",
+	     "mout_cam0_mux_aclk_cam0_3aa0_414_user",
+	     CAM0_GATE_ACLK_3AA0, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PCLK_3AA0, "gout_cam0_gate_pclk_3aa0",
+	     "dout_cam0_div_pclk_cam0_3aa0_207",
+	     CAM0_GATE_PCLK_3AA0, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_ACLK_3AA1, "gout_cam0_gate_aclk_3aa1",
+	     "mout_cam0_mux_aclk_cam0_3aa1_414_user",
+	     CAM0_GATE_ACLK_3AA1, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PCLK_3AA1, "gout_cam0_gate_pclk_3aa1",
+	     "dout_cam0_div_pclk_cam0_3aa1_207",
+	     CAM0_GATE_PCLK_3AA1, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_ACLK_SFW110_IS_A, "gout_cam0_gate_aclk_sfw110_is_a",
+	     "mout_cam0_mux_aclk_cam0_trex_528_user",
+	     CAM0_GATE_ACLK_SFW110_IS_A, 3, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_ACLK_SysMMU6_IS_A, "gout_cam0_gate_aclk_sysmmu6_is_a",
+	     "mout_cam0_mux_aclk_cam0_trex_528_user",
+	     CAM0_GATE_ACLK_SFW110_IS_A, 2, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_ACLK_TREX_A_5x1_IS_A, "gout_cam0_gate_aclk_trex_a_5x1_is_a",
+	     "mout_cam0_mux_aclk_cam0_trex_528_user",
+	     CAM0_GATE_ACLK_SFW110_IS_A, 1, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_ACLK_LH_ASYNC_SI_CAM0, "gout_cam0_gate_aclk_lh_async_si_cam0",
+	     "mout_cam0_mux_aclk_cam0_trex_528_user",
+	     CAM0_GATE_ACLK_SFW110_IS_A, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PCLK_PMU_CAM0, "gout_cam0_gate_pclk_pmu_cam0",
+	     "dout_cam0_div_pclk_cam0_trex_264",
+	     CAM0_GATE_PCLK_PMU_CAM0, 6, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PCLK_SYSREG_CAM0, "gout_cam0_gate_pclk_sysreg_cam0",
+	     "dout_cam0_div_pclk_cam0_trex_264",
+	     CAM0_GATE_PCLK_PMU_CAM0, 5, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_ACLK_LH_ASYNC_MI_CAM0, "gout_cam0_gate_aclk_lh_async_mi_cam0",
+	     "dout_cam0_div_pclk_cam0_trex_264",
+	     CAM0_GATE_PCLK_PMU_CAM0, 4, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_ACLK_XIUASYNC_MI_CAM0, "gout_cam0_gate_aclk_xiuasync_mi_cam0",
+	     "dout_cam0_div_pclk_cam0_trex_264",
+	     CAM0_GATE_PCLK_PMU_CAM0, 3, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PCLK_CAM0, "gout_cam0_gate_pclk_cam0",
+	     "dout_cam0_div_pclk_cam0_trex_264",
+	     CAM0_GATE_PCLK_PMU_CAM0, 2, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PCLK_CSIS1, "gout_cam0_gate_pclk_csis1",
+	     "dout_cam0_div_pclk_cam0_trex_264",
+	     CAM0_GATE_PCLK_PMU_CAM0, 1, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PCLK_CSIS0, "gout_cam0_gate_pclk_csis0",
+	     "dout_cam0_div_pclk_cam0_trex_264",
+	     CAM0_GATE_PCLK_PMU_CAM0, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PCLK_XIUASYNC_MI_CAM0, "gout_cam0_gate_pclk_xiuasync_mi_cam0",
+	     "dout_cam0_div_pclk_cam0_trex_132",
+	     CAM0_GATE_PCLK_XIUASYNC_MI_CAM0, 3, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PCLK_TREX_A_5x1_IS_A, "gout_cam0_gate_pclk_trex_a_5x1_is_a",
+	     "dout_cam0_div_pclk_cam0_trex_264",
+	     CAM0_GATE_PCLK_PMU_CAM0, 7, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PCLK_SysMMU6_IS_A, "gout_cam0_gate_pclk_sysmmu6_is_a",
+	     "dout_cam0_div_pclk_cam0_trex_132",
+	     CAM0_GATE_PCLK_XIUASYNC_MI_CAM0, 1, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PCLK_SFW110_IS_A_IS_A, "gout_cam0_gate_pclk_sfw110_is_a_is_a",
+	     "dout_cam0_div_pclk_cam0_trex_132",
+	     CAM0_GATE_PCLK_XIUASYNC_MI_CAM0, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_SCLK_PROMISE_CAM0, "gout_cam0_gate_sclk_promise_cam0",
+	     "gout_top_gate_sclk_promise_disp",
+	     CAM0_GATE_SCLK_PROMISE_CAM0, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PHYCLK_HS0_CSIS0_RX_BYTE, "gout_cam0_gate_phyclk_hs0_csis0_rx_byte",
+	     "mout_cam0_mux_phyclk_rxbyteclkhs0_csis0_user",
+	     CAM0_GATE_PHYCLK_HS0_CSIS0_RX_BYTE, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PHYCLK_HS1_CSIS0_RX_BYTE, "gout_cam0_gate_phyclk_hs1_csis0_rx_byte",
+	     "mout_cam0_mux_phyclk_rxbyteclkhs1_csis0_user",
+	     CAM0_GATE_PHYCLK_HS1_CSIS0_RX_BYTE, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PHYCLK_HS2_CSIS0_RX_BYTE, "gout_cam0_gate_phyclk_hs2_csis0_rx_byte",
+	     "mout_cam0_mux_phyclk_rxbyteclkhs2_csis0_user",
+	     CAM0_GATE_PHYCLK_HS2_CSIS0_RX_BYTE, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PHYCLK_HS3_CSIS0_RX_BYTE, "gout_cam0_gate_phyclk_hs3_csis0_rx_byte",
+	     "mout_cam0_mux_phyclk_rxbyteclkhs3_csis0_user",
+	     CAM0_GATE_PHYCLK_HS3_CSIS0_RX_BYTE, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PHYCLK_HS0_CSIS1_RX_BYTE, "gout_cam0_gate_phyclk_hs0_csis1_rx_byte",
+	     "mout_cam0_mux_phyclk_rxbyteclkhs0_csis1_user",
+	     CAM0_GATE_PHYCLK_HS0_CSIS1_RX_BYTE, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PHYCLK_HS1_CSIS1_RX_BYTE, "gout_cam0_gate_phyclk_hs1_csis1_rx_byte",
+	     "mout_cam0_mux_phyclk_rxbyteclkhs1_csis1_user",
+	     CAM0_GATE_PHYCLK_HS1_CSIS1_RX_BYTE, 0, 0, 0),
+	GATE(CLK_GOUT_CAM0_GATE_PCLK_HPM_APBIF_CAM0, "gout_cam0_gate_pclk_hpm_apbif_cam0",
+	     "dout_cam0_div_pclk_cam0_trex_264",
+	     CAM0_GATE_PCLK_HPM_APBIF_CAM0, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info cam0_cmu_info __initconst = {
+	.mux_clks		= cam0_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(cam0_mux_clks),
+	.div_clks		= cam0_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(cam0_div_clks),
+	.gate_clks		= cam0_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(cam0_gate_clks),
+	.fixed_clks		= cam0_fixed_clks,
+	.nr_fixed_clks		= ARRAY_SIZE(cam0_fixed_clks),
+	.nr_clk_ids		= CLKS_NR_CAM0,
+	.clk_regs		= cam0_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(cam0_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_cam0_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &cam0_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_cam0, "samsung,exynos8890-cmu-cam0",
+	       exynos8890_cmu_cam0_init);
+
+/* ---- CMU_CAM1_LOCAL --------------------------------------------------*/
+
+/* Register Offset definitions for CMU_CAM1_LOCAL (0x141f0000) */
+#define CAM1_LOCAL_GATE_ACLK_VRA			0x0808
+#define CAM1_LOCAL_GATE_PCLK_VRA			0x080c
+#define CAM1_LOCAL_GATE_PCLK_CSIS3			0x0814
+#define CAM1_LOCAL_GATE_PCLK_WDT			0x081c
+#define CAM1_LOCAL_GATE_ACLK_CSIS2			0x0820
+#define CAM1_LOCAL_GATE_ACLK_CSIS3			0x0828
+#define CAM1_LOCAL_GATE_ACLK_MC_SC			0x0830
+
+static const unsigned long cam1_local_clk_regs[] __initconst = {
+	CAM1_LOCAL_GATE_ACLK_VRA,
+	CAM1_LOCAL_GATE_PCLK_VRA,
+	CAM1_LOCAL_GATE_PCLK_CSIS3,
+	CAM1_LOCAL_GATE_PCLK_WDT,
+	CAM1_LOCAL_GATE_ACLK_CSIS2,
+	CAM1_LOCAL_GATE_ACLK_CSIS3,
+	CAM1_LOCAL_GATE_ACLK_MC_SC,
+};
+
+/* List of parent clocks for Muxes in CMU_CAM1_LOCAL */
+
+static const struct samsung_gate_clock cam1_local_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_CAM1_LOCAL_GATE_ACLK_VRA, "gout_cam1_local_gate_aclk_vra",
+	     "gout_cam1_gate_aclk_vra",
+	     CAM1_LOCAL_GATE_ACLK_VRA, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_LOCAL_GATE_PCLK_VRA, "gout_cam1_local_gate_pclk_vra",
+	     "gout_cam1_gate_pclk_vra",
+	     CAM1_LOCAL_GATE_PCLK_VRA, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_LOCAL_GATE_PCLK_CSIS3, "gout_cam1_local_gate_pclk_csis3",
+	     "gout_cam1_gate_pclk_csis3",
+	     CAM1_LOCAL_GATE_PCLK_CSIS3, 4, 0, 0),
+	GATE(CLK_GOUT_CAM1_LOCAL_GATE_PCLK_CSIS2, "gout_cam1_local_gate_pclk_csis2",
+	     "gout_cam1_gate_pclk_csis2",
+	     CAM1_LOCAL_GATE_PCLK_CSIS3, 3, 0, 0),
+	GATE(CLK_GOUT_CAM1_LOCAL_GATE_PCLK_WDT, "gout_cam1_local_gate_pclk_wdt",
+	     "gout_cam1_gate_pclk_wdt",
+	     CAM1_LOCAL_GATE_PCLK_WDT, 11, 0, 0),
+	GATE(CLK_GOUT_CAM1_LOCAL_GATE_PCLK_UART, "gout_cam1_local_gate_pclk_uart",
+	     "gout_cam1_gate_pclk_uart",
+	     CAM1_LOCAL_GATE_PCLK_WDT, 10, 0, 0),
+	GATE(CLK_GOUT_CAM1_LOCAL_GATE_PCLK_SPI1, "gout_cam1_local_gate_pclk_spi1",
+	     "gout_cam1_gate_pclk_spi1",
+	     CAM1_LOCAL_GATE_PCLK_WDT, 9, 0, 0),
+	GATE(CLK_GOUT_CAM1_LOCAL_GATE_PCLK_SPI0, "gout_cam1_local_gate_pclk_spi0",
+	     "gout_cam1_gate_pclk_spi0",
+	     CAM1_LOCAL_GATE_PCLK_WDT, 8, 0, 0),
+	GATE(CLK_GOUT_CAM1_LOCAL_GATE_PCLK_PWM, "gout_cam1_local_gate_pclk_pwm",
+	     "gout_cam1_gate_pclk_pwm",
+	     CAM1_LOCAL_GATE_PCLK_WDT, 7, 0, 0),
+	GATE(CLK_GOUT_CAM1_LOCAL_GATE_PCLK_MCUCTL, "gout_cam1_local_gate_pclk_mcuctl",
+	     "gout_cam1_gate_pclk_mcuctl",
+	     CAM1_LOCAL_GATE_PCLK_WDT, 6, 0, 0),
+	GATE(CLK_GOUT_CAM1_LOCAL_GATE_PCLK_I2C3, "gout_cam1_local_gate_pclk_i2c3",
+	     "gout_cam1_gate_pclk_i2c3",
+	     CAM1_LOCAL_GATE_PCLK_WDT, 5, 0, 0),
+	GATE(CLK_GOUT_CAM1_LOCAL_GATE_PCLK_I2C2, "gout_cam1_local_gate_pclk_i2c2",
+	     "gout_cam1_gate_pclk_i2c2",
+	     CAM1_LOCAL_GATE_PCLK_WDT, 4, 0, 0),
+	GATE(CLK_GOUT_CAM1_LOCAL_GATE_PCLK_I2C1, "gout_cam1_local_gate_pclk_i2c1",
+	     "gout_cam1_gate_pclk_i2c1",
+	     CAM1_LOCAL_GATE_PCLK_WDT, 3, 0, 0),
+	GATE(CLK_GOUT_CAM1_LOCAL_GATE_PCLK_I2C0, "gout_cam1_local_gate_pclk_i2c0",
+	     "gout_cam1_gate_pclk_i2c0",
+	     CAM1_LOCAL_GATE_PCLK_WDT, 2, 0, 0),
+	GATE(CLK_GOUT_CAM1_LOCAL_GATE_ACLK_PDMA, "gout_cam1_local_gate_aclk_pdma",
+	     "gout_cam1_gate_aclk_pdma",
+	     CAM1_LOCAL_GATE_PCLK_WDT, 1, 0, 0),
+	GATE(CLK_GOUT_CAM1_LOCAL_GATE_ACLK_CSIS2, "gout_cam1_local_gate_aclk_csis2",
+	     "gout_cam1_gate_aclk_csis2",
+	     CAM1_LOCAL_GATE_ACLK_CSIS2, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_LOCAL_GATE_ACLK_CSIS3, "gout_cam1_local_gate_aclk_csis3",
+	     "gout_cam1_gate_aclk_csis3",
+	     CAM1_LOCAL_GATE_ACLK_CSIS3, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_LOCAL_GATE_ACLK_MC_SC, "gout_cam1_local_gate_aclk_mc_sc",
+	     "gout_cam1_gate_aclk_mc_sc",
+	     CAM1_LOCAL_GATE_ACLK_MC_SC, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info cam1_local_cmu_info __initconst = {
+	.gate_clks		= cam1_local_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(cam1_local_gate_clks),
+	.nr_clk_ids		= CLKS_NR_CAM1_LOCAL,
+	.clk_regs		= cam1_local_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(cam1_local_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_cam1_local_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &cam1_local_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_cam1_local, "samsung,exynos8890-cmu-cam1_local",
+	       exynos8890_cmu_cam1_local_init);
+
+/* ---- CMU_CAM1 --------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_CAM1 (0x145d0000) */
+#define CAM1_MUX_ACLK_CAM1_ARM_672_USER			0x0200
+#define CAM1_MUX_ACLK_CAM1_TREX_VRA_528_USER			0x0204
+#define CAM1_MUX_ACLK_CAM1_TREX_B_528_USER			0x0208
+#define CAM1_MUX_ACLK_CAM1_BUS_264_USER			0x020c
+#define CAM1_MUX_ACLK_CAM1_PERI_84_USER			0x0210
+#define CAM1_MUX_ACLK_CAM1_CSIS2_414_USER			0x0214
+#define CAM1_MUX_ACLK_CAM1_CSIS3_132_USER			0x0218
+#define CAM1_MUX_ACLK_CAM1_SCL_566_USER			0x021c
+#define CAM1_MUX_SCLK_CAM1_ISP_SPI0_USER			0x0220
+#define CAM1_MUX_SCLK_CAM1_ISP_SPI1_USER			0x0224
+#define CAM1_MUX_SCLK_CAM1_ISP_UART_USER			0x0228
+#define CAM1_MUX_PHYCLK_RXBYTECLKHS0_CSIS2_USER			0x022c
+#define CAM1_MUX_PHYCLK_RXBYTECLKHS1_CSIS2_USER			0x0230
+#define CAM1_MUX_PHYCLK_RXBYTECLKHS2_CSIS2_USER			0x0234
+#define CAM1_MUX_PHYCLK_RXBYTECLKHS3_CSIS2_USER			0x0238
+#define CAM1_MUX_PHYCLK_RXBYTECLKHS0_CSIS3_USER			0x023c
+#define CAM1_DIV_PCLK_CAM1_ARM_168			0x0400
+#define CAM1_DIV_PCLK_CAM1_TREX_VRA_264			0x0408
+#define CAM1_DIV_PCLK_CAM1_BUS_132			0x040c
+#define CAM1_GATE_ACLK_ARM			0x0800
+#define CAM1_GATE_PCLK_ARM			0x0804
+#define CAM1_GATE_ACLK_SMMU_VRA			0x0808
+#define CAM1_GATE_PCLK_VRA			0x080c
+#define CAM1_GATE_ACLK_LH_SI			0x0810
+#define CAM1_GATE_ACLK_LH_MI			0x0814
+#define CAM1_GATE_PCLK_CMU_LOCAL			0x0818
+#define CAM1_GATE_PCLK_WDT			0x081c
+#define CAM1_GATE_ACLK_CSIS2			0x0820
+#define CAM1_GATE_ACLK_CSIS3			0x0828
+#define CAM1_GATE_ACLK_SMMU_MC_SC			0x0830
+#define CAM1_GATE_PCLK_SMMU_MC_SC			0x083c
+#define CAM1_GATE_SCLK_ISP_PERI_IS_B_SPI0_EXT_CLK_ISP	0x0840
+#define CAM1_GATE_SCLK_ISP_PERI_IS_B_SPI1_EXT_CLK_ISP	0x0844
+#define CAM1_GATE_SCLK_ISP_PERI_IS_B_UART_EXT_CLK_ISP	0x0848
+#define CAM1_GATE_SCLK_CAM1_ISP_IS_B_OSCCLK_I2C3_ISP	0x084c
+#define CAM1_GATE_PHYCLK_HS0_CSIS2_RX_BYTE			0x0850
+#define CAM1_GATE_PHYCLK_HS1_CSIS2_RX_BYTE			0x0854
+#define CAM1_GATE_PHYCLK_HS2_CSIS2_RX_BYTE			0x0858
+#define CAM1_GATE_PHYCLK_HS3_CSIS2_RX_BYTE			0x085c
+#define CAM1_GATE_PHYCLK_HS0_CSIS3_RX_BYTE			0x0860
+
+static const unsigned long cam1_clk_regs[] __initconst = {
+	CAM1_MUX_ACLK_CAM1_ARM_672_USER,
+	CAM1_MUX_ACLK_CAM1_TREX_VRA_528_USER,
+	CAM1_MUX_ACLK_CAM1_TREX_B_528_USER,
+	CAM1_MUX_ACLK_CAM1_BUS_264_USER,
+	CAM1_MUX_ACLK_CAM1_PERI_84_USER,
+	CAM1_MUX_ACLK_CAM1_CSIS2_414_USER,
+	CAM1_MUX_ACLK_CAM1_CSIS3_132_USER,
+	CAM1_MUX_ACLK_CAM1_SCL_566_USER,
+	CAM1_MUX_SCLK_CAM1_ISP_SPI0_USER,
+	CAM1_MUX_SCLK_CAM1_ISP_SPI1_USER,
+	CAM1_MUX_SCLK_CAM1_ISP_UART_USER,
+	CAM1_MUX_PHYCLK_RXBYTECLKHS0_CSIS2_USER,
+	CAM1_MUX_PHYCLK_RXBYTECLKHS1_CSIS2_USER,
+	CAM1_MUX_PHYCLK_RXBYTECLKHS2_CSIS2_USER,
+	CAM1_MUX_PHYCLK_RXBYTECLKHS3_CSIS2_USER,
+	CAM1_MUX_PHYCLK_RXBYTECLKHS0_CSIS3_USER,
+	CAM1_DIV_PCLK_CAM1_ARM_168,
+	CAM1_DIV_PCLK_CAM1_TREX_VRA_264,
+	CAM1_DIV_PCLK_CAM1_BUS_132,
+	CAM1_GATE_ACLK_ARM,
+	CAM1_GATE_PCLK_ARM,
+	CAM1_GATE_ACLK_SMMU_VRA,
+	CAM1_GATE_PCLK_VRA,
+	CAM1_GATE_ACLK_LH_SI,
+	CAM1_GATE_ACLK_LH_MI,
+	CAM1_GATE_PCLK_CMU_LOCAL,
+	CAM1_GATE_PCLK_WDT,
+	CAM1_GATE_ACLK_CSIS2,
+	CAM1_GATE_ACLK_CSIS3,
+	CAM1_GATE_ACLK_SMMU_MC_SC,
+	CAM1_GATE_PCLK_SMMU_MC_SC,
+	CAM1_GATE_SCLK_ISP_PERI_IS_B_SPI0_EXT_CLK_ISP,
+	CAM1_GATE_SCLK_ISP_PERI_IS_B_SPI1_EXT_CLK_ISP,
+	CAM1_GATE_SCLK_ISP_PERI_IS_B_UART_EXT_CLK_ISP,
+	CAM1_GATE_SCLK_CAM1_ISP_IS_B_OSCCLK_I2C3_ISP,
+	CAM1_GATE_PHYCLK_HS0_CSIS2_RX_BYTE,
+	CAM1_GATE_PHYCLK_HS1_CSIS2_RX_BYTE,
+	CAM1_GATE_PHYCLK_HS2_CSIS2_RX_BYTE,
+	CAM1_GATE_PHYCLK_HS3_CSIS2_RX_BYTE,
+	CAM1_GATE_PHYCLK_HS0_CSIS3_RX_BYTE,
+};
+
+static const struct samsung_fixed_rate_clock cam1_fixed_clks[] __initconst = {
+	FRATE(CLK_PHYCLK_RXBYTECLKHS0_CSIS2, "phyclk_rxbyteclkhs0_csis2", NULL, 0, 250 * MHZ),
+	FRATE(CLK_PHYCLK_RXBYTECLKHS1_CSIS2, "phyclk_rxbyteclkhs1_csis2", NULL, 0, 250 * MHZ),
+	FRATE(CLK_PHYCLK_RXBYTECLKHS2_CSIS2, "phyclk_rxbyteclkhs2_csis2", NULL, 0, 250 * MHZ),
+	FRATE(CLK_PHYCLK_RXBYTECLKHS3_CSIS2, "phyclk_rxbyteclkhs3_csis2", NULL, 0, 250 * MHZ),
+	FRATE(CLK_PHYCLK_RXBYTECLKHS0_CSIS3, "phyclk_rxbyteclkhs0_csis3", NULL, 0, 250 * MHZ),
+};
+
+/* List of parent clocks for Muxes in CMU_CAM1 */
+PNAME(mout_cam1_mux_aclk_cam1_arm_672_user_p) = { "oscclk", "gout_top_gate_aclk_cam1_arm_672" };
+PNAME(mout_cam1_mux_aclk_cam1_trex_vra_528_user_p) = { "oscclk", "gout_top_gate_aclk_cam1_trex_vra_528" };
+PNAME(mout_cam1_mux_aclk_cam1_trex_b_528_user_p) = { "oscclk", "gout_top_gate_aclk_cam1_trex_b_528" };
+PNAME(mout_cam1_mux_aclk_cam1_bus_264_user_p) = { "oscclk", "gout_top_gate_aclk_cam1_bus_264" };
+PNAME(mout_cam1_mux_aclk_cam1_peri_84_user_p) = { "oscclk", "gout_top_gate_aclk_cam1_peri_84" };
+PNAME(mout_cam1_mux_aclk_cam1_csis2_414_user_p) = { "oscclk", "gout_top_gate_aclk_cam1_csis2_414" };
+PNAME(mout_cam1_mux_aclk_cam1_csis3_132_user_p) = { "oscclk", "gout_top_gate_aclk_cam1_csis3_132" };
+PNAME(mout_cam1_mux_aclk_cam1_scl_566_user_p) = { "oscclk", "gout_top_gate_aclk_cam1_scl_566" };
+PNAME(mout_cam1_mux_sclk_cam1_isp_spi0_user_p) = { "oscclk", "gout_top_gate_sclk_cam1_isp_spi0" };
+PNAME(mout_cam1_mux_sclk_cam1_isp_spi1_user_p) = { "oscclk", "gout_top_gate_sclk_cam1_isp_spi1" };
+PNAME(mout_cam1_mux_sclk_cam1_isp_uart_user_p) = { "oscclk", "gout_top_gate_sclk_cam1_isp_uart" };
+PNAME(mout_cam1_mux_phyclk_rxbyteclkhs0_csis2_user_p) = { "oscclk", "phyclk_rxbyteclkhs0_csis2" };
+PNAME(mout_cam1_mux_phyclk_rxbyteclkhs1_csis2_user_p) = { "oscclk", "phyclk_rxbyteclkhs1_csis2" };
+PNAME(mout_cam1_mux_phyclk_rxbyteclkhs2_csis2_user_p) = { "oscclk", "phyclk_rxbyteclkhs2_csis2" };
+PNAME(mout_cam1_mux_phyclk_rxbyteclkhs3_csis2_user_p) = { "oscclk", "phyclk_rxbyteclkhs3_csis2" };
+PNAME(mout_cam1_mux_phyclk_rxbyteclkhs0_csis3_user_p) = { "oscclk", "phyclk_rxbyteclkhs0_csis3" };
+
+static const struct samsung_mux_clock cam1_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_CAM1_MUX_ACLK_CAM1_ARM_672_USER, "mout_cam1_mux_aclk_cam1_arm_672_user",
+	    mout_cam1_mux_aclk_cam1_arm_672_user_p,
+	    CAM1_MUX_ACLK_CAM1_ARM_672_USER, 12, 1),
+	MUX(CLK_MOUT_CAM1_MUX_ACLK_CAM1_TREX_VRA_528_USER, "mout_cam1_mux_aclk_cam1_trex_vra_528_user",
+	    mout_cam1_mux_aclk_cam1_trex_vra_528_user_p,
+	    CAM1_MUX_ACLK_CAM1_TREX_VRA_528_USER, 12, 1),
+	MUX(CLK_MOUT_CAM1_MUX_ACLK_CAM1_TREX_B_528_USER, "mout_cam1_mux_aclk_cam1_trex_b_528_user",
+	    mout_cam1_mux_aclk_cam1_trex_b_528_user_p,
+	    CAM1_MUX_ACLK_CAM1_TREX_B_528_USER, 12, 1),
+	MUX(CLK_MOUT_CAM1_MUX_ACLK_CAM1_BUS_264_USER, "mout_cam1_mux_aclk_cam1_bus_264_user",
+	    mout_cam1_mux_aclk_cam1_bus_264_user_p,
+	    CAM1_MUX_ACLK_CAM1_BUS_264_USER, 12, 1),
+	MUX(CLK_MOUT_CAM1_MUX_ACLK_CAM1_PERI_84_USER, "mout_cam1_mux_aclk_cam1_peri_84_user",
+	    mout_cam1_mux_aclk_cam1_peri_84_user_p,
+	    CAM1_MUX_ACLK_CAM1_PERI_84_USER, 12, 1),
+	MUX(CLK_MOUT_CAM1_MUX_ACLK_CAM1_CSIS2_414_USER, "mout_cam1_mux_aclk_cam1_csis2_414_user",
+	    mout_cam1_mux_aclk_cam1_csis2_414_user_p,
+	    CAM1_MUX_ACLK_CAM1_CSIS2_414_USER, 12, 1),
+	MUX(CLK_MOUT_CAM1_MUX_ACLK_CAM1_CSIS3_132_USER, "mout_cam1_mux_aclk_cam1_csis3_132_user",
+	    mout_cam1_mux_aclk_cam1_csis3_132_user_p,
+	    CAM1_MUX_ACLK_CAM1_CSIS3_132_USER, 12, 1),
+	MUX(CLK_MOUT_CAM1_MUX_ACLK_CAM1_SCL_566_USER, "mout_cam1_mux_aclk_cam1_scl_566_user",
+	    mout_cam1_mux_aclk_cam1_scl_566_user_p,
+	    CAM1_MUX_ACLK_CAM1_SCL_566_USER, 12, 1),
+	MUX(CLK_MOUT_CAM1_MUX_SCLK_CAM1_ISP_SPI0_USER, "mout_cam1_mux_sclk_cam1_isp_spi0_user",
+	    mout_cam1_mux_sclk_cam1_isp_spi0_user_p,
+	    CAM1_MUX_SCLK_CAM1_ISP_SPI0_USER, 12, 1),
+	MUX(CLK_MOUT_CAM1_MUX_SCLK_CAM1_ISP_SPI1_USER, "mout_cam1_mux_sclk_cam1_isp_spi1_user",
+	    mout_cam1_mux_sclk_cam1_isp_spi1_user_p,
+	    CAM1_MUX_SCLK_CAM1_ISP_SPI1_USER, 12, 1),
+	MUX(CLK_MOUT_CAM1_MUX_SCLK_CAM1_ISP_UART_USER, "mout_cam1_mux_sclk_cam1_isp_uart_user",
+	    mout_cam1_mux_sclk_cam1_isp_uart_user_p,
+	    CAM1_MUX_SCLK_CAM1_ISP_UART_USER, 12, 1),
+	MUX(CLK_MOUT_CAM1_MUX_PHYCLK_RXBYTECLKHS0_CSIS2_USER, "mout_cam1_mux_phyclk_rxbyteclkhs0_csis2_user",
+	    mout_cam1_mux_phyclk_rxbyteclkhs0_csis2_user_p,
+	    CAM1_MUX_PHYCLK_RXBYTECLKHS0_CSIS2_USER, 12, 1),
+	MUX(CLK_MOUT_CAM1_MUX_PHYCLK_RXBYTECLKHS1_CSIS2_USER, "mout_cam1_mux_phyclk_rxbyteclkhs1_csis2_user",
+	    mout_cam1_mux_phyclk_rxbyteclkhs1_csis2_user_p,
+	    CAM1_MUX_PHYCLK_RXBYTECLKHS1_CSIS2_USER, 12, 1),
+	MUX(CLK_MOUT_CAM1_MUX_PHYCLK_RXBYTECLKHS2_CSIS2_USER, "mout_cam1_mux_phyclk_rxbyteclkhs2_csis2_user",
+	    mout_cam1_mux_phyclk_rxbyteclkhs2_csis2_user_p,
+	    CAM1_MUX_PHYCLK_RXBYTECLKHS2_CSIS2_USER, 12, 1),
+	MUX(CLK_MOUT_CAM1_MUX_PHYCLK_RXBYTECLKHS3_CSIS2_USER, "mout_cam1_mux_phyclk_rxbyteclkhs3_csis2_user",
+	    mout_cam1_mux_phyclk_rxbyteclkhs3_csis2_user_p,
+	    CAM1_MUX_PHYCLK_RXBYTECLKHS3_CSIS2_USER, 12, 1),
+	MUX(CLK_MOUT_CAM1_MUX_PHYCLK_RXBYTECLKHS0_CSIS3_USER, "mout_cam1_mux_phyclk_rxbyteclkhs0_csis3_user",
+	    mout_cam1_mux_phyclk_rxbyteclkhs0_csis3_user_p,
+	    CAM1_MUX_PHYCLK_RXBYTECLKHS0_CSIS3_USER, 12, 1),
+};
+
+static const struct samsung_div_clock cam1_div_clks[] __initconst = {
+	DIV(CLK_DOUT_CAM1_DIV_PCLK_CAM1_ARM_168, "dout_cam1_div_pclk_cam1_arm_168",
+	    "mout_cam1_mux_aclk_cam1_arm_672_user",
+	    CAM1_DIV_PCLK_CAM1_ARM_168, 0, 3),
+	DIV(CLK_DOUT_CAM1_DIV_PCLK_CAM1_TREX_VRA_264, "dout_cam1_div_pclk_cam1_trex_vra_264",
+	    "mout_cam1_mux_aclk_cam1_trex_vra_528_user",
+	    CAM1_DIV_PCLK_CAM1_TREX_VRA_264, 0, 3),
+	DIV(CLK_DOUT_CAM1_DIV_PCLK_CAM1_BUS_132, "dout_cam1_div_pclk_cam1_bus_132",
+	    "mout_cam1_mux_aclk_cam1_bus_264_user",
+	    CAM1_DIV_PCLK_CAM1_BUS_132, 0, 3),
+};
+
+static const struct samsung_gate_clock cam1_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_ARM, "gout_cam1_gate_aclk_arm",
+	     "mout_cam1_mux_aclk_cam1_arm_672_user",
+	     CAM1_GATE_ACLK_ARM, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_ARM, "gout_cam1_gate_pclk_arm",
+	     "dout_cam1_div_pclk_cam1_arm_168",
+	     CAM1_GATE_PCLK_ARM, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_SMMU_VRA, "gout_cam1_gate_aclk_smmu_vra",
+	     "mout_cam1_mux_aclk_cam1_trex_vra_528_user",
+	     CAM1_GATE_ACLK_SMMU_VRA, 1, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_VRA, "gout_cam1_gate_aclk_vra",
+	     "mout_cam1_mux_aclk_cam1_trex_vra_528_user",
+	     CAM1_GATE_ACLK_SMMU_VRA, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_VRA, "gout_cam1_gate_pclk_vra",
+	     "dout_cam1_div_pclk_cam1_trex_vra_264",
+	     CAM1_GATE_PCLK_VRA, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_LH_SI, "gout_cam1_gate_aclk_lh_si",
+	     "mout_cam1_mux_aclk_cam1_trex_b_528_user",
+	     CAM1_GATE_ACLK_LH_SI, 7, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_TREX_CAM1, "gout_cam1_gate_aclk_trex_cam1",
+	     "mout_cam1_mux_aclk_cam1_trex_b_528_user",
+	     CAM1_GATE_ACLK_LH_SI, 6, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_XIU_from_ISP1, "gout_cam1_gate_aclk_xiu_from_isp1",
+	     "mout_cam1_mux_aclk_cam1_trex_b_528_user",
+	     CAM1_GATE_ACLK_LH_SI, 5, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_SMMU_IS_B, "gout_cam1_gate_aclk_smmu_is_b",
+	     "mout_cam1_mux_aclk_cam1_trex_b_528_user",
+	     CAM1_GATE_ACLK_LH_SI, 4, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_SFW, "gout_cam1_gate_aclk_sfw",
+	     "mout_cam1_mux_aclk_cam1_trex_b_528_user",
+	     CAM1_GATE_ACLK_LH_SI, 3, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_ASYNC_CA7_TO_DRAM, "gout_cam1_gate_aclk_async_ca7_to_dram",
+	     "mout_cam1_mux_aclk_cam1_trex_b_528_user",
+	     CAM1_GATE_ACLK_LH_SI, 2, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_SMMU_ISPCPU, "gout_cam1_gate_aclk_smmu_ispcpu",
+	     "mout_cam1_mux_aclk_cam1_trex_b_528_user",
+	     CAM1_GATE_ACLK_LH_SI, 1, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_TREX_B, "gout_cam1_gate_aclk_trex_b",
+	     "mout_cam1_mux_aclk_cam1_trex_b_528_user",
+	     CAM1_GATE_ACLK_LH_SI, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_LH_MI, "gout_cam1_gate_aclk_lh_mi",
+	     "mout_cam1_mux_aclk_cam1_bus_264_user",
+	     CAM1_GATE_ACLK_LH_MI, 6, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_PERI, "gout_cam1_gate_aclk_peri",
+	     "mout_cam1_mux_aclk_cam1_bus_264_user",
+	     CAM1_GATE_ACLK_LH_MI, 5, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_CSIS3, "gout_cam1_gate_pclk_csis3",
+	     "mout_cam1_mux_aclk_cam1_bus_264_user",
+	     CAM1_GATE_ACLK_LH_MI, 4, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_CSIS2, "gout_cam1_gate_pclk_csis2",
+	     "mout_cam1_mux_aclk_cam1_bus_264_user",
+	     CAM1_GATE_ACLK_LH_MI, 3, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_XIU_to_CAM0, "gout_cam1_gate_aclk_xiu_to_cam0",
+	     "mout_cam1_mux_aclk_cam1_bus_264_user",
+	     CAM1_GATE_ACLK_LH_MI, 2, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_XIU_to_ISP1, "gout_cam1_gate_aclk_xiu_to_isp1",
+	     "mout_cam1_mux_aclk_cam1_bus_264_user",
+	     CAM1_GATE_ACLK_LH_MI, 1, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_XIU_to_ISP0, "gout_cam1_gate_aclk_xiu_to_isp0",
+	     "mout_cam1_mux_aclk_cam1_bus_264_user",
+	     CAM1_GATE_ACLK_LH_MI, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_CMU_LOCAL, "gout_cam1_gate_pclk_cmu_local",
+	     "dout_cam1_div_pclk_cam1_bus_132",
+	     CAM1_GATE_PCLK_CMU_LOCAL, 10, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_SYSREG_CAM1, "gout_cam1_gate_pclk_sysreg_cam1",
+	     "dout_cam1_div_pclk_cam1_bus_132",
+	     CAM1_GATE_PCLK_CMU_LOCAL, 9, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_PMU_CAM1, "gout_cam1_gate_pclk_pmu_cam1",
+	     "dout_cam1_div_pclk_cam1_bus_132",
+	     CAM1_GATE_PCLK_CMU_LOCAL, 8, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_TREX_CAM1, "gout_cam1_gate_pclk_trex_cam1",
+	     "dout_cam1_div_pclk_cam1_bus_132",
+	     CAM1_GATE_PCLK_CMU_LOCAL, 7, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_XIU_from_ISP1, "gout_cam1_gate_pclk_xiu_from_isp1",
+	     "dout_cam1_div_pclk_cam1_bus_132",
+	     CAM1_GATE_PCLK_CMU_LOCAL, 6, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_PERI, "gout_cam1_gate_pclk_peri",
+	     "dout_cam1_div_pclk_cam1_bus_132",
+	     CAM1_GATE_PCLK_CMU_LOCAL, 5, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_SMMU_ISPCPU, "gout_cam1_gate_pclk_smmu_ispcpu",
+	     "dout_cam1_div_pclk_cam1_bus_132",
+	     CAM1_GATE_PCLK_CMU_LOCAL, 4, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_SMMU_VRA, "gout_cam1_gate_pclk_smmu_vra",
+	     "dout_cam1_div_pclk_cam1_bus_132",
+	     CAM1_GATE_PCLK_CMU_LOCAL, 3, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_SMMU_IS_B, "gout_cam1_gate_pclk_smmu_is_b",
+	     "dout_cam1_div_pclk_cam1_bus_132",
+	     CAM1_GATE_PCLK_CMU_LOCAL, 2, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_SFW, "gout_cam1_gate_pclk_sfw",
+	     "dout_cam1_div_pclk_cam1_bus_132",
+	     CAM1_GATE_PCLK_CMU_LOCAL, 1, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_TREX_B, "gout_cam1_gate_pclk_trex_b",
+	     "dout_cam1_div_pclk_cam1_bus_132",
+	     CAM1_GATE_PCLK_CMU_LOCAL, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_WDT, "gout_cam1_gate_pclk_wdt",
+	     "mout_cam1_mux_aclk_cam1_peri_84_user",
+	     CAM1_GATE_PCLK_WDT, 11, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_UART, "gout_cam1_gate_pclk_uart",
+	     "mout_cam1_mux_aclk_cam1_peri_84_user",
+	     CAM1_GATE_PCLK_WDT, 10, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_SPI1, "gout_cam1_gate_pclk_spi1",
+	     "mout_cam1_mux_aclk_cam1_peri_84_user",
+	     CAM1_GATE_PCLK_WDT, 9, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_SPI0, "gout_cam1_gate_pclk_spi0",
+	     "mout_cam1_mux_aclk_cam1_peri_84_user",
+	     CAM1_GATE_PCLK_WDT, 8, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_PWM, "gout_cam1_gate_pclk_pwm",
+	     "mout_cam1_mux_aclk_cam1_peri_84_user",
+	     CAM1_GATE_PCLK_WDT, 7, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_MCUCTL, "gout_cam1_gate_pclk_mcuctl",
+	     "mout_cam1_mux_aclk_cam1_peri_84_user",
+	     CAM1_GATE_PCLK_WDT, 6, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_I2C3, "gout_cam1_gate_pclk_i2c3",
+	     "mout_cam1_mux_aclk_cam1_peri_84_user",
+	     CAM1_GATE_PCLK_WDT, 5, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_I2C2, "gout_cam1_gate_pclk_i2c2",
+	     "mout_cam1_mux_aclk_cam1_peri_84_user",
+	     CAM1_GATE_PCLK_WDT, 4, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_I2C1, "gout_cam1_gate_pclk_i2c1",
+	     "mout_cam1_mux_aclk_cam1_peri_84_user",
+	     CAM1_GATE_PCLK_WDT, 3, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_I2C0, "gout_cam1_gate_pclk_i2c0",
+	     "mout_cam1_mux_aclk_cam1_peri_84_user",
+	     CAM1_GATE_PCLK_WDT, 2, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_PDMA, "gout_cam1_gate_aclk_pdma",
+	     "mout_cam1_mux_aclk_cam1_peri_84_user",
+	     CAM1_GATE_PCLK_WDT, 1, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_BRIDGE_PERI, "gout_cam1_gate_aclk_bridge_peri",
+	     "mout_cam1_mux_aclk_cam1_peri_84_user",
+	     CAM1_GATE_PCLK_WDT, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_CSIS2, "gout_cam1_gate_aclk_csis2",
+	     "mout_cam1_mux_aclk_cam1_csis2_414_user",
+	     CAM1_GATE_ACLK_CSIS2, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_CSIS3, "gout_cam1_gate_aclk_csis3",
+	     "mout_cam1_mux_aclk_cam1_csis3_132_user",
+	     CAM1_GATE_ACLK_CSIS3, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_SMMU_MC_SC, "gout_cam1_gate_aclk_smmu_mc_sc",
+	     "mout_cam1_mux_aclk_cam1_scl_566_user",
+	     CAM1_GATE_ACLK_SMMU_MC_SC, 1, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_ACLK_MC_SC, "gout_cam1_gate_aclk_mc_sc",
+	     "mout_cam1_mux_aclk_cam1_scl_566_user",
+	     CAM1_GATE_ACLK_SMMU_MC_SC, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PCLK_SMMU_MC_SC, "gout_cam1_gate_pclk_smmu_mc_sc",
+	     "dout_cam1_div_pclk_cam1_bus_132",
+	     CAM1_GATE_PCLK_SMMU_MC_SC, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_SCLK_ISP_PERI_IS_B_SPI0_EXT_CLK_ISP, "gout_cam1_gate_sclk_isp_peri_is_b_spi0_ext_clk_isp",
+	     "mout_cam1_mux_sclk_cam1_isp_spi0_user",
+	     CAM1_GATE_SCLK_ISP_PERI_IS_B_SPI0_EXT_CLK_ISP, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_SCLK_ISP_PERI_IS_B_SPI1_EXT_CLK_ISP, "gout_cam1_gate_sclk_isp_peri_is_b_spi1_ext_clk_isp",
+	     "mout_cam1_mux_sclk_cam1_isp_spi1_user",
+	     CAM1_GATE_SCLK_ISP_PERI_IS_B_SPI1_EXT_CLK_ISP, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_SCLK_ISP_PERI_IS_B_UART_EXT_CLK_ISP, "gout_cam1_gate_sclk_isp_peri_is_b_uart_ext_clk_isp",
+	     "mout_cam1_mux_sclk_cam1_isp_uart_user",
+	     CAM1_GATE_SCLK_ISP_PERI_IS_B_UART_EXT_CLK_ISP, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_SCLK_CAM1_ISP_IS_B_OSCCLK_I2C3_ISP, "gout_cam1_gate_sclk_cam1_isp_is_b_oscclk_i2c3_isp",
+	     "oscclk",
+	     CAM1_GATE_SCLK_CAM1_ISP_IS_B_OSCCLK_I2C3_ISP, 4, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_SCLK_CAM1_ISP_IS_B_OSCCLK_I2C2_ISP, "gout_cam1_gate_sclk_cam1_isp_is_b_oscclk_i2c2_isp",
+	     "oscclk",
+	     CAM1_GATE_SCLK_CAM1_ISP_IS_B_OSCCLK_I2C3_ISP, 3, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_SCLK_CAM1_ISP_IS_B_OSCCLK_I2C1_ISP, "gout_cam1_gate_sclk_cam1_isp_is_b_oscclk_i2c1_isp",
+	     "oscclk",
+	     CAM1_GATE_SCLK_CAM1_ISP_IS_B_OSCCLK_I2C3_ISP, 2, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_SCLK_CAM1_ISP_IS_B_OSCCLK_I2C0_ISP, "gout_cam1_gate_sclk_cam1_isp_is_b_oscclk_i2c0_isp",
+	     "oscclk",
+	     CAM1_GATE_SCLK_CAM1_ISP_IS_B_OSCCLK_I2C3_ISP, 1, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_SCLK_ISP_PERI_IS_B_PWM_ISP, "gout_cam1_gate_sclk_isp_peri_is_b_pwm_isp",
+	     "oscclk",
+	     CAM1_GATE_SCLK_CAM1_ISP_IS_B_OSCCLK_I2C3_ISP, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PHYCLK_HS0_CSIS2_RX_BYTE, "gout_cam1_gate_phyclk_hs0_csis2_rx_byte",
+	     "mout_cam1_mux_phyclk_rxbyteclkhs0_csis2_user",
+	     CAM1_GATE_PHYCLK_HS0_CSIS2_RX_BYTE, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PHYCLK_HS1_CSIS2_RX_BYTE, "gout_cam1_gate_phyclk_hs1_csis2_rx_byte",
+	     "mout_cam1_mux_phyclk_rxbyteclkhs1_csis2_user",
+	     CAM1_GATE_PHYCLK_HS1_CSIS2_RX_BYTE, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PHYCLK_HS2_CSIS2_RX_BYTE, "gout_cam1_gate_phyclk_hs2_csis2_rx_byte",
+	     "mout_cam1_mux_phyclk_rxbyteclkhs2_csis2_user",
+	     CAM1_GATE_PHYCLK_HS2_CSIS2_RX_BYTE, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PHYCLK_HS3_CSIS2_RX_BYTE, "gout_cam1_gate_phyclk_hs3_csis2_rx_byte",
+	     "mout_cam1_mux_phyclk_rxbyteclkhs3_csis2_user",
+	     CAM1_GATE_PHYCLK_HS3_CSIS2_RX_BYTE, 0, 0, 0),
+	GATE(CLK_GOUT_CAM1_GATE_PHYCLK_HS0_CSIS3_RX_BYTE, "gout_cam1_gate_phyclk_hs0_csis3_rx_byte",
+	     "mout_cam1_mux_phyclk_rxbyteclkhs0_csis3_user",
+	     CAM1_GATE_PHYCLK_HS0_CSIS3_RX_BYTE, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info cam1_cmu_info __initconst = {
+	.mux_clks		= cam1_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(cam1_mux_clks),
+	.div_clks		= cam1_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(cam1_div_clks),
+	.gate_clks		= cam1_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(cam1_gate_clks),
+	.fixed_clks		= cam1_fixed_clks,
+	.nr_fixed_clks		= ARRAY_SIZE(cam1_fixed_clks),
+	.nr_clk_ids		= CLKS_NR_CAM1,
+	.clk_regs		= cam1_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(cam1_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_cam1_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &cam1_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_cam1, "samsung,exynos8890-cmu-cam1",
+	       exynos8890_cmu_cam1_init);
+
+/* ---- CMU_ISP0_LOCAL --------------------------------------------------*/
+
+/* Register Offset definitions for CMU_ISP0_LOCAL (0x14290000) */
+#define ISP0_LOCAL_GATE_ACLK_FIMC_ISP0			0x0800
+#define ISP0_LOCAL_GATE_PCLK_FIMC_ISP0			0x0808
+#define ISP0_LOCAL_GATE_ACLK_FIMC_TPU			0x080c
+#define ISP0_LOCAL_GATE_PCLK_FIMC_TPU			0x0814
+#define ISP0_LOCAL_GATE_CLK_C_TREX_C			0x0818
+#define ISP0_LOCAL_GATE_PCLK_TREX_C			0x0824
+
+static const unsigned long isp0_local_clk_regs[] __initconst = {
+	ISP0_LOCAL_GATE_ACLK_FIMC_ISP0,
+	ISP0_LOCAL_GATE_PCLK_FIMC_ISP0,
+	ISP0_LOCAL_GATE_ACLK_FIMC_TPU,
+	ISP0_LOCAL_GATE_PCLK_FIMC_TPU,
+	ISP0_LOCAL_GATE_CLK_C_TREX_C,
+	ISP0_LOCAL_GATE_PCLK_TREX_C,
+};
+
+/* List of parent clocks for Muxes in CMU_ISP0_LOCAL */
+
+static const struct samsung_gate_clock isp0_local_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_ISP0_LOCAL_GATE_ACLK_FIMC_ISP0, "gout_isp0_local_gate_aclk_fimc_isp0",
+	     "gout_isp0_gate_aclk_fimc_isp0",
+	     ISP0_LOCAL_GATE_ACLK_FIMC_ISP0, 0, 0, 0),
+	GATE(CLK_GOUT_ISP0_LOCAL_GATE_PCLK_FIMC_ISP0, "gout_isp0_local_gate_pclk_fimc_isp0",
+	     "gout_isp0_gate_pclk_fimc_isp0",
+	     ISP0_LOCAL_GATE_PCLK_FIMC_ISP0, 0, 0, 0),
+	GATE(CLK_GOUT_ISP0_LOCAL_GATE_ACLK_FIMC_TPU, "gout_isp0_local_gate_aclk_fimc_tpu",
+	     "gout_isp0_gate_aclk_fimc_tpu",
+	     ISP0_LOCAL_GATE_ACLK_FIMC_TPU, 0, 0, 0),
+	GATE(CLK_GOUT_ISP0_LOCAL_GATE_PCLK_FIMC_TPU, "gout_isp0_local_gate_pclk_fimc_tpu",
+	     "gout_isp0_gate_pclk_fimc_tpu",
+	     ISP0_LOCAL_GATE_PCLK_FIMC_TPU, 0, 0, 0),
+	GATE(CLK_GOUT_ISP0_LOCAL_GATE_CLK_C_TREX_C, "gout_isp0_local_gate_clk_c_trex_c",
+	     "gout_isp0_gate_clk_c_trex_c",
+	     ISP0_LOCAL_GATE_CLK_C_TREX_C, 1, 0, 0),
+	GATE(CLK_GOUT_ISP0_LOCAL_GATE_PCLK_TREX_C, "gout_isp0_local_gate_pclk_trex_c",
+	     "gout_isp0_gate_pclk_trex_c",
+	     ISP0_LOCAL_GATE_PCLK_TREX_C, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info isp0_local_cmu_info __initconst = {
+	.gate_clks		= isp0_local_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(isp0_local_gate_clks),
+	.nr_clk_ids		= CLKS_NR_ISP0_LOCAL,
+	.clk_regs		= isp0_local_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(isp0_local_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_isp0_local_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &isp0_local_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_isp0_local, "samsung,exynos8890-cmu-isp0_local",
+	       exynos8890_cmu_isp0_local_init);
+
+/* ---- CMU_ISP0 --------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_ISP0 (0x146d0000) */
+#define ISP0_MUX_ACLK_ISP0_528_USER			0x0200
+#define ISP0_MUX_ACLK_ISP0_TPU_400_USER			0x0204
+#define ISP0_MUX_ACLK_ISP0_TREX_528_USER			0x0208
+#define ISP0_MUX_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D_USER	0x020c
+#define ISP0_DIV_PCLK_ISP0			0x0400
+#define ISP0_DIV_PCLK_ISP0_TPU			0x0404
+#define ISP0_DIV_PCLK_ISP0_TREX_264			0x0408
+#define ISP0_DIV_PCLK_ISP0_TREX_132			0x040c
+#define ISP0_GATE_ACLK_FIMC_ISP0			0x0800
+#define ISP0_GATE_PCLK_FIMC_ISP0			0x0808
+#define ISP0_GATE_ACLK_FIMC_TPU			0x080c
+#define ISP0_GATE_PCLK_FIMC_TPU			0x0814
+#define ISP0_GATE_ACLK_SysMMU601			0x0818
+#define ISP0_GATE_PCLK_SYSREG_ISP0			0x081c
+#define ISP0_GATE_PCLK_HPM_APBIF_ISP0			0x0820
+#define ISP0_GATE_PCLK_SysMMU601			0x0824
+#define ISP0_GATE_SCLK_PROMISE_ISP0			0x0828
+#define ISP0_GATE_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D	0x082c
+
+static const unsigned long isp0_clk_regs[] __initconst = {
+	ISP0_MUX_ACLK_ISP0_528_USER,
+	ISP0_MUX_ACLK_ISP0_TPU_400_USER,
+	ISP0_MUX_ACLK_ISP0_TREX_528_USER,
+	ISP0_MUX_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D_USER,
+	ISP0_DIV_PCLK_ISP0,
+	ISP0_DIV_PCLK_ISP0_TPU,
+	ISP0_DIV_PCLK_ISP0_TREX_264,
+	ISP0_DIV_PCLK_ISP0_TREX_132,
+	ISP0_GATE_ACLK_FIMC_ISP0,
+	ISP0_GATE_PCLK_FIMC_ISP0,
+	ISP0_GATE_ACLK_FIMC_TPU,
+	ISP0_GATE_PCLK_FIMC_TPU,
+	ISP0_GATE_ACLK_SysMMU601,
+	ISP0_GATE_PCLK_SYSREG_ISP0,
+	ISP0_GATE_PCLK_HPM_APBIF_ISP0,
+	ISP0_GATE_PCLK_SysMMU601,
+	ISP0_GATE_SCLK_PROMISE_ISP0,
+	ISP0_GATE_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D,
+};
+
+/* List of parent clocks for Muxes in CMU_ISP0 */
+PNAME(mout_isp0_mux_aclk_isp0_528_user_p) = { "oscclk", "gout_top_gate_aclk_isp0_isp0_528" };
+PNAME(mout_isp0_mux_aclk_isp0_tpu_400_user_p) = { "oscclk", "gout_top_gate_aclk_isp0_tpu_400" };
+PNAME(mout_isp0_mux_aclk_isp0_trex_528_user_p) = { "oscclk", "gout_top_gate_aclk_isp0_trex_528" };
+PNAME(mout_isp0_mux_aclk_isp0_pxl_asbs_is_c_from_is_d_user_p) = { "oscclk", "gout_top_gate_aclk_isp0_pxl_asbs_is_c_from_is_d" };
+
+static const struct samsung_mux_clock isp0_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_ISP0_MUX_ACLK_ISP0_528_USER, "mout_isp0_mux_aclk_isp0_528_user",
+	    mout_isp0_mux_aclk_isp0_528_user_p,
+	    ISP0_MUX_ACLK_ISP0_528_USER, 12, 1),
+	MUX(CLK_MOUT_ISP0_MUX_ACLK_ISP0_TPU_400_USER, "mout_isp0_mux_aclk_isp0_tpu_400_user",
+	    mout_isp0_mux_aclk_isp0_tpu_400_user_p,
+	    ISP0_MUX_ACLK_ISP0_TPU_400_USER, 12, 1),
+	MUX(CLK_MOUT_ISP0_MUX_ACLK_ISP0_TREX_528_USER, "mout_isp0_mux_aclk_isp0_trex_528_user",
+	    mout_isp0_mux_aclk_isp0_trex_528_user_p,
+	    ISP0_MUX_ACLK_ISP0_TREX_528_USER, 12, 1),
+	MUX(CLK_MOUT_ISP0_MUX_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D_USER, "mout_isp0_mux_aclk_isp0_pxl_asbs_is_c_from_is_d_user",
+	    mout_isp0_mux_aclk_isp0_pxl_asbs_is_c_from_is_d_user_p,
+	    ISP0_MUX_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D_USER, 12, 1),
+};
+
+static const struct samsung_div_clock isp0_div_clks[] __initconst = {
+	DIV(CLK_DOUT_ISP0_DIV_PCLK_ISP0, "dout_isp0_div_pclk_isp0",
+	    "mout_isp0_mux_aclk_isp0_528_user",
+	    ISP0_DIV_PCLK_ISP0, 0, 3),
+	DIV(CLK_DOUT_ISP0_DIV_PCLK_ISP0_TPU, "dout_isp0_div_pclk_isp0_tpu",
+	    "mout_isp0_mux_aclk_isp0_tpu_400_user",
+	    ISP0_DIV_PCLK_ISP0_TPU, 0, 3),
+	DIV(CLK_DOUT_ISP0_DIV_PCLK_ISP0_TREX_264, "dout_isp0_div_pclk_isp0_trex_264",
+	    "mout_isp0_mux_aclk_isp0_trex_528_user",
+	    ISP0_DIV_PCLK_ISP0_TREX_264, 0, 3),
+	DIV(CLK_DOUT_ISP0_DIV_PCLK_ISP0_TREX_132, "dout_isp0_div_pclk_isp0_trex_132",
+	    "mout_isp0_mux_aclk_isp0_trex_528_user",
+	    ISP0_DIV_PCLK_ISP0_TREX_132, 0, 3),
+};
+
+static const struct samsung_gate_clock isp0_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_ISP0_GATE_ACLK_FIMC_ISP0, "gout_isp0_gate_aclk_fimc_isp0",
+	     "mout_isp0_mux_aclk_isp0_528_user",
+	     ISP0_GATE_ACLK_FIMC_ISP0, 0, 0, 0),
+	GATE(CLK_GOUT_ISP0_GATE_PCLK_FIMC_ISP0, "gout_isp0_gate_pclk_fimc_isp0",
+	     "dout_isp0_div_pclk_isp0",
+	     ISP0_GATE_PCLK_FIMC_ISP0, 0, 0, 0),
+	GATE(CLK_GOUT_ISP0_GATE_ACLK_FIMC_TPU, "gout_isp0_gate_aclk_fimc_tpu",
+	     "mout_isp0_mux_aclk_isp0_tpu_400_user",
+	     ISP0_GATE_ACLK_FIMC_TPU, 0, 0, 0),
+	GATE(CLK_GOUT_ISP0_GATE_PCLK_FIMC_TPU, "gout_isp0_gate_pclk_fimc_tpu",
+	     "dout_isp0_div_pclk_isp0_tpu",
+	     ISP0_GATE_PCLK_FIMC_TPU, 0, 0, 0),
+	GATE(CLK_GOUT_ISP0_GATE_ACLK_SysMMU601, "gout_isp0_gate_aclk_sysmmu601",
+	     "mout_isp0_mux_aclk_isp0_trex_528_user",
+	     ISP0_GATE_ACLK_SysMMU601, 2, 0, 0),
+	GATE(CLK_GOUT_ISP0_GATE_CLK_C_TREX_C, "gout_isp0_gate_clk_c_trex_c",
+	     "mout_isp0_mux_aclk_isp0_trex_528_user",
+	     ISP0_GATE_ACLK_SysMMU601, 1, 0, 0),
+	GATE(CLK_GOUT_ISP0_GATE_CLK_AXI_LH_ASYNC_SI_TOP_ISP0, "gout_isp0_gate_clk_axi_lh_async_si_top_isp0",
+	     "mout_isp0_mux_aclk_isp0_trex_528_user",
+	     ISP0_GATE_ACLK_SysMMU601, 0, 0, 0),
+	GATE(CLK_GOUT_ISP0_GATE_PCLK_SYSREG_ISP0, "gout_isp0_gate_pclk_sysreg_isp0",
+	     "dout_isp0_div_pclk_isp0_trex_264",
+	     ISP0_GATE_PCLK_SYSREG_ISP0, 3, 0, 0),
+	GATE(CLK_GOUT_ISP0_GATE_PCLK_PMU_ISP0, "gout_isp0_gate_pclk_pmu_isp0",
+	     "dout_isp0_div_pclk_isp0_trex_264",
+	     ISP0_GATE_PCLK_SYSREG_ISP0, 2, 0, 0),
+	GATE(CLK_GOUT_ISP0_GATE_ACLK_XIU_N_ASYNC_MI, "gout_isp0_gate_aclk_xiu_n_async_mi",
+	     "dout_isp0_div_pclk_isp0_trex_264",
+	     ISP0_GATE_PCLK_SYSREG_ISP0, 1, 0, 0),
+	GATE(CLK_GOUT_ISP0_GATE_PCLK_ISP0, "gout_isp0_gate_pclk_isp0",
+	     "dout_isp0_div_pclk_isp0_trex_264",
+	     ISP0_GATE_PCLK_SYSREG_ISP0, 0, 0, 0),
+	GATE(CLK_GOUT_ISP0_GATE_PCLK_HPM_APBIF_ISP0, "gout_isp0_gate_pclk_hpm_apbif_isp0",
+	     "dout_isp0_div_pclk_isp0_trex_264",
+	     ISP0_GATE_PCLK_HPM_APBIF_ISP0, 0, 0, 0),
+	GATE(CLK_GOUT_ISP0_GATE_PCLK_SysMMU601, "gout_isp0_gate_pclk_sysmmu601",
+	     "dout_isp0_div_pclk_isp0_trex_132",
+	     ISP0_GATE_PCLK_SysMMU601, 1, 0, 0),
+	GATE(CLK_GOUT_ISP0_GATE_PCLK_TREX_C, "gout_isp0_gate_pclk_trex_c",
+	     "dout_isp0_div_pclk_isp0_trex_132",
+	     ISP0_GATE_PCLK_SysMMU601, 0, 0, 0),
+	GATE(CLK_GOUT_ISP0_GATE_SCLK_PROMISE_ISP0, "gout_isp0_gate_sclk_promise_isp0",
+	     "gout_top_gate_sclk_promise_int",
+	     ISP0_GATE_SCLK_PROMISE_ISP0, 0, 0, 0),
+	GATE(CLK_GOUT_ISP0_GATE_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D, "gout_isp0_gate_aclk_isp0_pxl_asbs_is_c_from_is_d",
+	     "mout_isp0_mux_aclk_isp0_pxl_asbs_is_c_from_is_d_user",
+	     ISP0_GATE_ACLK_ISP0_PXL_ASBS_IS_C_FROM_IS_D, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info isp0_cmu_info __initconst = {
+	.mux_clks		= isp0_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(isp0_mux_clks),
+	.div_clks		= isp0_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(isp0_div_clks),
+	.gate_clks		= isp0_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(isp0_gate_clks),
+	.nr_clk_ids		= CLKS_NR_ISP0,
+	.clk_regs		= isp0_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(isp0_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_isp0_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &isp0_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_isp0, "samsung,exynos8890-cmu-isp0",
+	       exynos8890_cmu_isp0_init);
+
+/* ---- CMU_ISP1_LOCAL --------------------------------------------------*/
+
+/* Register Offset definitions for CMU_ISP1_LOCAL (0x142f0000) */
+#define ISP1_LOCAL_GATE_ACLK_FIMC_ISP1			0x0800
+#define ISP1_LOCAL_GATE_PCLK_FIMC_ISP1			0x0808
+
+static const unsigned long isp1_local_clk_regs[] __initconst = {
+	ISP1_LOCAL_GATE_ACLK_FIMC_ISP1,
+	ISP1_LOCAL_GATE_PCLK_FIMC_ISP1,
+};
+
+/* List of parent clocks for Muxes in CMU_ISP1_LOCAL */
+
+static const struct samsung_gate_clock isp1_local_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_ISP1_LOCAL_GATE_ACLK_FIMC_ISP1, "gout_isp1_local_gate_aclk_fimc_isp1",
+	     "gout_isp1_gate_aclk_fimc_isp1",
+	     ISP1_LOCAL_GATE_ACLK_FIMC_ISP1, 0, 0, 0),
+	GATE(CLK_GOUT_ISP1_LOCAL_GATE_PCLK_FIMC_ISP1, "gout_isp1_local_gate_pclk_fimc_isp1",
+	     "gout_isp1_gate_pclk_fimc_isp1",
+	     ISP1_LOCAL_GATE_PCLK_FIMC_ISP1, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info isp1_local_cmu_info __initconst = {
+	.gate_clks		= isp1_local_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(isp1_local_gate_clks),
+	.nr_clk_ids		= CLKS_NR_ISP1_LOCAL,
+	.clk_regs		= isp1_local_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(isp1_local_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_isp1_local_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &isp1_local_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_isp1_local, "samsung,exynos8890-cmu-isp1_local",
+	       exynos8890_cmu_isp1_local_init);
+
+/* ---- CMU_ISP1 --------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_ISP1 (0x147d0000) */
+#define ISP1_MUX_ACLK_ISP1_468_USER			0x0200
+#define ISP1_DIV_PCLK_ISP1_234			0x0400
+#define ISP1_GATE_ACLK_XIU_N_ASYNC_SI			0x0800
+#define ISP1_GATE_PCLK_SYSREG_ISP1			0x0808
+#define ISP1_GATE_PCLK_HPM_APBIF_ISP1			0x080c
+#define ISP1_GATE_SCLK_PROMISE_ISP1			0x0810
+
+static const unsigned long isp1_clk_regs[] __initconst = {
+	ISP1_MUX_ACLK_ISP1_468_USER,
+	ISP1_DIV_PCLK_ISP1_234,
+	ISP1_GATE_ACLK_XIU_N_ASYNC_SI,
+	ISP1_GATE_PCLK_SYSREG_ISP1,
+	ISP1_GATE_PCLK_HPM_APBIF_ISP1,
+	ISP1_GATE_SCLK_PROMISE_ISP1,
+};
+
+/* List of parent clocks for Muxes in CMU_ISP1 */
+PNAME(mout_isp1_mux_aclk_isp1_468_user_p) = { "oscclk", "gout_top_gate_aclk_isp1_isp1_468" };
+
+static const struct samsung_mux_clock isp1_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_ISP1_MUX_ACLK_ISP1_468_USER, "mout_isp1_mux_aclk_isp1_468_user",
+	    mout_isp1_mux_aclk_isp1_468_user_p,
+	    ISP1_MUX_ACLK_ISP1_468_USER, 12, 1),
+};
+
+static const struct samsung_div_clock isp1_div_clks[] __initconst = {
+	DIV(CLK_DOUT_ISP1_DIV_PCLK_ISP1_234, "dout_isp1_div_pclk_isp1_234",
+	    "mout_isp1_mux_aclk_isp1_468_user",
+	    ISP1_DIV_PCLK_ISP1_234, 0, 3),
+};
+
+static const struct samsung_gate_clock isp1_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_ISP1_GATE_ACLK_XIU_N_ASYNC_SI, "gout_isp1_gate_aclk_xiu_n_async_si",
+	     "mout_isp1_mux_aclk_isp1_468_user",
+	     ISP1_GATE_ACLK_XIU_N_ASYNC_SI, 1, 0, 0),
+	GATE(CLK_GOUT_ISP1_GATE_ACLK_FIMC_ISP1, "gout_isp1_gate_aclk_fimc_isp1",
+	     "mout_isp1_mux_aclk_isp1_468_user",
+	     ISP1_GATE_ACLK_XIU_N_ASYNC_SI, 0, 0, 0),
+	GATE(CLK_GOUT_ISP1_GATE_PCLK_SYSREG_ISP1, "gout_isp1_gate_pclk_sysreg_isp1",
+	     "dout_isp1_div_pclk_isp1_234",
+	     ISP1_GATE_PCLK_SYSREG_ISP1, 4, 0, 0),
+	GATE(CLK_GOUT_ISP1_GATE_PCLK_PMU_ISP1, "gout_isp1_gate_pclk_pmu_isp1",
+	     "dout_isp1_div_pclk_isp1_234",
+	     ISP1_GATE_PCLK_SYSREG_ISP1, 3, 0, 0),
+	GATE(CLK_GOUT_ISP1_GATE_ACLK_AXI2APB_BRIDGE_IS2P, "gout_isp1_gate_aclk_axi2apb_bridge_is2p",
+	     "dout_isp1_div_pclk_isp1_234",
+	     ISP1_GATE_PCLK_SYSREG_ISP1, 2, 0, 0),
+	GATE(CLK_GOUT_ISP1_GATE_ACLK_XIU_N_ASYNC_MI, "gout_isp1_gate_aclk_xiu_n_async_mi",
+	     "dout_isp1_div_pclk_isp1_234",
+	     ISP1_GATE_PCLK_SYSREG_ISP1, 1, 0, 0),
+	GATE(CLK_GOUT_ISP1_GATE_PCLK_FIMC_ISP1, "gout_isp1_gate_pclk_fimc_isp1",
+	     "dout_isp1_div_pclk_isp1_234",
+	     ISP1_GATE_PCLK_SYSREG_ISP1, 0, 0, 0),
+	GATE(CLK_GOUT_ISP1_GATE_PCLK_HPM_APBIF_ISP1, "gout_isp1_gate_pclk_hpm_apbif_isp1",
+	     "dout_isp1_div_pclk_isp1_234",
+	     ISP1_GATE_PCLK_HPM_APBIF_ISP1, 0, 0, 0),
+	GATE(CLK_GOUT_ISP1_GATE_SCLK_PROMISE_ISP1, "gout_isp1_gate_sclk_promise_isp1",
+	     "gout_top_gate_sclk_promise_int",
+	     ISP1_GATE_SCLK_PROMISE_ISP1, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info isp1_cmu_info __initconst = {
+	.mux_clks		= isp1_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(isp1_mux_clks),
+	.div_clks		= isp1_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(isp1_div_clks),
+	.gate_clks		= isp1_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(isp1_gate_clks),
+	.nr_clk_ids		= CLKS_NR_ISP1,
+	.clk_regs		= isp1_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(isp1_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_isp1_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &isp1_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_isp1, "samsung,exynos8890-cmu-isp1",
+	       exynos8890_cmu_isp1_init);
+
+/* ---- CMU_G3D ---------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_G3D (0x14aa0000) */
+#define G3D_MUX_G3D_PLL_USER			0x0200
+#define G3D_MUX_BUS_PLL_USER			0x0204
+#define G3D_MUX_G3D			0x020c
+#define G3D_DIV_ACLK_G3D			0x0400
+#define G3D_DIV_PCLK_G3D			0x0404
+#define G3D_DIV_SCLK_HPM_G3D			0x0408
+#define G3D_DIV_SCLK_ATE_G3D			0x040c
+#define G3D_GATE_ACLK_G3D			0x0800
+#define G3D_GATE_ACLK_GRAY_DEC			0x0804
+#define G3D_GATE_PCLK_SFW100_ACEL_G3D1			0x0900
+#define G3D_GATE_SCLK_HPM2_G3D			0x0a00
+#define G3D_GATE_SCLK_AXI_LH_ASYNC_SI_G3DIRAM			0x0a04
+
+static const unsigned long g3d_clk_regs[] __initconst = {
+	G3D_MUX_G3D_PLL_USER,
+	G3D_MUX_BUS_PLL_USER,
+	G3D_MUX_G3D,
+	G3D_DIV_ACLK_G3D,
+	G3D_DIV_PCLK_G3D,
+	G3D_DIV_SCLK_HPM_G3D,
+	G3D_DIV_SCLK_ATE_G3D,
+	G3D_GATE_ACLK_G3D,
+	G3D_GATE_ACLK_GRAY_DEC,
+	G3D_GATE_PCLK_SFW100_ACEL_G3D1,
+	G3D_GATE_SCLK_HPM2_G3D,
+	G3D_GATE_SCLK_AXI_LH_ASYNC_SI_G3DIRAM,
+};
+
+/* List of parent clocks for Muxes in CMU_G3D */
+PNAME(mout_g3d_mux_g3d_pll_user_p) = { "oscclk", "fout_g3d_pll" };
+PNAME(mout_g3d_mux_bus_pll_user_p) = { "oscclk", "gout_top_gate_sclk_bus_pll_g3d" };
+PNAME(mout_g3d_mux_g3d_p) = { "mout_g3d_mux_g3d_pll_user", "mout_g3d_mux_bus_pll_user" };
+
+static const struct samsung_mux_clock g3d_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_G3D_MUX_G3D_PLL_USER, "mout_g3d_mux_g3d_pll_user", mout_g3d_mux_g3d_pll_user_p,
+	    G3D_MUX_G3D_PLL_USER, 12, 1),
+	MUX(CLK_MOUT_G3D_MUX_BUS_PLL_USER, "mout_g3d_mux_bus_pll_user", mout_g3d_mux_bus_pll_user_p,
+	    G3D_MUX_BUS_PLL_USER, 12, 1),
+	MUX(CLK_MOUT_G3D_MUX_G3D, "mout_g3d_mux_g3d", mout_g3d_mux_g3d_p,
+	    G3D_MUX_G3D, 12, 1),
+};
+
+static const struct samsung_div_clock g3d_div_clks[] __initconst = {
+	DIV(CLK_DOUT_G3D_DIV_ACLK_G3D, "dout_g3d_div_aclk_g3d", "mout_g3d_mux_g3d",
+	    G3D_DIV_ACLK_G3D, 0, 3),
+	DIV(CLK_DOUT_G3D_DIV_PCLK_G3D, "dout_g3d_div_pclk_g3d", "dout_g3d_div_aclk_g3d",
+	    G3D_DIV_PCLK_G3D, 0, 3),
+	DIV(CLK_DOUT_G3D_DIV_SCLK_HPM_G3D, "dout_g3d_div_sclk_hpm_g3d", "mout_g3d_mux_g3d",
+	    G3D_DIV_SCLK_HPM_G3D, 0, 2),
+	DIV(CLK_DOUT_G3D_DIV_SCLK_ATE_G3D, "dout_g3d_div_sclk_ate_g3d", "mout_g3d_mux_g3d",
+	    G3D_DIV_SCLK_ATE_G3D, 0, 4),
+};
+
+static const struct samsung_gate_clock g3d_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_G3D_GATE_ACLK_G3D, "gout_g3d_gate_aclk_g3d", "dout_g3d_div_aclk_g3d",
+	     G3D_GATE_ACLK_G3D, 0, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_ACLK_GRAY_DEC, "gout_g3d_gate_aclk_gray_dec",
+	     "dout_g3d_div_aclk_g3d",
+	     G3D_GATE_ACLK_GRAY_DEC, 10, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_ACLK_SFW100_ACEL_G3D1, "gout_g3d_gate_aclk_sfw100_acel_g3d1",
+	     "dout_g3d_div_aclk_g3d",
+	     G3D_GATE_ACLK_GRAY_DEC, 9, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_ACLK_SFW100_ACEL_G3D0, "gout_g3d_gate_aclk_sfw100_acel_g3d0",
+	     "dout_g3d_div_aclk_g3d",
+	     G3D_GATE_ACLK_GRAY_DEC, 8, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_ACLK_XIU_G3D, "gout_g3d_gate_aclk_xiu_g3d", "dout_g3d_div_aclk_g3d",
+	     G3D_GATE_ACLK_GRAY_DEC, 7, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_ACLK_PPMU_G3D1, "gout_g3d_gate_aclk_ppmu_g3d1",
+	     "dout_g3d_div_aclk_g3d",
+	     G3D_GATE_ACLK_GRAY_DEC, 6, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_ACLK_PPMU_G3D0, "gout_g3d_gate_aclk_ppmu_g3d0",
+	     "dout_g3d_div_aclk_g3d",
+	     G3D_GATE_ACLK_GRAY_DEC, 5, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_ACLK_ASYNCAPBM_G3D, "gout_g3d_gate_aclk_asyncapbm_g3d",
+	     "dout_g3d_div_aclk_g3d",
+	     G3D_GATE_ACLK_GRAY_DEC, 4, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_ACLK_ASYNCAXI_G3D, "gout_g3d_gate_aclk_asyncaxi_g3d",
+	     "dout_g3d_div_aclk_g3d",
+	     G3D_GATE_ACLK_GRAY_DEC, 3, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_ACLK_AXI_DS_G3D, "gout_g3d_gate_aclk_axi_ds_g3d",
+	     "dout_g3d_div_aclk_g3d",
+	     G3D_GATE_ACLK_GRAY_DEC, 2, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_ACLK_ACEL_LH_ASYNC_SI_G3D1, "gout_g3d_gate_aclk_acel_lh_async_si_g3d1",
+	     "dout_g3d_div_aclk_g3d",
+	     G3D_GATE_ACLK_GRAY_DEC, 1, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_ACLK_ACEL_LH_ASYNC_SI_G3D0, "gout_g3d_gate_aclk_acel_lh_async_si_g3d0",
+	     "dout_g3d_div_aclk_g3d",
+	     G3D_GATE_ACLK_GRAY_DEC, 0, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_PCLK_SFW100_ACEL_G3D1, "gout_g3d_gate_pclk_sfw100_acel_g3d1",
+	     "dout_g3d_div_pclk_g3d",
+	     G3D_GATE_PCLK_SFW100_ACEL_G3D1, 9, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_PCLK_SFW100_ACEL_G3D0, "gout_g3d_gate_pclk_sfw100_acel_g3d0",
+	     "dout_g3d_div_pclk_g3d",
+	     G3D_GATE_PCLK_SFW100_ACEL_G3D1, 8, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_PCLK_HPM_G3D, "gout_g3d_gate_pclk_hpm_g3d", "dout_g3d_div_pclk_g3d",
+	     G3D_GATE_PCLK_SFW100_ACEL_G3D1, 7, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_PCLK_PPMU_G3D1, "gout_g3d_gate_pclk_ppmu_g3d1",
+	     "dout_g3d_div_pclk_g3d",
+	     G3D_GATE_PCLK_SFW100_ACEL_G3D1, 6, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_PCLK_PPMU_G3D0, "gout_g3d_gate_pclk_ppmu_g3d0",
+	     "dout_g3d_div_pclk_g3d",
+	     G3D_GATE_PCLK_SFW100_ACEL_G3D1, 5, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_PCLK_PMU_G3D, "gout_g3d_gate_pclk_pmu_g3d", "dout_g3d_div_pclk_g3d",
+	     G3D_GATE_PCLK_SFW100_ACEL_G3D1, 4, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_ACLK_ASYNCAPBS_G3D, "gout_g3d_gate_aclk_asyncapbs_g3d",
+	     "dout_g3d_div_pclk_g3d",
+	     G3D_GATE_PCLK_SFW100_ACEL_G3D1, 3, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_PCLK_SYSREG_G3D, "gout_g3d_gate_pclk_sysreg_g3d",
+	     "dout_g3d_div_pclk_g3d",
+	     G3D_GATE_PCLK_SFW100_ACEL_G3D1, 2, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_ACLK_AXI2APB_G3DP, "gout_g3d_gate_aclk_axi2apb_g3dp",
+	     "dout_g3d_div_pclk_g3d",
+	     G3D_GATE_PCLK_SFW100_ACEL_G3D1, 1, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_ACLK_AXI_LH_ASYNC_MI_G3DP, "gout_g3d_gate_aclk_axi_lh_async_mi_g3dp",
+	     "dout_g3d_div_pclk_g3d",
+	     G3D_GATE_PCLK_SFW100_ACEL_G3D1, 0, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_SCLK_HPM2_G3D, "gout_g3d_gate_sclk_hpm2_g3d",
+	     "dout_g3d_div_sclk_hpm_g3d",
+	     G3D_GATE_SCLK_HPM2_G3D, 2, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_SCLK_HPM1_G3D, "gout_g3d_gate_sclk_hpm1_g3d",
+	     "dout_g3d_div_sclk_hpm_g3d",
+	     G3D_GATE_SCLK_HPM2_G3D, 1, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_SCLK_HPM0_G3D, "gout_g3d_gate_sclk_hpm0_g3d",
+	     "dout_g3d_div_sclk_hpm_g3d",
+	     G3D_GATE_SCLK_HPM2_G3D, 0, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_SCLK_AXI_LH_ASYNC_SI_G3DIRAM, "gout_g3d_gate_sclk_axi_lh_async_si_g3diram",
+	     "dout_g3d_div_sclk_ate_g3d",
+	     G3D_GATE_SCLK_AXI_LH_ASYNC_SI_G3DIRAM, 1, 0, 0),
+	GATE(CLK_GOUT_G3D_GATE_SCLK_ASYNCAXI_G3D, "gout_g3d_gate_sclk_asyncaxi_g3d",
+	     "dout_g3d_div_sclk_ate_g3d",
+	     G3D_GATE_SCLK_AXI_LH_ASYNC_SI_G3DIRAM, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info g3d_cmu_info __initconst = {
+	.mux_clks		= g3d_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(g3d_mux_clks),
+	.div_clks		= g3d_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(g3d_div_clks),
+	.gate_clks		= g3d_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(g3d_gate_clks),
+	.nr_clk_ids		= CLKS_NR_G3D,
+	.clk_regs		= g3d_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(g3d_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_g3d_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &g3d_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_g3d, "samsung,exynos8890-cmu-g3d",
+	       exynos8890_cmu_g3d_init);
+
+/* ---- CMU_PERIC1 ------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_PERIC1 (0x14c80000) */
+#define PERIC1_MUX_ACLK_PERIC1_66_USER			0x0200
+#define PERIC1_MUX_SCLK_SPI0_USER			0x0204
+#define PERIC1_MUX_SCLK_SPI1_USER			0x0208
+#define PERIC1_MUX_SCLK_SPI2_USER			0x020c
+#define PERIC1_MUX_SCLK_SPI3_USER			0x0210
+#define PERIC1_MUX_SCLK_SPI4_USER			0x0214
+#define PERIC1_MUX_SCLK_SPI5_USER			0x0218
+#define PERIC1_MUX_SCLK_SPI6_USER			0x021c
+#define PERIC1_MUX_SCLK_SPI7_USER			0x0220
+#define PERIC1_MUX_SCLK_UART1_USER			0x0224
+#define PERIC1_MUX_SCLK_UART2_USER			0x0228
+#define PERIC1_MUX_SCLK_UART3_USER			0x022c
+#define PERIC1_MUX_SCLK_UART4_USER			0x0230
+#define PERIC1_MUX_SCLK_UART5_USER			0x0234
+#define PERIC1_GATE_PCLK_SPI7			0x0800
+#define PERIC1_GATE_PCLK_HSI2C14			0x0804
+#define PERIC1_GATE_SCLK_SPI0			0x0840
+#define PERIC1_GATE_SCLK_SPI1			0x0844
+#define PERIC1_GATE_SCLK_SPI2			0x0848
+#define PERIC1_GATE_SCLK_SPI3			0x084c
+#define PERIC1_GATE_SCLK_SPI4			0x0850
+#define PERIC1_GATE_SCLK_SPI5			0x0854
+#define PERIC1_GATE_SCLK_SPI6			0x0858
+#define PERIC1_GATE_SCLK_SPI7			0x085c
+#define PERIC1_GATE_SCLK_UART1			0x0860
+#define PERIC1_GATE_SCLK_UART2			0x0864
+#define PERIC1_GATE_SCLK_UART3			0x0868
+#define PERIC1_GATE_SCLK_UART4			0x086c
+#define PERIC1_GATE_SCLK_UART5			0x0870
+#define PERIC1_HWACG_GPIO_PERIC1			0x2410
+#define PERIC1_HWACG_GPIO_NFC			0x2414
+#define PERIC1_HWACG_GPIO_TOUCH			0x2418
+#define PERIC1_HWACG_GPIO_FF			0x241c
+#define PERIC1_HWACG_GPIO_ESE			0x2420
+#define PERIC1_HWACG_UART1			0x2424
+#define PERIC1_HWACG_UART2			0x2428
+#define PERIC1_HWACG_UART3			0x242c
+#define PERIC1_HWACG_UART4			0x2430
+#define PERIC1_HWACG_UART5			0x2434
+#define PERIC1_HWACG_SPI0			0x2438
+#define PERIC1_HWACG_SPI1			0x243c
+#define PERIC1_HWACG_SPI2			0x2440
+#define PERIC1_HWACG_SPI3			0x2444
+#define PERIC1_HWACG_SPI4			0x2448
+#define PERIC1_HWACG_SPI5			0x244c
+#define PERIC1_HWACG_SPI6			0x2450
+#define PERIC1_HWACG_SPI7			0x2454
+#define PERIC1_HWACG_HSI2C2			0x2458
+#define PERIC1_HWACG_HSI2C3			0x245c
+#define PERIC1_HWACG_HSI2C6			0x2460
+#define PERIC1_HWACG_HSI2C7			0x2464
+#define PERIC1_HWACG_HSI2C8			0x2468
+#define PERIC1_HWACG_HSI2C12			0x246c
+#define PERIC1_HWACG_HSI2C13			0x2470
+#define PERIC1_HWACG_HSI2C14			0x2474
+
+static const unsigned long peric1_clk_regs[] __initconst = {
+	PERIC1_MUX_ACLK_PERIC1_66_USER,
+	PERIC1_MUX_SCLK_SPI0_USER,
+	PERIC1_MUX_SCLK_SPI1_USER,
+	PERIC1_MUX_SCLK_SPI2_USER,
+	PERIC1_MUX_SCLK_SPI3_USER,
+	PERIC1_MUX_SCLK_SPI4_USER,
+	PERIC1_MUX_SCLK_SPI5_USER,
+	PERIC1_MUX_SCLK_SPI6_USER,
+	PERIC1_MUX_SCLK_SPI7_USER,
+	PERIC1_MUX_SCLK_UART1_USER,
+	PERIC1_MUX_SCLK_UART2_USER,
+	PERIC1_MUX_SCLK_UART3_USER,
+	PERIC1_MUX_SCLK_UART4_USER,
+	PERIC1_MUX_SCLK_UART5_USER,
+	PERIC1_GATE_PCLK_SPI7,
+	PERIC1_GATE_PCLK_HSI2C14,
+	PERIC1_GATE_SCLK_SPI0,
+	PERIC1_GATE_SCLK_SPI1,
+	PERIC1_GATE_SCLK_SPI2,
+	PERIC1_GATE_SCLK_SPI3,
+	PERIC1_GATE_SCLK_SPI4,
+	PERIC1_GATE_SCLK_SPI5,
+	PERIC1_GATE_SCLK_SPI6,
+	PERIC1_GATE_SCLK_SPI7,
+	PERIC1_GATE_SCLK_UART1,
+	PERIC1_GATE_SCLK_UART2,
+	PERIC1_GATE_SCLK_UART3,
+	PERIC1_GATE_SCLK_UART4,
+	PERIC1_GATE_SCLK_UART5,
+	PERIC1_HWACG_GPIO_PERIC1,
+	PERIC1_HWACG_GPIO_NFC,
+	PERIC1_HWACG_GPIO_TOUCH,
+	PERIC1_HWACG_GPIO_FF,
+	PERIC1_HWACG_GPIO_ESE,
+	PERIC1_HWACG_UART1,
+	PERIC1_HWACG_UART2,
+	PERIC1_HWACG_UART3,
+	PERIC1_HWACG_UART4,
+	PERIC1_HWACG_UART5,
+	PERIC1_HWACG_SPI0,
+	PERIC1_HWACG_SPI1,
+	PERIC1_HWACG_SPI2,
+	PERIC1_HWACG_SPI3,
+	PERIC1_HWACG_SPI4,
+	PERIC1_HWACG_SPI5,
+	PERIC1_HWACG_SPI6,
+	PERIC1_HWACG_SPI7,
+	PERIC1_HWACG_HSI2C2,
+	PERIC1_HWACG_HSI2C3,
+	PERIC1_HWACG_HSI2C6,
+	PERIC1_HWACG_HSI2C7,
+	PERIC1_HWACG_HSI2C8,
+	PERIC1_HWACG_HSI2C12,
+	PERIC1_HWACG_HSI2C13,
+	PERIC1_HWACG_HSI2C14,
+};
+
+/* List of parent clocks for Muxes in CMU_PERIC1 */
+PNAME(mout_peric1_mux_aclk_peric1_66_user_p) = { "oscclk", "gout_top_gate_aclk_peric1_66" };
+PNAME(mout_peric1_mux_sclk_spi0_user_p) = { "oscclk", "gout_top_gate_sclk_peric1_spi0" };
+PNAME(mout_peric1_mux_sclk_spi1_user_p) = { "oscclk", "gout_top_gate_sclk_peric1_spi1" };
+PNAME(mout_peric1_mux_sclk_spi2_user_p) = { "oscclk", "gout_top_gate_sclk_peric1_spi2" };
+PNAME(mout_peric1_mux_sclk_spi3_user_p) = { "oscclk", "gout_top_gate_sclk_peric1_spi3" };
+PNAME(mout_peric1_mux_sclk_spi4_user_p) = { "oscclk", "gout_top_gate_sclk_peric1_spi4" };
+PNAME(mout_peric1_mux_sclk_spi5_user_p) = { "oscclk", "gout_top_gate_sclk_peric1_spi5" };
+PNAME(mout_peric1_mux_sclk_spi6_user_p) = { "oscclk", "gout_top_gate_sclk_peric1_spi6" };
+PNAME(mout_peric1_mux_sclk_spi7_user_p) = { "oscclk", "gout_top_gate_sclk_peric1_spi7" };
+PNAME(mout_peric1_mux_sclk_uart1_user_p) = { "oscclk", "gout_top_gate_sclk_peric1_uart1" };
+PNAME(mout_peric1_mux_sclk_uart2_user_p) = { "oscclk", "gout_top_gate_sclk_peric1_uart2" };
+PNAME(mout_peric1_mux_sclk_uart3_user_p) = { "oscclk", "gout_top_gate_sclk_peric1_uart3" };
+PNAME(mout_peric1_mux_sclk_uart4_user_p) = { "oscclk", "gout_top_gate_sclk_peric1_uart4" };
+PNAME(mout_peric1_mux_sclk_uart5_user_p) = { "oscclk", "gout_top_gate_sclk_peric1_uart5" };
+
+static const struct samsung_mux_clock peric1_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_PERIC1_MUX_ACLK_PERIC1_66_USER, "mout_peric1_mux_aclk_peric1_66_user",
+	    mout_peric1_mux_aclk_peric1_66_user_p,
+	    PERIC1_MUX_ACLK_PERIC1_66_USER, 12, 1),
+	MUX(CLK_MOUT_PERIC1_MUX_SCLK_SPI0_USER, "mout_peric1_mux_sclk_spi0_user",
+	    mout_peric1_mux_sclk_spi0_user_p,
+	    PERIC1_MUX_SCLK_SPI0_USER, 12, 1),
+	MUX(CLK_MOUT_PERIC1_MUX_SCLK_SPI1_USER, "mout_peric1_mux_sclk_spi1_user",
+	    mout_peric1_mux_sclk_spi1_user_p,
+	    PERIC1_MUX_SCLK_SPI1_USER, 12, 1),
+	MUX(CLK_MOUT_PERIC1_MUX_SCLK_SPI2_USER, "mout_peric1_mux_sclk_spi2_user",
+	    mout_peric1_mux_sclk_spi2_user_p,
+	    PERIC1_MUX_SCLK_SPI2_USER, 12, 1),
+	MUX(CLK_MOUT_PERIC1_MUX_SCLK_SPI3_USER, "mout_peric1_mux_sclk_spi3_user",
+	    mout_peric1_mux_sclk_spi3_user_p,
+	    PERIC1_MUX_SCLK_SPI3_USER, 12, 1),
+	MUX(CLK_MOUT_PERIC1_MUX_SCLK_SPI4_USER, "mout_peric1_mux_sclk_spi4_user",
+	    mout_peric1_mux_sclk_spi4_user_p,
+	    PERIC1_MUX_SCLK_SPI4_USER, 12, 1),
+	MUX(CLK_MOUT_PERIC1_MUX_SCLK_SPI5_USER, "mout_peric1_mux_sclk_spi5_user",
+	    mout_peric1_mux_sclk_spi5_user_p,
+	    PERIC1_MUX_SCLK_SPI5_USER, 12, 1),
+	MUX(CLK_MOUT_PERIC1_MUX_SCLK_SPI6_USER, "mout_peric1_mux_sclk_spi6_user",
+	    mout_peric1_mux_sclk_spi6_user_p,
+	    PERIC1_MUX_SCLK_SPI6_USER, 12, 1),
+	MUX(CLK_MOUT_PERIC1_MUX_SCLK_SPI7_USER, "mout_peric1_mux_sclk_spi7_user",
+	    mout_peric1_mux_sclk_spi7_user_p,
+	    PERIC1_MUX_SCLK_SPI7_USER, 12, 1),
+	MUX(CLK_MOUT_PERIC1_MUX_SCLK_UART1_USER, "mout_peric1_mux_sclk_uart1_user",
+	    mout_peric1_mux_sclk_uart1_user_p,
+	    PERIC1_MUX_SCLK_UART1_USER, 12, 1),
+	MUX(CLK_MOUT_PERIC1_MUX_SCLK_UART2_USER, "mout_peric1_mux_sclk_uart2_user",
+	    mout_peric1_mux_sclk_uart2_user_p,
+	    PERIC1_MUX_SCLK_UART2_USER, 12, 1),
+	MUX(CLK_MOUT_PERIC1_MUX_SCLK_UART3_USER, "mout_peric1_mux_sclk_uart3_user",
+	    mout_peric1_mux_sclk_uart3_user_p,
+	    PERIC1_MUX_SCLK_UART3_USER, 12, 1),
+	MUX(CLK_MOUT_PERIC1_MUX_SCLK_UART4_USER, "mout_peric1_mux_sclk_uart4_user",
+	    mout_peric1_mux_sclk_uart4_user_p,
+	    PERIC1_MUX_SCLK_UART4_USER, 12, 1),
+	MUX(CLK_MOUT_PERIC1_MUX_SCLK_UART5_USER, "mout_peric1_mux_sclk_uart5_user",
+	    mout_peric1_mux_sclk_uart5_user_p,
+	    PERIC1_MUX_SCLK_UART5_USER, 12, 1),
+};
+
+static const struct samsung_gate_clock peric1_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_SPI7, "gout_peric1_gate_pclk_spi7",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 25, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_SPI6, "gout_peric1_gate_pclk_spi6",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 24, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_SPI5, "gout_peric1_gate_pclk_spi5",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 23, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_SPI4, "gout_peric1_gate_pclk_spi4",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 22, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_SPI3, "gout_peric1_gate_pclk_spi3",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 21, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_SPI2, "gout_peric1_gate_pclk_spi2",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 20, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_SPI1, "gout_peric1_gate_pclk_spi1",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 19, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_SPI0, "gout_peric1_gate_pclk_spi0",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 18, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_UART5, "gout_peric1_gate_pclk_uart5",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 17, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_UART4, "gout_peric1_gate_pclk_uart4",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 16, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_UART3, "gout_peric1_gate_pclk_uart3",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 15, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_UART2, "gout_peric1_gate_pclk_uart2",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 14, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_UART1, "gout_peric1_gate_pclk_uart1",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 13, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_GPIO_ESE, "gout_peric1_gate_pclk_gpio_ese",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 12, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_GPIO_FF, "gout_peric1_gate_pclk_gpio_ff",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 11, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_GPIO_TOUCH, "gout_peric1_gate_pclk_gpio_touch",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 10, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_GPIO_NFC, "gout_peric1_gate_pclk_gpio_nfc",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 9, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_GPIO_PERIC1, "gout_peric1_gate_pclk_gpio_peric1",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 8, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_SYSREG_PERIC1, "gout_peric1_gate_pclk_sysreg_peric1",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 7, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_PMU_PERIC1, "gout_peric1_gate_pclk_pmu_peric1",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 6, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_CMU_PERIC1, "gout_peric1_gate_pclk_cmu_peric1",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 5, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_ACLK_AXI2APB_PERIC1_2P, "gout_peric1_gate_aclk_axi2apb_peric1_2p",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 4, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_ACLK_AXI2APB_PERIC1_1P, "gout_peric1_gate_aclk_axi2apb_peric1_1p",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 3, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_ACLK_AXI2APB_PERIC1_0P, "gout_peric1_gate_aclk_axi2apb_peric1_0p",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 2, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_ACLK_XIU_PERIC1SFRX, "gout_peric1_gate_aclk_xiu_peric1sfrx",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_ACLK_AXILHASYNCM_PERIC1, "gout_peric1_gate_aclk_axilhasyncm_peric1",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_SPI7, 0, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_HSI2C14, "gout_peric1_gate_pclk_hsi2c14",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_HSI2C14, 7, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_HSI2C13, "gout_peric1_gate_pclk_hsi2c13",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_HSI2C14, 6, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_HSI2C12, "gout_peric1_gate_pclk_hsi2c12",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_HSI2C14, 5, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_HSI2C8, "gout_peric1_gate_pclk_hsi2c8",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_HSI2C14, 4, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_HSI2C7, "gout_peric1_gate_pclk_hsi2c7",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_HSI2C14, 3, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_HSI2C6, "gout_peric1_gate_pclk_hsi2c6",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_HSI2C14, 2, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_HSI2C3, "gout_peric1_gate_pclk_hsi2c3",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_HSI2C14, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_PCLK_HSI2C2, "gout_peric1_gate_pclk_hsi2c2",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_GATE_PCLK_HSI2C14, 0, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_SCLK_SPI0, "gout_peric1_gate_sclk_spi0",
+	     "mout_peric1_mux_sclk_spi0_user",
+	     PERIC1_GATE_SCLK_SPI0, 0, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_SCLK_SPI1, "gout_peric1_gate_sclk_spi1",
+	     "mout_peric1_mux_sclk_spi1_user",
+	     PERIC1_GATE_SCLK_SPI1, 0, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_SCLK_SPI2, "gout_peric1_gate_sclk_spi2",
+	     "mout_peric1_mux_sclk_spi2_user",
+	     PERIC1_GATE_SCLK_SPI2, 0, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_SCLK_SPI3, "gout_peric1_gate_sclk_spi3",
+	     "mout_peric1_mux_sclk_spi3_user",
+	     PERIC1_GATE_SCLK_SPI3, 0, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_SCLK_SPI4, "gout_peric1_gate_sclk_spi4",
+	     "mout_peric1_mux_sclk_spi4_user",
+	     PERIC1_GATE_SCLK_SPI4, 0, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_SCLK_SPI5, "gout_peric1_gate_sclk_spi5",
+	     "mout_peric1_mux_sclk_spi5_user",
+	     PERIC1_GATE_SCLK_SPI5, 0, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_SCLK_SPI6, "gout_peric1_gate_sclk_spi6",
+	     "mout_peric1_mux_sclk_spi6_user",
+	     PERIC1_GATE_SCLK_SPI6, 0, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_SCLK_SPI7, "gout_peric1_gate_sclk_spi7",
+	     "mout_peric1_mux_sclk_spi7_user",
+	     PERIC1_GATE_SCLK_SPI7, 0, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_SCLK_UART1, "gout_peric1_gate_sclk_uart1",
+	     "mout_peric1_mux_sclk_uart1_user",
+	     PERIC1_GATE_SCLK_UART1, 0, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_SCLK_UART2, "gout_peric1_gate_sclk_uart2",
+	     "mout_peric1_mux_sclk_uart2_user",
+	     PERIC1_GATE_SCLK_UART2, 0, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_SCLK_UART3, "gout_peric1_gate_sclk_uart3",
+	     "mout_peric1_mux_sclk_uart3_user",
+	     PERIC1_GATE_SCLK_UART3, 0, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_SCLK_UART4, "gout_peric1_gate_sclk_uart4",
+	     "mout_peric1_mux_sclk_uart4_user",
+	     PERIC1_GATE_SCLK_UART4, 0, 0, 0),
+	GATE(CLK_GOUT_PERIC1_GATE_SCLK_UART5, "gout_peric1_gate_sclk_uart5",
+	     "mout_peric1_mux_sclk_uart5_user",
+	     PERIC1_GATE_SCLK_UART5, 0, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_GPIO_PERIC1, "gout_peric1_hwacg_gpio_peric1",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_GPIO_PERIC1, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_GPIO_NFC, "gout_peric1_hwacg_gpio_nfc",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_GPIO_NFC, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_GPIO_TOUCH, "gout_peric1_hwacg_gpio_touch",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_GPIO_TOUCH, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_GPIO_FF, "gout_peric1_hwacg_gpio_ff",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_GPIO_FF, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_GPIO_ESE, "gout_peric1_hwacg_gpio_ese",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_GPIO_ESE, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_UART1, "gout_peric1_hwacg_uart1",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_UART1, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_UART2, "gout_peric1_hwacg_uart2",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_UART2, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_UART3, "gout_peric1_hwacg_uart3",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_UART3, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_UART4, "gout_peric1_hwacg_uart4",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_UART4, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_UART5, "gout_peric1_hwacg_uart5",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_UART5, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_SPI0, "gout_peric1_hwacg_spi0",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_SPI0, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_SPI1, "gout_peric1_hwacg_spi1",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_SPI1, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_SPI2, "gout_peric1_hwacg_spi2",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_SPI2, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_SPI3, "gout_peric1_hwacg_spi3",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_SPI3, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_SPI4, "gout_peric1_hwacg_spi4",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_SPI4, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_SPI5, "gout_peric1_hwacg_spi5",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_SPI5, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_SPI6, "gout_peric1_hwacg_spi6",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_SPI6, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_SPI7, "gout_peric1_hwacg_spi7",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_SPI7, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_HSI2C2, "gout_peric1_hwacg_hsi2c2",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_HSI2C2, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_HSI2C3, "gout_peric1_hwacg_hsi2c3",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_HSI2C3, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_HSI2C6, "gout_peric1_hwacg_hsi2c6",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_HSI2C6, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_HSI2C7, "gout_peric1_hwacg_hsi2c7",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_HSI2C7, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_HSI2C8, "gout_peric1_hwacg_hsi2c8",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_HSI2C8, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_HSI2C12, "gout_peric1_hwacg_hsi2c12",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_HSI2C12, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_HSI2C13, "gout_peric1_hwacg_hsi2c13",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_HSI2C13, 1, 0, 0),
+	GATE(CLK_GOUT_PERIC1_HWACG_HSI2C14, "gout_peric1_hwacg_hsi2c14",
+	     "mout_peric1_mux_aclk_peric1_66_user",
+	     PERIC1_HWACG_HSI2C14, 1, 0, 0),
+};
+
+static const struct samsung_cmu_info peric1_cmu_info __initconst = {
+	.mux_clks		= peric1_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(peric1_mux_clks),
+	.gate_clks		= peric1_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(peric1_gate_clks),
+	.nr_clk_ids		= CLKS_NR_PERIC1,
+	.clk_regs		= peric1_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(peric1_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_peric1_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &peric1_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_peric1, "samsung,exynos8890-cmu-peric1",
+	       exynos8890_cmu_peric1_init);
+
+/* ---- CMU_MSCL --------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_MSCL (0x150d0000) */
+#define MSCL_MUX_ACLK_MSCL0_528_USER			0x0200
+#define MSCL_MUX_ACLK_MSCL1_528_USER			0x0204
+#define MSCL_MUX_ACLK_MSCL1_528			0x0210
+#define MSCL_DIV_PCLK_MSCL			0x0400
+#define MSCL_GATE_ACLK_ASYNCAPB_JPEG			0x0800
+#define MSCL_GATE_ACLK_SFW_MSCL_0			0x0804
+#define MSCL_GATE_ACLK_ASYNCAPB_G2D			0x0808
+#define MSCL_GATE_ACLK_SFW_MSCL_1			0x080c
+#define MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR			0x0820
+#define MSCL_GATE_PCLK_SFW_MSCL_0			0x0824
+#define MSCL_GATE_PCLK_SFW_MSCL_1			0x0828
+
+static const unsigned long mscl_clk_regs[] __initconst = {
+	MSCL_MUX_ACLK_MSCL0_528_USER,
+	MSCL_MUX_ACLK_MSCL1_528_USER,
+	MSCL_MUX_ACLK_MSCL1_528,
+	MSCL_DIV_PCLK_MSCL,
+	MSCL_GATE_ACLK_ASYNCAPB_JPEG,
+	MSCL_GATE_ACLK_SFW_MSCL_0,
+	MSCL_GATE_ACLK_ASYNCAPB_G2D,
+	MSCL_GATE_ACLK_SFW_MSCL_1,
+	MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR,
+	MSCL_GATE_PCLK_SFW_MSCL_0,
+	MSCL_GATE_PCLK_SFW_MSCL_1,
+};
+
+/* List of parent clocks for Muxes in CMU_MSCL */
+PNAME(mout_mscl_mux_aclk_mscl0_528_user_p) = { "oscclk", "gout_top_gate_aclk_mscl0_528" };
+PNAME(mout_mscl_mux_aclk_mscl1_528_user_p) = { "oscclk", "gout_top_gate_aclk_mscl1_528" };
+PNAME(mout_mscl_mux_aclk_mscl1_528_p) = { "mout_mscl_mux_aclk_mscl0_528_user", "mout_mscl_mux_aclk_mscl1_528_user" };
+
+static const struct samsung_mux_clock mscl_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_MSCL_MUX_ACLK_MSCL0_528_USER, "mout_mscl_mux_aclk_mscl0_528_user",
+	    mout_mscl_mux_aclk_mscl0_528_user_p,
+	    MSCL_MUX_ACLK_MSCL0_528_USER, 12, 1),
+	MUX(CLK_MOUT_MSCL_MUX_ACLK_MSCL1_528_USER, "mout_mscl_mux_aclk_mscl1_528_user",
+	    mout_mscl_mux_aclk_mscl1_528_user_p,
+	    MSCL_MUX_ACLK_MSCL1_528_USER, 12, 1),
+	MUX(CLK_MOUT_MSCL_MUX_ACLK_MSCL1_528, "mout_mscl_mux_aclk_mscl1_528",
+	    mout_mscl_mux_aclk_mscl1_528_p,
+	    MSCL_MUX_ACLK_MSCL1_528, 12, 1),
+};
+
+static const struct samsung_div_clock mscl_div_clks[] __initconst = {
+	DIV(CLK_DOUT_MSCL_DIV_PCLK_MSCL, "dout_mscl_div_pclk_mscl",
+	    "mout_mscl_mux_aclk_mscl0_528_user",
+	    MSCL_DIV_PCLK_MSCL, 0, 3),
+};
+
+static const struct samsung_gate_clock mscl_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_ASYNCAPB_JPEG, "gout_mscl_gate_aclk_asyncapb_jpeg",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_JPEG, 9, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_PPMU_MSCL_0, "gout_mscl_gate_aclk_ppmu_mscl_0",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_JPEG, 8, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_SMMU_JPEG, "gout_mscl_gate_aclk_smmu_jpeg",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_JPEG, 7, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_SMMU_MSCL_0, "gout_mscl_gate_aclk_smmu_mscl_0",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_JPEG, 6, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_QE_JPEG, "gout_mscl_gate_aclk_qe_jpeg",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_JPEG, 5, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_QE_MSCL_0, "gout_mscl_gate_aclk_qe_mscl_0",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_JPEG, 4, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_XIU_MSCLX_0, "gout_mscl_gate_aclk_xiu_msclx_0",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_JPEG, 3, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_LH_ASYNC_SI_MSCL_0, "gout_mscl_gate_aclk_lh_async_si_mscl_0",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_JPEG, 2, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_JPEG, "gout_mscl_gate_aclk_jpeg",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_JPEG, 1, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_MSCL_0, "gout_mscl_gate_aclk_mscl_0",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_JPEG, 0, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_SFW_MSCL_0, "gout_mscl_gate_aclk_sfw_mscl_0",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_SFW_MSCL_0, 0, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_ASYNCAPB_G2D, "gout_mscl_gate_aclk_asyncapb_g2d",
+	     "mout_mscl_mux_aclk_mscl1_528",
+	     MSCL_GATE_ACLK_ASYNCAPB_G2D, 10, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_PPMU_MSCL_1, "gout_mscl_gate_aclk_ppmu_mscl_1",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_G2D, 9, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_SMMU_G2D, "gout_mscl_gate_aclk_smmu_g2d",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_G2D, 8, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_SMMU_MSCL_1, "gout_mscl_gate_aclk_smmu_mscl_1",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_G2D, 7, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_QE_G2D, "gout_mscl_gate_aclk_qe_g2d",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_G2D, 6, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_QE_MSCL_1, "gout_mscl_gate_aclk_qe_mscl_1",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_G2D, 5, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_AXI2ACEL, "gout_mscl_gate_aclk_axi2acel",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_G2D, 4, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_XIU_MSCLX_1, "gout_mscl_gate_aclk_xiu_msclx_1",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_G2D, 3, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_LH_ASYNC_SI_MSCL_1, "gout_mscl_gate_aclk_lh_async_si_mscl_1",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_G2D, 2, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_G2D, "gout_mscl_gate_aclk_g2d",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_G2D, 1, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_MSCL_1, "gout_mscl_gate_aclk_mscl_1",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_ASYNCAPB_G2D, 0, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_SFW_MSCL_1, "gout_mscl_gate_aclk_sfw_mscl_1",
+	     "mout_mscl_mux_aclk_mscl0_528_user",
+	     MSCL_GATE_ACLK_SFW_MSCL_1, 0, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, "gout_mscl_gate_aclk_lh_async_mi_msclsfr",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 20, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_PMU_MSCL, "gout_mscl_gate_pclk_pmu_mscl",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 19, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_SYSREG_MSCL, "gout_mscl_gate_pclk_sysreg_mscl",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 18, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_CMU_MSCL, "gout_mscl_gate_pclk_cmu_mscl",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 17, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_PPMU_MSCL_1, "gout_mscl_gate_pclk_ppmu_mscl_1",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 16, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_PPMU_MSCL_0, "gout_mscl_gate_pclk_ppmu_mscl_0",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 15, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_SMMU_G2D, "gout_mscl_gate_pclk_smmu_g2d",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 14, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_SMMU_JPEG, "gout_mscl_gate_pclk_smmu_jpeg",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 13, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_SMMU_MSCL_1, "gout_mscl_gate_pclk_smmu_mscl_1",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 12, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_SMMU_MSCL_0, "gout_mscl_gate_pclk_smmu_mscl_0",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 11, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_QE_G2D, "gout_mscl_gate_pclk_qe_g2d",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 10, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_QE_JPEG, "gout_mscl_gate_pclk_qe_jpeg",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 9, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_QE_MSCL_1, "gout_mscl_gate_pclk_qe_mscl_1",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 8, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_QE_MSCL_0, "gout_mscl_gate_pclk_qe_mscl_0",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 7, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_ASYNCAPB_G2D, "gout_mscl_gate_pclk_asyncapb_g2d",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 6, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_ASYNCAPB_JPEG, "gout_mscl_gate_pclk_asyncapb_jpeg",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 5, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_MSCL_1, "gout_mscl_gate_pclk_mscl_1",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 4, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_MSCL_0, "gout_mscl_gate_pclk_mscl_0",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 3, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_AXI2APB_MSCLSFR_1P, "gout_mscl_gate_aclk_axi2apb_msclsfr_1p",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 2, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_AXI2APB_MSCLSFR_0P, "gout_mscl_gate_aclk_axi2apb_msclsfr_0p",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 1, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_ACLK_XIU_MSCLSFRX, "gout_mscl_gate_aclk_xiu_msclsfrx",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_ACLK_LH_ASYNC_MI_MSCLSFR, 0, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_SFW_MSCL_0, "gout_mscl_gate_pclk_sfw_mscl_0",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_PCLK_SFW_MSCL_0, 0, 0, 0),
+	GATE(CLK_GOUT_MSCL_GATE_PCLK_SFW_MSCL_1, "gout_mscl_gate_pclk_sfw_mscl_1",
+	     "dout_mscl_div_pclk_mscl",
+	     MSCL_GATE_PCLK_SFW_MSCL_1, 0, 0, 0),
+};
+
+static const struct samsung_cmu_info mscl_cmu_info __initconst = {
+	.mux_clks		= mscl_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(mscl_mux_clks),
+	.div_clks		= mscl_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(mscl_div_clks),
+	.gate_clks		= mscl_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(mscl_gate_clks),
+	.nr_clk_ids		= CLKS_NR_MSCL,
+	.clk_regs		= mscl_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(mscl_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_mscl_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &mscl_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_mscl, "samsung,exynos8890-cmu-mscl",
+	       exynos8890_cmu_mscl_init);
+
+/* ---- CMU_MFC ---------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_MFC (0x15280000) */
+#define MFC_MUX_ACLK_MFC_600_USER			0x0200
+#define MFC_DIV_PCLK_MFC_150			0x0400
+#define MFC_GATE_ACLK_ASYNCAPB_MFC			0x0800
+#define MFC_GATE_ACLK_SFW_MFC_0			0x0804
+#define MFC_GATE_ACLK_SFW_MFC_1			0x0808
+#define MFC_GATE_PCLK_SYSREG_MFC			0x0820
+#define MFC_GATE_PCLK_HPM_APBIF_MFC			0x0824
+#define MFC_GATE_PCLK_SFW_MFC_0			0x0828
+#define MFC_GATE_PCLK_SFW_MFC_1			0x082c
+#define MFC_GATE_SCLK_PROMISE_MFC			0x0840
+#define MFC_HWACG_HPM_APBIF_MFC			0x2404
+#define MFC_HWACG_PROMISE_MFC			0x2408
+
+static const unsigned long mfc_clk_regs[] __initconst = {
+	MFC_MUX_ACLK_MFC_600_USER,
+	MFC_DIV_PCLK_MFC_150,
+	MFC_GATE_ACLK_ASYNCAPB_MFC,
+	MFC_GATE_ACLK_SFW_MFC_0,
+	MFC_GATE_ACLK_SFW_MFC_1,
+	MFC_GATE_PCLK_SYSREG_MFC,
+	MFC_GATE_PCLK_HPM_APBIF_MFC,
+	MFC_GATE_PCLK_SFW_MFC_0,
+	MFC_GATE_PCLK_SFW_MFC_1,
+	MFC_GATE_SCLK_PROMISE_MFC,
+	MFC_HWACG_HPM_APBIF_MFC,
+	MFC_HWACG_PROMISE_MFC,
+};
+
+/* List of parent clocks for Muxes in CMU_MFC */
+PNAME(mout_mfc_mux_aclk_mfc_600_user_p) = { "oscclk", "gout_top_gate_aclk_mfc_600" };
+
+static const struct samsung_mux_clock mfc_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_MFC_MUX_ACLK_MFC_600_USER, "mout_mfc_mux_aclk_mfc_600_user",
+	    mout_mfc_mux_aclk_mfc_600_user_p,
+	    MFC_MUX_ACLK_MFC_600_USER, 12, 1),
+};
+
+static const struct samsung_div_clock mfc_div_clks[] __initconst = {
+	DIV(CLK_DOUT_MFC_DIV_PCLK_MFC_150, "dout_mfc_div_pclk_mfc_150",
+	    "mout_mfc_mux_aclk_mfc_600_user",
+	    MFC_DIV_PCLK_MFC_150, 0, 2),
+};
+
+static const struct samsung_gate_clock mfc_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_MFC_GATE_ACLK_ASYNCAPB_MFC, "gout_mfc_gate_aclk_asyncapb_mfc",
+	     "mout_mfc_mux_aclk_mfc_600_user",
+	     MFC_GATE_ACLK_ASYNCAPB_MFC, 7, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_ACLK_SMMU_MFC_1, "gout_mfc_gate_aclk_smmu_mfc_1",
+	     "mout_mfc_mux_aclk_mfc_600_user",
+	     MFC_GATE_ACLK_ASYNCAPB_MFC, 6, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_ACLK_SMMU_MFC_0, "gout_mfc_gate_aclk_smmu_mfc_0",
+	     "mout_mfc_mux_aclk_mfc_600_user",
+	     MFC_GATE_ACLK_ASYNCAPB_MFC, 5, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_ACLK_MFC, "gout_mfc_gate_aclk_mfc", "mout_mfc_mux_aclk_mfc_600_user",
+	     MFC_GATE_ACLK_ASYNCAPB_MFC, 4, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_ACLK_PPMU_MFC_1, "gout_mfc_gate_aclk_ppmu_mfc_1",
+	     "mout_mfc_mux_aclk_mfc_600_user",
+	     MFC_GATE_ACLK_ASYNCAPB_MFC, 3, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_ACLK_PPMU_MFC_0, "gout_mfc_gate_aclk_ppmu_mfc_0",
+	     "mout_mfc_mux_aclk_mfc_600_user",
+	     MFC_GATE_ACLK_ASYNCAPB_MFC, 2, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_ACLK_LH_S_MFC_1, "gout_mfc_gate_aclk_lh_s_mfc_1",
+	     "mout_mfc_mux_aclk_mfc_600_user",
+	     MFC_GATE_ACLK_ASYNCAPB_MFC, 1, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_ACLK_LH_S_MFC_0, "gout_mfc_gate_aclk_lh_s_mfc_0",
+	     "mout_mfc_mux_aclk_mfc_600_user",
+	     MFC_GATE_ACLK_ASYNCAPB_MFC, 0, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_ACLK_SFW_MFC_0, "gout_mfc_gate_aclk_sfw_mfc_0",
+	     "mout_mfc_mux_aclk_mfc_600_user",
+	     MFC_GATE_ACLK_SFW_MFC_0, 0, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_ACLK_SFW_MFC_1, "gout_mfc_gate_aclk_sfw_mfc_1",
+	     "mout_mfc_mux_aclk_mfc_600_user",
+	     MFC_GATE_ACLK_SFW_MFC_1, 0, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_PCLK_SYSREG_MFC, "gout_mfc_gate_pclk_sysreg_mfc",
+	     "dout_mfc_div_pclk_mfc_150",
+	     MFC_GATE_PCLK_SYSREG_MFC, 9, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_PCLK_SMMU_MFC_1, "gout_mfc_gate_pclk_smmu_mfc_1",
+	     "dout_mfc_div_pclk_mfc_150",
+	     MFC_GATE_PCLK_SYSREG_MFC, 8, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_PCLK_SMMU_MFC_0, "gout_mfc_gate_pclk_smmu_mfc_0",
+	     "dout_mfc_div_pclk_mfc_150",
+	     MFC_GATE_PCLK_SYSREG_MFC, 7, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_PCLK_PPMU_MFC_1, "gout_mfc_gate_pclk_ppmu_mfc_1",
+	     "dout_mfc_div_pclk_mfc_150",
+	     MFC_GATE_PCLK_SYSREG_MFC, 6, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_PCLK_PPMU_MFC_0, "gout_mfc_gate_pclk_ppmu_mfc_0",
+	     "dout_mfc_div_pclk_mfc_150",
+	     MFC_GATE_PCLK_SYSREG_MFC, 5, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_PCLK_PMU_MFC, "gout_mfc_gate_pclk_pmu_mfc",
+	     "dout_mfc_div_pclk_mfc_150",
+	     MFC_GATE_PCLK_SYSREG_MFC, 4, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_PCLK_CMU_MFC, "gout_mfc_gate_pclk_cmu_mfc",
+	     "dout_mfc_div_pclk_mfc_150",
+	     MFC_GATE_PCLK_SYSREG_MFC, 3, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_MFC_GATE_PCLK_ASYNCAPB_MFC, "gout_mfc_gate_pclk_asyncapb_mfc",
+	     "dout_mfc_div_pclk_mfc_150",
+	     MFC_GATE_PCLK_SYSREG_MFC, 2, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_ACLK_AXI2APB_MFCSFR, "gout_mfc_gate_aclk_axi2apb_mfcsfr",
+	     "dout_mfc_div_pclk_mfc_150",
+	     MFC_GATE_PCLK_SYSREG_MFC, 1, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_ACLK_LH_M_MFC, "gout_mfc_gate_aclk_lh_m_mfc",
+	     "dout_mfc_div_pclk_mfc_150",
+	     MFC_GATE_PCLK_SYSREG_MFC, 0, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_PCLK_HPM_APBIF_MFC, "gout_mfc_gate_pclk_hpm_apbif_mfc",
+	     "dout_mfc_div_pclk_mfc_150",
+	     MFC_GATE_PCLK_HPM_APBIF_MFC, 0, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_PCLK_SFW_MFC_0, "gout_mfc_gate_pclk_sfw_mfc_0",
+	     "dout_mfc_div_pclk_mfc_150",
+	     MFC_GATE_PCLK_SFW_MFC_0, 0, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_PCLK_SFW_MFC_1, "gout_mfc_gate_pclk_sfw_mfc_1",
+	     "dout_mfc_div_pclk_mfc_150",
+	     MFC_GATE_PCLK_SFW_MFC_1, 0, 0, 0),
+	GATE(CLK_GOUT_MFC_GATE_SCLK_PROMISE_MFC, "gout_mfc_gate_sclk_promise_mfc",
+	     "gout_top_gate_sclk_promise_int",
+	     MFC_GATE_SCLK_PROMISE_MFC, 0, 0, 0),
+	GATE(CLK_GOUT_MFC_HWACG_HPM_APBIF_MFC, "gout_mfc_hwacg_hpm_apbif_mfc",
+	     "dout_mfc_div_pclk_mfc_150",
+	     MFC_HWACG_HPM_APBIF_MFC, 1, 0, 0),
+	GATE(CLK_GOUT_MFC_HWACG_PROMISE_MFC, "gout_mfc_hwacg_promise_mfc",
+	     "gout_top_gate_sclk_promise_int",
+	     MFC_HWACG_PROMISE_MFC, 1, 0, 0),
+};
+
+static const struct samsung_cmu_info mfc_cmu_info __initconst = {
+	.mux_clks		= mfc_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(mfc_mux_clks),
+	.div_clks		= mfc_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(mfc_div_clks),
+	.gate_clks		= mfc_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(mfc_gate_clks),
+	.nr_clk_ids		= CLKS_NR_MFC,
+	.clk_regs		= mfc_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(mfc_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_mfc_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &mfc_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_mfc, "samsung,exynos8890-cmu-mfc",
+	       exynos8890_cmu_mfc_init);
+
+/* ---- CMU_FSYS1 -------------------------------------------------------*/
+
+/* Register Offset definitions for CMU_FSYS1 (0x156e0000) */
+#define PCIE_PLL_LOCK			0x0000
+#define PCIE_PLL_CON0			0x0100
+#define FSYS1_MUX_ACLK_FSYS1_200_USER			0x0200
+#define FSYS1_MUX_SCLK_FSYS1_MMC2_USER			0x0204
+#define FSYS1_MUX_SCLK_FSYS1_UFSUNIPRO_SDCARD_USER	0x020c
+#define FSYS1_MUX_SCLK_FSYS1_UFSUNIPRO_SDCARD_CFG_USER	0x0210
+#define FSYS1_MUX_SCLK_FSYS1_PCIE_PHY_USER			0x0214
+#define FSYS1_MUX_PCIE_PLL			0x0218
+#define FSYS1_MUX_PHYCLK_UFS_LINK_SDCARD_TX0_SYMBOL_USER	0x0220
+#define FSYS1_MUX_PHYCLK_UFS_LINK_SDCARD_RX0_SYMBOL_USER	0x0224
+#define FSYS1_MUX_PHYCLK_PCIE_WIFI0_TX0_USER			0x0230
+#define FSYS1_MUX_PHYCLK_PCIE_WIFI0_RX0_USER			0x0234
+#define FSYS1_MUX_PHYCLK_PCIE_WIFI1_TX0_USER			0x0238
+#define FSYS1_MUX_PHYCLK_PCIE_WIFI1_RX0_USER			0x023c
+#define FSYS1_MUX_PHYCLK_PCIE_WIFI0_DIG_REFCLK_USER	0x0240
+#define FSYS1_MUX_PHYCLK_PCIE_WIFI1_DIG_REFCLK_USER	0x0244
+#define FSYS1_DIV_PCLK_COMBO_PHY_WIFI			0x0400
+#define FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X			0x0800
+#define FSYS1_GATE_PCLK_HPM_APBIF_FSYS1			0x0820
+#define FSYS1_GATE_PCLK_COMBO_PHY_WIFI1			0x0824
+#define FSYS1_GATE_SCLK_MMC2			0x0840
+#define FSYS1_GATE_SCLK_UFSUNIPRO_SDCARD			0x0844
+#define FSYS1_GATE_SCLK_UFSUNIPRO_SDCARD_CFG			0x0848
+#define FSYS1_GATE_SCLK_PCIE_LINK_WIFI0			0x0854
+#define FSYS1_GATE_SCLK_PCIE_LINK_WIFI1			0x0858
+#define FSYS1_GATE_PHYCLK_UFS_LINK_SDCARD_TX0_SYMBOL	0x085c
+#define FSYS1_GATE_PHYCLK_UFS_LINK_SDCARD_RX0_SYMBOL	0x0860
+#define FSYS1_GATE_PHYCLK_PCIE_WIFI0_TX0			0x086c
+#define FSYS1_GATE_PHYCLK_PCIE_WIFI0_RX0			0x0870
+#define FSYS1_GATE_PHYCLK_PCIE_WIFI1_TX0			0x0874
+#define FSYS1_GATE_PHYCLK_PCIE_WIFI1_RX0			0x0878
+#define FSYS1_GATE_PHYCLK_PCIE_WIFI0_DIG_REFCLK			0x087c
+#define FSYS1_GATE_PHYCLK_PCIE_WIFI1_DIG_REFCLK			0x0880
+#define FSYS1_GATE_SCLK_PROMISE_FSYS1			0x0890
+#define FSYS1_HWACG_SROMC_FSYS1			0x241c
+#define FSYS1_HWACG_GPIO_FSYS1			0x2420
+#define FSYS1_HWACG_HPM_APBIF_FSYS1			0x2424
+#define FSYS1_HWACG_PROMISE_FSYS1			0x2428
+#define FSYS1_HWACG_PCIE_RC_LINK_WIFI0			0x242c
+#define FSYS1_HWACG_PCIE_RC_LINK_WIFI1			0x2430
+#define FSYS1_HWACG_PCIE_PCS_WIFI0			0x2434
+#define FSYS1_HWACG_PCIE_PCS_WIFI1			0x2438
+#define FSYS1_HWACG_PCIE_PHY_FSYS1_WIFI0			0x243c
+#define FSYS1_HWACG_PCIE_PHY_FSYS1_WIFI1			0x2440
+#define FSYS1_HWACG_UFS_LINK_SDCARD			0x2444
+
+static const unsigned long fsys1_clk_regs[] __initconst = {
+	PCIE_PLL_LOCK,
+	PCIE_PLL_CON0,
+	FSYS1_MUX_ACLK_FSYS1_200_USER,
+	FSYS1_MUX_SCLK_FSYS1_MMC2_USER,
+	FSYS1_MUX_SCLK_FSYS1_UFSUNIPRO_SDCARD_USER,
+	FSYS1_MUX_SCLK_FSYS1_UFSUNIPRO_SDCARD_CFG_USER,
+	FSYS1_MUX_SCLK_FSYS1_PCIE_PHY_USER,
+	FSYS1_MUX_PCIE_PLL,
+	FSYS1_MUX_PHYCLK_UFS_LINK_SDCARD_TX0_SYMBOL_USER,
+	FSYS1_MUX_PHYCLK_UFS_LINK_SDCARD_RX0_SYMBOL_USER,
+	FSYS1_MUX_PHYCLK_PCIE_WIFI0_TX0_USER,
+	FSYS1_MUX_PHYCLK_PCIE_WIFI0_RX0_USER,
+	FSYS1_MUX_PHYCLK_PCIE_WIFI1_TX0_USER,
+	FSYS1_MUX_PHYCLK_PCIE_WIFI1_RX0_USER,
+	FSYS1_MUX_PHYCLK_PCIE_WIFI0_DIG_REFCLK_USER,
+	FSYS1_MUX_PHYCLK_PCIE_WIFI1_DIG_REFCLK_USER,
+	FSYS1_DIV_PCLK_COMBO_PHY_WIFI,
+	FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X,
+	FSYS1_GATE_PCLK_HPM_APBIF_FSYS1,
+	FSYS1_GATE_PCLK_COMBO_PHY_WIFI1,
+	FSYS1_GATE_SCLK_MMC2,
+	FSYS1_GATE_SCLK_UFSUNIPRO_SDCARD,
+	FSYS1_GATE_SCLK_UFSUNIPRO_SDCARD_CFG,
+	FSYS1_GATE_SCLK_PCIE_LINK_WIFI0,
+	FSYS1_GATE_SCLK_PCIE_LINK_WIFI1,
+	FSYS1_GATE_PHYCLK_UFS_LINK_SDCARD_TX0_SYMBOL,
+	FSYS1_GATE_PHYCLK_UFS_LINK_SDCARD_RX0_SYMBOL,
+	FSYS1_GATE_PHYCLK_PCIE_WIFI0_TX0,
+	FSYS1_GATE_PHYCLK_PCIE_WIFI0_RX0,
+	FSYS1_GATE_PHYCLK_PCIE_WIFI1_TX0,
+	FSYS1_GATE_PHYCLK_PCIE_WIFI1_RX0,
+	FSYS1_GATE_PHYCLK_PCIE_WIFI0_DIG_REFCLK,
+	FSYS1_GATE_PHYCLK_PCIE_WIFI1_DIG_REFCLK,
+	FSYS1_GATE_SCLK_PROMISE_FSYS1,
+	FSYS1_HWACG_SROMC_FSYS1,
+	FSYS1_HWACG_GPIO_FSYS1,
+	FSYS1_HWACG_HPM_APBIF_FSYS1,
+	FSYS1_HWACG_PROMISE_FSYS1,
+	FSYS1_HWACG_PCIE_RC_LINK_WIFI0,
+	FSYS1_HWACG_PCIE_RC_LINK_WIFI1,
+	FSYS1_HWACG_PCIE_PCS_WIFI0,
+	FSYS1_HWACG_PCIE_PCS_WIFI1,
+	FSYS1_HWACG_PCIE_PHY_FSYS1_WIFI0,
+	FSYS1_HWACG_PCIE_PHY_FSYS1_WIFI1,
+	FSYS1_HWACG_UFS_LINK_SDCARD,
+};
+
+static const struct samsung_fixed_rate_clock fsys1_fixed_clks[] __initconst = {
+	FRATE(CLK_PHYCLK_UFS_LINK_SDCARD_TX0_SYMBOL_PHY, "phyclk_ufs_link_sdcard_tx0_symbol_phy", NULL, 0, 30 * MHZ),
+	FRATE(CLK_PHYCLK_UFS_LINK_SDCARD_RX0_SYMBOL_PHY, "phyclk_ufs_link_sdcard_rx0_symbol_phy", NULL, 0, 30 * MHZ),
+	FRATE(CLK_PHYCLK_PCIE_WIFI0_TX0_PHY, "phyclk_pcie_wifi0_tx0_phy", NULL, 0, 30 * MHZ),
+	FRATE(CLK_PHYCLK_PCIE_WIFI0_RX0_PHY, "phyclk_pcie_wifi0_rx0_phy", NULL, 0, 30 * MHZ),
+	FRATE(CLK_PHYCLK_PCIE_WIFI1_TX0_PHY, "phyclk_pcie_wifi1_tx0_phy", NULL, 0, 250 * MHZ),
+	FRATE(CLK_PHYCLK_PCIE_WIFI1_RX0_PHY, "phyclk_pcie_wifi1_rx0_phy", NULL, 0, 250 * MHZ),
+	FRATE(CLK_PHYCLK_PCIE_WIFI0_DIG_REFCLK_PHY, "phyclk_pcie_wifi0_dig_refclk_phy", NULL, 0, 30 * MHZ),
+	FRATE(CLK_PHYCLK_PCIE_WIFI1_DIG_REFCLK_PHY, "phyclk_pcie_wifi1_dig_refclk_phy", NULL, 0, 30 * MHZ),
+};
+
+static const struct samsung_pll_clock fsys1_pll_clks[] __initconst = {
+	PLL(pll_1431x, CLK_FOUT_PCIE_PLL, "fout_pcie_pll", "oscclk",
+	    PCIE_PLL_LOCK, PCIE_PLL_CON0, NULL),
+};
+
+/* List of parent clocks for Muxes in CMU_FSYS1 */
+PNAME(mout_fsys1_mux_aclk_fsys1_200_user_p) = { "oscclk", "gout_top_gate_aclk_fsys1_200" };
+PNAME(mout_fsys1_mux_sclk_fsys1_mmc2_user_p) = { "oscclk", "gout_top_gate_sclk_fsys1_mmc2" };
+PNAME(mout_fsys1_mux_sclk_fsys1_ufsunipro_sdcard_user_p) = { "oscclk", "gout_top_gate_sclk_fsys1_ufsunipro20" };
+PNAME(mout_fsys1_mux_sclk_fsys1_ufsunipro_sdcard_cfg_user_p) = { "oscclk", "gout_top_gate_sclk_fsys1_ufsunipro_cfg" };
+PNAME(mout_fsys1_mux_sclk_fsys1_pcie_phy_user_p) = { "oscclk", "gout_top_gate_sclk_fsys1_pcie_phy" };
+PNAME(mout_fsys1_mux_pcie_pll_p) = { "oscclk", "fout_pcie_pll" };
+PNAME(mout_fsys1_mux_phyclk_ufs_link_sdcard_tx0_symbol_user_p) = { "oscclk", "phyclk_ufs_link_sdcard_tx0_symbol_phy" };
+PNAME(mout_fsys1_mux_phyclk_ufs_link_sdcard_rx0_symbol_user_p) = { "oscclk", "phyclk_ufs_link_sdcard_rx0_symbol_phy" };
+PNAME(mout_fsys1_mux_phyclk_pcie_wifi0_tx0_user_p) = { "oscclk", "phyclk_pcie_wifi0_tx0_phy" };
+PNAME(mout_fsys1_mux_phyclk_pcie_wifi0_rx0_user_p) = { "oscclk", "phyclk_pcie_wifi0_rx0_phy" };
+PNAME(mout_fsys1_mux_phyclk_pcie_wifi1_tx0_user_p) = { "oscclk", "phyclk_pcie_wifi1_tx0_phy" };
+PNAME(mout_fsys1_mux_phyclk_pcie_wifi1_rx0_user_p) = { "oscclk", "phyclk_pcie_wifi1_rx0_phy" };
+PNAME(mout_fsys1_mux_phyclk_pcie_wifi0_dig_refclk_user_p) = { "oscclk", "phyclk_pcie_wifi0_dig_refclk_phy" };
+PNAME(mout_fsys1_mux_phyclk_pcie_wifi1_dig_refclk_user_p) = { "oscclk", "phyclk_pcie_wifi1_dig_refclk_phy" };
+
+static const struct samsung_mux_clock fsys1_mux_clks[] __initconst = {
+	MUX(CLK_MOUT_FSYS1_MUX_ACLK_FSYS1_200_USER, "mout_fsys1_mux_aclk_fsys1_200_user",
+	    mout_fsys1_mux_aclk_fsys1_200_user_p,
+	    FSYS1_MUX_ACLK_FSYS1_200_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS1_MUX_SCLK_FSYS1_MMC2_USER, "mout_fsys1_mux_sclk_fsys1_mmc2_user",
+	    mout_fsys1_mux_sclk_fsys1_mmc2_user_p,
+	    FSYS1_MUX_SCLK_FSYS1_MMC2_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS1_MUX_SCLK_FSYS1_UFSUNIPRO_SDCARD_USER, "mout_fsys1_mux_sclk_fsys1_ufsunipro_sdcard_user",
+	    mout_fsys1_mux_sclk_fsys1_ufsunipro_sdcard_user_p,
+	    FSYS1_MUX_SCLK_FSYS1_UFSUNIPRO_SDCARD_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS1_MUX_SCLK_FSYS1_UFSUNIPRO_SDCARD_CFG_USER, "mout_fsys1_mux_sclk_fsys1_ufsunipro_sdcard_cfg_user",
+	    mout_fsys1_mux_sclk_fsys1_ufsunipro_sdcard_cfg_user_p,
+	    FSYS1_MUX_SCLK_FSYS1_UFSUNIPRO_SDCARD_CFG_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS1_MUX_SCLK_FSYS1_PCIE_PHY_USER, "mout_fsys1_mux_sclk_fsys1_pcie_phy_user",
+	    mout_fsys1_mux_sclk_fsys1_pcie_phy_user_p,
+	    FSYS1_MUX_SCLK_FSYS1_PCIE_PHY_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS1_MUX_PCIE_PLL, "mout_fsys1_mux_pcie_pll", mout_fsys1_mux_pcie_pll_p,
+	    FSYS1_MUX_PCIE_PLL, 12, 1),
+	MUX(CLK_MOUT_FSYS1_MUX_PHYCLK_UFS_LINK_SDCARD_TX0_SYMBOL_USER, "mout_fsys1_mux_phyclk_ufs_link_sdcard_tx0_symbol_user",
+	    mout_fsys1_mux_phyclk_ufs_link_sdcard_tx0_symbol_user_p,
+	    FSYS1_MUX_PHYCLK_UFS_LINK_SDCARD_TX0_SYMBOL_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS1_MUX_PHYCLK_UFS_LINK_SDCARD_RX0_SYMBOL_USER, "mout_fsys1_mux_phyclk_ufs_link_sdcard_rx0_symbol_user",
+	    mout_fsys1_mux_phyclk_ufs_link_sdcard_rx0_symbol_user_p,
+	    FSYS1_MUX_PHYCLK_UFS_LINK_SDCARD_RX0_SYMBOL_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS1_MUX_PHYCLK_PCIE_WIFI0_TX0_USER, "mout_fsys1_mux_phyclk_pcie_wifi0_tx0_user",
+	    mout_fsys1_mux_phyclk_pcie_wifi0_tx0_user_p,
+	    FSYS1_MUX_PHYCLK_PCIE_WIFI0_TX0_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS1_MUX_PHYCLK_PCIE_WIFI0_RX0_USER, "mout_fsys1_mux_phyclk_pcie_wifi0_rx0_user",
+	    mout_fsys1_mux_phyclk_pcie_wifi0_rx0_user_p,
+	    FSYS1_MUX_PHYCLK_PCIE_WIFI0_RX0_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS1_MUX_PHYCLK_PCIE_WIFI1_TX0_USER, "mout_fsys1_mux_phyclk_pcie_wifi1_tx0_user",
+	    mout_fsys1_mux_phyclk_pcie_wifi1_tx0_user_p,
+	    FSYS1_MUX_PHYCLK_PCIE_WIFI1_TX0_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS1_MUX_PHYCLK_PCIE_WIFI1_RX0_USER, "mout_fsys1_mux_phyclk_pcie_wifi1_rx0_user",
+	    mout_fsys1_mux_phyclk_pcie_wifi1_rx0_user_p,
+	    FSYS1_MUX_PHYCLK_PCIE_WIFI1_RX0_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS1_MUX_PHYCLK_PCIE_WIFI0_DIG_REFCLK_USER, "mout_fsys1_mux_phyclk_pcie_wifi0_dig_refclk_user",
+	    mout_fsys1_mux_phyclk_pcie_wifi0_dig_refclk_user_p,
+	    FSYS1_MUX_PHYCLK_PCIE_WIFI0_DIG_REFCLK_USER, 12, 1),
+	MUX(CLK_MOUT_FSYS1_MUX_PHYCLK_PCIE_WIFI1_DIG_REFCLK_USER, "mout_fsys1_mux_phyclk_pcie_wifi1_dig_refclk_user",
+	    mout_fsys1_mux_phyclk_pcie_wifi1_dig_refclk_user_p,
+	    FSYS1_MUX_PHYCLK_PCIE_WIFI1_DIG_REFCLK_USER, 12, 1),
+};
+
+static const struct samsung_div_clock fsys1_div_clks[] __initconst = {
+	DIV(CLK_DOUT_FSYS1_DIV_PCLK_COMBO_PHY_WIFI, "dout_fsys1_div_pclk_combo_phy_wifi",
+	    "mout_fsys1_mux_aclk_fsys1_200_user",
+	    FSYS1_DIV_PCLK_COMBO_PHY_WIFI, 0, 2),
+};
+
+static const struct samsung_gate_clock fsys1_gate_clks[] __initconst = {
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, "gout_fsys1_gate_aclk_axi2acel_fsys1x",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 31, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_PCLK_CMU_FSYS1, "gout_fsys1_gate_pclk_cmu_fsys1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 30, CLK_IS_CRITICAL, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_COMBO_PHY_PCS_PCLK_WIFI1, "gout_fsys1_gate_aclk_combo_phy_pcs_pclk_wifi1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 29, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_COMBO_PHY_PCS_PCLK_WIFI0, "gout_fsys1_gate_aclk_combo_phy_pcs_pclk_wifi0",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 28, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_PCLK_PMU_FSYS1, "gout_fsys1_gate_pclk_pmu_fsys1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 26, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_PCLK_PPMU_FSYS1, "gout_fsys1_gate_pclk_ppmu_fsys1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 25, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_PCLK_GPIO_FSYS1, "gout_fsys1_gate_pclk_gpio_fsys1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 24, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_PCLK_SYSREG_FSYS1, "gout_fsys1_gate_pclk_sysreg_fsys1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 23, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_SROMC_FSYS1, "gout_fsys1_gate_aclk_sromc_fsys1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 22, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_PCLK_PCIE_WIFI1, "gout_fsys1_gate_pclk_pcie_wifi1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 21, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_PCIE_WIFI1_DBI, "gout_fsys1_gate_aclk_pcie_wifi1_dbi",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 20, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_PCIE_WIFI1_SLV, "gout_fsys1_gate_aclk_pcie_wifi1_slv",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 19, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_PCIE_WIFI1_MSTR, "gout_fsys1_gate_aclk_pcie_wifi1_mstr",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 18, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_AHB2AXI_PCIE_WIFI1, "gout_fsys1_gate_aclk_ahb2axi_pcie_wifi1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 17, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_PCLK_PCIE_WIFI0, "gout_fsys1_gate_pclk_pcie_wifi0",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 16, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_PCIE_WIFI0_DBI, "gout_fsys1_gate_aclk_pcie_wifi0_dbi",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 15, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_PCIE_WIFI0_SLV, "gout_fsys1_gate_aclk_pcie_wifi0_slv",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 14, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_PCIE_WIFI0_MSTR, "gout_fsys1_gate_aclk_pcie_wifi0_mstr",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 13, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_AHB2AXI_PCIE_WIFI0, "gout_fsys1_gate_aclk_ahb2axi_pcie_wifi0",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 12, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_PPMU_FSYS1, "gout_fsys1_gate_aclk_ppmu_fsys1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 11, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_AHB_BRIDGE_FSYS1_S4, "gout_fsys1_gate_aclk_ahb_bridge_fsys1_s4",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 10, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_AXI2AHB_FSYS1_S4, "gout_fsys1_gate_aclk_axi2ahb_fsys1_s4",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 9, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_AXI2APB_FSYS1_S1, "gout_fsys1_gate_aclk_axi2apb_fsys1_s1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 8, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_AXI2AHB_FSYS1_S0, "gout_fsys1_gate_aclk_axi2ahb_fsys1_s0",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 7, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_XIU_FSYS1SFRX, "gout_fsys1_gate_aclk_xiu_fsys1sfrx",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 6, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_XIU_SDCARDX, "gout_fsys1_gate_aclk_xiu_sdcardx",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 5, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_XIU_FSYS1X, "gout_fsys1_gate_aclk_xiu_fsys1x",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 4, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_AXI_LH_ASYNC_MI_TOP_FSYS1, "gout_fsys1_gate_aclk_axi_lh_async_mi_top_fsys1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 3, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_ACEL_LH_ASYNC_SI_TOP_FSYS1, "gout_fsys1_gate_aclk_acel_lh_async_si_top_fsys1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 2, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_UFS_LINK_SDCARD, "gout_fsys1_gate_aclk_ufs_link_sdcard",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_ACLK_MMC2, "gout_fsys1_gate_aclk_mmc2",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_ACLK_AXI2ACEL_FSYS1X, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_PCLK_HPM_APBIF_FSYS1, "gout_fsys1_gate_pclk_hpm_apbif_fsys1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_GATE_PCLK_HPM_APBIF_FSYS1, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_PCLK_COMBO_PHY_WIFI1, "gout_fsys1_gate_pclk_combo_phy_wifi1",
+	     "dout_fsys1_div_pclk_combo_phy_wifi",
+	     FSYS1_GATE_PCLK_COMBO_PHY_WIFI1, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_PCLK_COMBO_PHY_WIFI0, "gout_fsys1_gate_pclk_combo_phy_wifi0",
+	     "dout_fsys1_div_pclk_combo_phy_wifi",
+	     FSYS1_GATE_PCLK_COMBO_PHY_WIFI1, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_SCLK_MMC2, "gout_fsys1_gate_sclk_mmc2",
+	     "mout_fsys1_mux_sclk_fsys1_mmc2_user",
+	     FSYS1_GATE_SCLK_MMC2, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_SCLK_UFSUNIPRO_SDCARD, "gout_fsys1_gate_sclk_ufsunipro_sdcard",
+	     "mout_fsys1_mux_sclk_fsys1_ufsunipro_sdcard_user",
+	     FSYS1_GATE_SCLK_UFSUNIPRO_SDCARD, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_SCLK_UFSUNIPRO_SDCARD_CFG, "gout_fsys1_gate_sclk_ufsunipro_sdcard_cfg",
+	     "mout_fsys1_mux_sclk_fsys1_ufsunipro_sdcard_cfg_user",
+	     FSYS1_GATE_SCLK_UFSUNIPRO_SDCARD_CFG, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_SCLK_PCIE_LINK_WIFI0, "gout_fsys1_gate_sclk_pcie_link_wifi0",
+	     "oscclk",
+	     FSYS1_GATE_SCLK_PCIE_LINK_WIFI0, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_SCLK_PCIE_LINK_WIFI1, "gout_fsys1_gate_sclk_pcie_link_wifi1",
+	     "oscclk",
+	     FSYS1_GATE_SCLK_PCIE_LINK_WIFI1, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_PHYCLK_UFS_LINK_SDCARD_TX0_SYMBOL, "gout_fsys1_gate_phyclk_ufs_link_sdcard_tx0_symbol",
+	     "mout_fsys1_mux_phyclk_ufs_link_sdcard_tx0_symbol_user",
+	     FSYS1_GATE_PHYCLK_UFS_LINK_SDCARD_TX0_SYMBOL, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_PHYCLK_UFS_LINK_SDCARD_RX0_SYMBOL, "gout_fsys1_gate_phyclk_ufs_link_sdcard_rx0_symbol",
+	     "mout_fsys1_mux_phyclk_ufs_link_sdcard_rx0_symbol_user",
+	     FSYS1_GATE_PHYCLK_UFS_LINK_SDCARD_RX0_SYMBOL, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_PHYCLK_PCIE_WIFI0_TX0, "gout_fsys1_gate_phyclk_pcie_wifi0_tx0",
+	     "mout_fsys1_mux_phyclk_pcie_wifi0_tx0_user",
+	     FSYS1_GATE_PHYCLK_PCIE_WIFI0_TX0, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_PHYCLK_PCIE_WIFI0_RX0, "gout_fsys1_gate_phyclk_pcie_wifi0_rx0",
+	     "mout_fsys1_mux_phyclk_pcie_wifi0_rx0_user",
+	     FSYS1_GATE_PHYCLK_PCIE_WIFI0_RX0, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_PHYCLK_PCIE_WIFI1_TX0, "gout_fsys1_gate_phyclk_pcie_wifi1_tx0",
+	     "mout_fsys1_mux_phyclk_pcie_wifi1_tx0_user",
+	     FSYS1_GATE_PHYCLK_PCIE_WIFI1_TX0, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_PHYCLK_PCIE_WIFI1_RX0, "gout_fsys1_gate_phyclk_pcie_wifi1_rx0",
+	     "mout_fsys1_mux_phyclk_pcie_wifi1_rx0_user",
+	     FSYS1_GATE_PHYCLK_PCIE_WIFI1_RX0, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_PHYCLK_PCIE_WIFI0_DIG_REFCLK, "gout_fsys1_gate_phyclk_pcie_wifi0_dig_refclk",
+	     "mout_fsys1_mux_phyclk_pcie_wifi0_dig_refclk_user",
+	     FSYS1_GATE_PHYCLK_PCIE_WIFI0_DIG_REFCLK, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_PHYCLK_PCIE_WIFI1_DIG_REFCLK, "gout_fsys1_gate_phyclk_pcie_wifi1_dig_refclk",
+	     "mout_fsys1_mux_phyclk_pcie_wifi1_dig_refclk_user",
+	     FSYS1_GATE_PHYCLK_PCIE_WIFI1_DIG_REFCLK, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS1_GATE_SCLK_PROMISE_FSYS1, "gout_fsys1_gate_sclk_promise_fsys1",
+	     "gout_top_gate_sclk_promise_int",
+	     FSYS1_GATE_SCLK_PROMISE_FSYS1, 0, 0, 0),
+	GATE(CLK_GOUT_FSYS1_HWACG_SROMC_FSYS1, "gout_fsys1_hwacg_sromc_fsys1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_HWACG_SROMC_FSYS1, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS1_HWACG_GPIO_FSYS1, "gout_fsys1_hwacg_gpio_fsys1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_HWACG_GPIO_FSYS1, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS1_HWACG_HPM_APBIF_FSYS1, "gout_fsys1_hwacg_hpm_apbif_fsys1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_HWACG_HPM_APBIF_FSYS1, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS1_HWACG_PROMISE_FSYS1, "gout_fsys1_hwacg_promise_fsys1",
+	     "gout_top_gate_sclk_promise_int",
+	     FSYS1_HWACG_PROMISE_FSYS1, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS1_HWACG_PCIE_RC_LINK_WIFI0, "gout_fsys1_hwacg_pcie_rc_link_wifi0",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_HWACG_PCIE_RC_LINK_WIFI0, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS1_HWACG_PCIE_RC_LINK_WIFI1, "gout_fsys1_hwacg_pcie_rc_link_wifi1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_HWACG_PCIE_RC_LINK_WIFI1, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS1_HWACG_PCIE_PCS_WIFI0, "gout_fsys1_hwacg_pcie_pcs_wifi0",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_HWACG_PCIE_PCS_WIFI0, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS1_HWACG_PCIE_PCS_WIFI1, "gout_fsys1_hwacg_pcie_pcs_wifi1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_HWACG_PCIE_PCS_WIFI1, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS1_HWACG_PCIE_PHY_FSYS1_WIFI0, "gout_fsys1_hwacg_pcie_phy_fsys1_wifi0",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_HWACG_PCIE_PHY_FSYS1_WIFI0, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS1_HWACG_PCIE_PHY_FSYS1_WIFI1, "gout_fsys1_hwacg_pcie_phy_fsys1_wifi1",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_HWACG_PCIE_PHY_FSYS1_WIFI1, 1, 0, 0),
+	GATE(CLK_GOUT_FSYS1_HWACG_UFS_LINK_SDCARD, "gout_fsys1_hwacg_ufs_link_sdcard",
+	     "mout_fsys1_mux_aclk_fsys1_200_user",
+	     FSYS1_HWACG_UFS_LINK_SDCARD, 1, 0, 0),
+};
+
+static const struct samsung_cmu_info fsys1_cmu_info __initconst = {
+	.pll_clks		= fsys1_pll_clks,
+	.nr_pll_clks		= ARRAY_SIZE(fsys1_pll_clks),
+	.mux_clks		= fsys1_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(fsys1_mux_clks),
+	.div_clks		= fsys1_div_clks,
+	.nr_div_clks		= ARRAY_SIZE(fsys1_div_clks),
+	.gate_clks		= fsys1_gate_clks,
+	.nr_gate_clks		= ARRAY_SIZE(fsys1_gate_clks),
+	.fixed_clks		= fsys1_fixed_clks,
+	.nr_fixed_clks		= ARRAY_SIZE(fsys1_fixed_clks),
+	.nr_clk_ids		= CLKS_NR_FSYS1,
+	.clk_regs		= fsys1_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(fsys1_clk_regs),
+	.clk_name		= "bus",
+};
+
+static void __init exynos8890_cmu_fsys1_init(struct device_node *np)
+{
+	exynos_arm64_register_cmu(NULL, np, &fsys1_cmu_info);
+}
+
+CLK_OF_DECLARE(exynos8890_cmu_fsys1, "samsung,exynos8890-cmu-fsys1",
+	       exynos8890_cmu_fsys1_init);
+
