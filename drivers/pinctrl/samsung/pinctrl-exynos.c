@@ -340,6 +340,7 @@ static irqreturn_t exynos_eint_gpio_irq(int irq, void *data)
 	struct samsung_pinctrl_drv_data *d = data;
 	struct samsung_pin_bank *bank = d->pin_banks;
 	unsigned int svc, group, pin;
+	unsigned int i;
 	int ret;
 
 	if (clk_enable(bank->drvdata->pclk)) {
@@ -360,7 +361,29 @@ static irqreturn_t exynos_eint_gpio_irq(int irq, void *data)
 
 	if (!group)
 		return IRQ_HANDLED;
-	bank += (group - 1);
+
+	/*
+	 * SVC group numbers follow EINT register slots, which are not always
+	 * contiguous in the pin-bank table.  Exynos7870 TOP skips EINT group
+	 * 13, for example, so indexing the table directly routes GPE0 events
+	 * to GPF0 and leaves the shared parent interrupt asserted forever.
+	 */
+	if (!bank->eint_con_offset) {
+		u32 eint_offset = (group - 1) * sizeof(u32);
+
+		for (i = 0; i < d->nr_banks; i++) {
+			bank = &d->pin_banks[i];
+			if (bank->eint_type == EINT_TYPE_GPIO &&
+			    bank->eint_offset == eint_offset)
+				break;
+		}
+		if (i == d->nr_banks)
+			return IRQ_NONE;
+	} else {
+		if (group > d->nr_banks)
+			return IRQ_NONE;
+		bank += group - 1;
+	}
 
 	ret = generic_handle_domain_irq(bank->irq_domain, pin);
 	if (ret)
