@@ -1,0 +1,49 @@
+// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+/*
+ * Motorola One Action (troika) device tree source
+ *
+ * Copyright (c) 2026 Sean Hoyt <seanhoyt963@gmail.com>
+ *
+ * The memory nodes below are the exact ranges this device's own running
+ * LineageOS-18.1 kernel reports as "System RAM" in /proc/iomem -- i.e.
+ * physical RAM already known-safe to use, with modem/TrustZone/other
+ * carveouts already excluded. This undercounts total installed RAM
+ * (those carveouts sit inside the real, larger contiguous banks) but
+ * avoids guessing at carveout boundaries for this first bring-up pass.
+ */
+
+/dts-v1/;
+#include "exynos9610.dtsi"
+
+/ {
+	model = "Motorola One Action";
+	compatible = "motorola,troika", "samsung,exynos9610";
+
+	chosen {
+		stdout-path = &serial_0;
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x0 0x80000000 0x3c800000>,
+		      <0x0 0xc0000000 0x20000000>,
+		      <0x0 0xe0d00000 0x1f300000>,
+		      <0x8 0x80000000 0x80000000>;
+	};
+};
+
+&oscclk {
+	clock-frequency = <26000000>;
+};
+
+&serial_0 {
+	status = "okay";
+};
+
+&ufs {
+	status = "okay";
+};
+
+&watchdog_cl0 {
+	status = "okay";
+};

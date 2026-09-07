@@ -1,0 +1,335 @@
+// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+/*
+ * Samsung Exynos 9610 SoC device tree source
+ *
+ * Copyright (c) 2026 Sean Hoyt <seanhoyt963@gmail.com>
+ *
+ * Deliberately minimal, matching the same incremental convention already
+ * used for exynos8890/exynos9810/exynos8855 upstream: only nodes that are
+ * real and verified are included. Verified against a live Motorola One
+ * Action (troika) device via /sys/firmware/devicetree/base and against
+ * the LineageOS-18.1 downstream kernel
+ * (github.com/LineageOS/android_kernel_motorola_exynos9610) and its CAL
+ * register tables (drivers/soc/samsung/cal-if/exynos9610/cmucal-sfr.c),
+ * NOT guessed:
+ *   - GICD/GICC base (0x14af1000/0x14af2000): read live from
+ *     /proc/iomem on troika. GICH/GICV are derived from the same
+ *     GICD-relative offsets mainline exynos9810.dtsi uses (+0x3000/+0x5000)
+ *     since the running Android kernel doesn't map hyp mode and they don't
+ *     show up in /proc/iomem -- unverified on real hardware, flagged here.
+ *   - CMU_TOP (0x12100000) and CMU_PERI (0x10030000) bases: from
+ *     cmucal-sfr.c's cmucal_sfr_block_list[] (SFR_BLOCK(TOP, 0x12100000,
+ *     ...), SFR_BLOCK(PERI, 0x10030000, ...)). CMU_TOP cross-checked
+ *     against troika's own device tree, which has a stray legacy
+ *     "clock-controller@0x12100000" node even though downstream doesn't
+ *     otherwise expose CCF-style per-domain clock nodes.
+ *   - UART0 (0x13820000): status "okay" with samsung,dbg-uart-ch /
+ *     samsung,dbg-uart-baud = <115200> in troika's live device tree;
+ *     the sibling instance at 0x13920000 is status "disabled".
+ *   - UART pinmux (pinctrl_alive, gpq0-3/gpq0-4, function 2): from
+ *     downstream exynos9610-pinctrl.dtsi's uart0_bus node.
+ *   - Clock IDs (CLK_GOUT_CLKCMU_PERI_BUS, CLK_GOUT_PERI_UART_PCLK,
+ *     CLK_GOUT_PERI_UART_IPCLK) and CMU compatible strings come from our
+ *     own drivers/clk/samsung/clk-exynos9610.c + its dt-bindings header,
+ *     not downstream naming.
+ *   - "samsung,exynos8895-uart" is reused for the UART compatible: it's
+ *     the only upstream samsung_tty.c entry for this USI-wrapped
+ *     generation (separate-uart-clk, DT-specified fifosize), confirmed
+ *     by reading drivers/tty/serial/samsung_tty.c directly. No upstream
+ *     board (8895/9810/990) has actually wired up a UART node yet, so
+ *     there was no existing DTS example to copy for this part.
+ *   - UFS: reg ranges (HCI/vs_hci/unipro/ufsp) and clock names read
+ *     straight off downstream's ufs@0x13520000 node; reg-names/
+ *     clock-names ("hci"/"vs_hci"/"unipro"/"ufsp",
+ *     "core_clk"/"sclk_unipro_main") come from what
+ *     drivers/ufs/host/ufs-exynos.c actually calls
+ *     devm_platform_ioremap_resource_byname()/looks up by clk name for,
+ *     not downstream's names. CMU_FSYS base (0x13400000) from
+ *     cmucal-sfr.c's SFR_BLOCK(FSYS, ...). PMU syscon base (0x11860000)
+ *     matches both downstream's exynos9610.dtsi and troika's own live
+ *     device tree ("system-controller@11860000").
+ *   - UFS PHY reg (0x13524000, size 0x800) matches downstream's nested
+ *     "ufs-phy" child node exactly, and troika's live /proc/iomem
+ *     ("ufs-phy" under ufs@0x13520000). Isolation offset/mask/en
+ *     (0x724/0x1/BIT(0)) traced to exynos_ufs_populate_dt_system()'s
+ *     fallback default for a missing "ufs-phy-iso" DT node -- see
+ *     phy-exynos9610-ufs.c for the full trail.
+ *   - NOT verified: the UFS PHY's 4 named symbol clocks
+ *     (tx0_symbol_clk/rx0_symbol_clk/rx1_symbol_clk/ref_clk, copied from
+ *     exynos7's clk_list). Downstream's much simpler clocking (just
+ *     aclk + one unipro clock, no separate symbol clocks) doesn't
+ *     evidence how these are actually derived on this chip, so all four
+ *     are wired to &oscclk as a placeholder pending real verification.
+ *   - Also NOT included: the ufs_fixed_vcc regulator (GPIO-controlled,
+ *     downstream uses gpg4-0) and the ufs-dma-coherency IO-coherency
+ *     context downstream's ufs node also has -- deferred, not needed for
+ *     the host controller to probe.
+ *
+ * Still missing, deliberately deferred: every other CMU domain
+ * (dispaud, usb, mif, ...), the other pinctrl domains, a full
+ * pinctrl_alive wakeup-interrupt-controller child, and watchdog/RTC
+ * nodes.
+ */
+
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/clock/samsung,exynos9610.h>
+
+/ {
+	compatible = "samsung,exynos9610";
+	#address-cells = <2>;
+	#size-cells = <1>;
+
+	interrupt-parent = <&gic>;
+
+	aliases {
+		pinctrl0 = &pinctrl_alive;
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu-map {
+			cluster0 {
+				core0 { cpu = <&cpu0>; };
+				core1 { cpu = <&cpu1>; };
+				core2 { cpu = <&cpu2>; };
+				core3 { cpu = <&cpu3>; };
+			};
+
+			cluster1 {
+				core0 { cpu = <&cpu4>; };
+				core1 { cpu = <&cpu5>; };
+				core2 { cpu = <&cpu6>; };
+				core3 { cpu = <&cpu7>; };
+			};
+		};
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a53";
+			reg = <0x0>;
+			enable-method = "psci";
+		};
+
+		cpu1: cpu@1 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a53";
+			reg = <0x1>;
+			enable-method = "psci";
+		};
+
+		cpu2: cpu@2 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a53";
+			reg = <0x2>;
+			enable-method = "psci";
+		};
+
+		cpu3: cpu@3 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a53";
+			reg = <0x3>;
+			enable-method = "psci";
+		};
+
+		cpu4: cpu@100 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a73";
+			reg = <0x100>;
+			enable-method = "psci";
+		};
+
+		cpu5: cpu@101 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a73";
+			reg = <0x101>;
+			enable-method = "psci";
+		};
+
+		cpu6: cpu@102 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a73";
+			reg = <0x102>;
+			enable-method = "psci";
+		};
+
+		cpu7: cpu@103 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a73";
+			reg = <0x103>;
+			enable-method = "psci";
+		};
+	};
+
+	oscclk: osc-clock {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-output-names = "oscclk";
+	};
+
+	psci {
+		compatible = "arm,psci-0.2";
+		method = "smc";
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		/* Hypervisor Virtual Timer interrupt is not wired to GIC */
+		interrupts = <GIC_PPI 13 (GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>,
+			     <GIC_PPI 14 (GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>,
+			     <GIC_PPI 11 (GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>,
+			     <GIC_PPI 10 (GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>;
+		/*
+		 * Like exynos9810/exynos8895, the stock Samsung/Motorola
+		 * bootloader does not configure CNTFRQ_EL0.
+		 */
+		clock-frequency = <26000000>;
+	};
+
+	soc: soc@0 {
+		compatible = "simple-bus";
+		ranges = <0x0 0x0 0x0 0x20000000>;
+
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		chipid@10000000 {
+			compatible = "samsung,exynos9610-chipid",
+				     "samsung,exynos850-chipid";
+			reg = <0x10000000 0x100>;
+		};
+
+		cmu_peri: clock-controller@10030000 {
+			compatible = "samsung,exynos9610-cmu-peri";
+			reg = <0x10030000 0x8000>;
+			#clock-cells = <1>;
+
+			clocks = <&cmu_top CLK_GOUT_CLKCMU_PERI_BUS>;
+			clock-names = "bus";
+		};
+
+		pinctrl_alive: pinctrl@11850000 {
+			compatible = "samsung,exynos9610-pinctrl";
+			reg = <0x11850000 0x1000>;
+		};
+
+		cmu_top: clock-controller@12100000 {
+			compatible = "samsung,exynos9610-cmu-top";
+			reg = <0x12100000 0x8000>;
+			#clock-cells = <1>;
+
+			clocks = <&oscclk>;
+			clock-names = "bus";
+		};
+
+		serial_0: serial@13820000 {
+			compatible = "samsung,exynos8895-uart";
+			reg = <0x13820000 0x100>;
+			interrupts = <GIC_SPI 246 IRQ_TYPE_LEVEL_HIGH>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart0_bus>;
+			samsung,uart-fifosize = <256>;
+			clocks = <&cmu_peri CLK_GOUT_PERI_UART_PCLK>,
+				 <&cmu_peri CLK_GOUT_PERI_UART_IPCLK>;
+			clock-names = "uart", "clk_uart_baud0";
+			status = "disabled";
+		};
+
+		/*
+		 * GICD/GICC read live from troika (/proc/iomem). GICH/GICV
+		 * are NOT hardware-verified -- derived from the same
+		 * GICD-relative offsets (+0x3000/+0x5000) mainline
+		 * exynos9810.dtsi uses, since the running Android kernel
+		 * doesn't map hyp mode so they never show up in /proc/iomem.
+		 */
+		gic: interrupt-controller@14af1000 {
+			compatible = "arm,gic-400";
+			reg = <0x14af1000 0x1000>,
+			      <0x14af2000 0x1000>,
+			      <0x14af4000 0x2000>,
+			      <0x14af6000 0x2000>;
+			#interrupt-cells = <3>;
+			interrupt-controller;
+			interrupts = <GIC_PPI 9 (GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_HIGH)>;
+			#address-cells = <0>;
+			#size-cells = <1>;
+		};
+
+		pmu_system_controller: syscon@11860000 {
+			compatible = "samsung,exynos9610-pmu", "syscon";
+			reg = <0x11860000 0x10000>;
+		};
+
+		/*
+		 * "samsung,exynos7-wdt" and "samsung,s3c6400-pwm" below are
+		 * downstream's exact compatible strings, already supported
+		 * by mainline's s3c2410_wdt.c/pwm-samsung.c with zero driver
+		 * changes -- confirmed by reading both drivers directly, not
+		 * assumed from the name alone. reg/irq/clock wiring is
+		 * otherwise from downstream's watchdog_cl0@0x10050000 and
+		 * pwm@0x13970000 nodes; clock-names ("watchdog"/
+		 * "watchdog_src", "timers") come from what those two mainline
+		 * drivers actually devm_clk_get() by name.
+		 *
+		 * watchdog_cl1@0x10060000 downstream uses "samsung,exynos8-wdt"
+		 * instead, which mainline does NOT have -- left out rather
+		 * than assumed compatible with exynos7-wdt.
+		 */
+		watchdog_cl0: watchdog@10050000 {
+			compatible = "samsung,exynos7-wdt";
+			reg = <0x10050000 0x100>;
+			interrupts = <GIC_SPI 232 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&cmu_peri CLK_GOUT_PERI_WDT_CLUSTER0_PCLK>, <&oscclk>;
+			clock-names = "watchdog", "watchdog_src";
+			samsung,syscon-phandle = <&pmu_system_controller>;
+			status = "disabled";
+		};
+
+		pwm: pwm@13970000 {
+			compatible = "samsung,s3c6400-pwm";
+			reg = <0x13970000 0x1000>;
+			samsung,pwm-outputs = <0>, <1>, <2>, <3>, <4>;
+			#pwm-cells = <3>;
+			clocks = <&cmu_peri CLK_GOUT_PERI_PWM_MOTOR_i_PCLK_S0>;
+			clock-names = "timers";
+			status = "disabled";
+		};
+
+		cmu_fsys: clock-controller@13400000 {
+			compatible = "samsung,exynos9610-cmu-fsys";
+			reg = <0x13400000 0x8000>;
+			#clock-cells = <1>;
+
+			clocks = <&cmu_top CLK_GOUT_CLKCMU_FSYS_BUS>;
+			clock-names = "bus";
+		};
+
+		ufs_phy: phy@13524000 {
+			compatible = "samsung,exynos9610-ufs-phy";
+			reg = <0x13524000 0x800>;
+			samsung,pmu-syscon = <&pmu_system_controller>;
+			clocks = <&oscclk>, <&oscclk>, <&oscclk>, <&oscclk>;
+			clock-names = "tx0_symbol_clk", "rx0_symbol_clk",
+				      "rx1_symbol_clk", "ref_clk";
+			#phy-cells = <0>;
+		};
+
+		ufs: ufs@13520000 {
+			compatible = "samsung,exynos9610-ufs";
+			reg = <0x13520000 0x200>, <0x13521100 0x200>,
+			      <0x13510000 0x8000>, <0x13530000 0x100>;
+			reg-names = "hci", "vs_hci", "unipro", "ufsp";
+			interrupts = <GIC_SPI 157 IRQ_TYPE_LEVEL_HIGH>;
+			phys = <&ufs_phy>;
+			phy-names = "ufs-phy";
+			clocks = <&cmu_fsys CLK_GOUT_FSYS_UFS_EMBD_I_ACLK>,
+				 <&cmu_fsys CLK_GOUT_FSYS_UFS_EMBD_I_CLK_UNIPRO>;
+			clock-names = "core_clk", "sclk_unipro_main";
+			freq-table-hz = <0 0>, <0 0>;
+			status = "disabled";
+		};
+	};
+};
+
+#include "exynos9610-pinctrl.dtsi"

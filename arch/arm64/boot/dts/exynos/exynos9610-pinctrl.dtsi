@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+/*
+ * Samsung's Exynos9610 SoC pin-mux and pin-config device tree source
+ *
+ * Copyright (c) 2026 Sean Hoyt <seanhoyt963@gmail.com>
+ *
+ * Only the ALIVE-domain gpq0 bank and the uart0_bus pin group are defined
+ * here so far, translated from downstream's exynos9610-pinctrl.dtsi
+ * (LineageOS/android_kernel_motorola_exynos9610, lineage-18.1):
+ *
+ *   uart0_bus: uart0-bus {
+ *           samsung,pins = "gpq0-3", "gpq0-4";
+ *           samsung,pin-function = <2>;
+ *           samsung,pin-pud = <0>;
+ *   };
+ *
+ * All other pinctrl domains (peric0/peric1/fsys/cmgp/...) are still
+ * missing.
+ */
+
+&pinctrl_alive {
+	gpq0: gpq0-gpio-bank {
+		gpio-controller;
+		#gpio-cells = <2>;
+	};
+
+	uart0_bus: uart0-bus {
+		samsung,pins = "gpq0-3", "gpq0-4";
+		samsung,pin-function = <2>;
+		samsung,pin-pud = <0>;
+	};
+};
