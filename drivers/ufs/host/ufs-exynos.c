@@ -2005,6 +2005,91 @@ static int fsd_ufs_suspend(struct exynos_ufs *ufs)
 	return 0;
 }
 
+/*
+ * Exynos 9610 (troika). Traced against LineageOS/android_kernel_motorola_exynos9610
+ * (lineage-18.1) drivers/scsi/ufs/ufs-cal-9610.c's init_cfg[]/post_init_cfg[]/
+ * calib_of_hs_rate_a[] (identical to calib_of_hs_rate_b[] downstream, so no
+ * rate-series split is done here) tables, by checking each entry's dispatch
+ * in ufs_cal_config_uic(): PHY_PCS_* / UNIPRO_* entries go through
+ * ufshcd_dme_set()-equivalent calls, so they belong here rather than in the
+ * PHY driver (see phy-exynos9610-ufs.c for the PHY_PMA_* half).
+ *
+ * This is a near-exact match for fsd_ufs_pre_link()/fsd_ufs_post_link():
+ * every PCS/DBG_MIB value is identical except register 0x8F, which
+ * downstream sets to 0x3E here vs. fsd's 0x3F, and two extra per-lane
+ * writes (0x04 on TX, 0x84 on RX) that don't appear in fsd's version.
+ * fsd_ufs_post_link() needs no changes at all and is reused directly.
+ */
+static int exynos9610_ufs_pre_link(struct exynos_ufs *ufs)
+{
+	struct exynos_ufs_uic_attr *attr = ufs->drv_data->uic_attr;
+	struct ufs_hba *hba = ufs->hba;
+	int i;
+
+	ufshcd_dme_set(hba, UIC_ARG_MIB(attr->pa_dbg_clk_period_off),
+		       DIV_ROUND_UP(NSEC_PER_SEC,  ufs->mclk_rate));
+	ufshcd_dme_set(hba, UIC_ARG_MIB(0x200), 0x40);
+
+	for_each_ufs_tx_lane(ufs, i) {
+		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(0xAA, i),
+			       DIV_ROUND_UP(NSEC_PER_SEC, ufs->mclk_rate));
+		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(0x8F, i), 0x3E);
+		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(0x04, i), 0x1);
+	}
+
+	for_each_ufs_rx_lane(ufs, i) {
+		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(0x12, i),
+			       DIV_ROUND_UP(NSEC_PER_SEC, ufs->mclk_rate));
+		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(0x5C, i), 0x38);
+		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(0x0F, i), 0x0);
+		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(0x65, i), 0x1);
+		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(0x69, i), 0x1);
+		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(0x21, i), 0x0);
+		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(0x22, i), 0x0);
+		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(0x84, i), 0x1);
+	}
+
+	ufshcd_dme_set(hba, UIC_ARG_MIB(0x200), 0x0);
+	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_DBG_AUTOMODE_THLD), 0x4E20);
+
+	ufshcd_dme_set(hba, UIC_ARG_MIB(attr->pa_dbg_opt_suite1_off),
+		       0x2e820183);
+	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_LOCAL_TX_LCC_ENABLE), 0x0);
+
+	exynos_ufs_establish_connt(ufs);
+
+	return 0;
+}
+
+/*
+ * calib_of_hs_rate_a[]/_b[] set DL_FC0PROTTIMEOUTVAL/DL_TC0REPLAYTIMEOUTVAL/
+ * DL_AFC0REQTIMEOUTVAL and both the local and remote L2 timers -- an exact
+ * value-for-value match with exynosautov920_ufs_pre_pwr_change() (minus its
+ * automotive-only 0x15d4 write, which doesn't appear anywhere downstream
+ * for this device).
+ */
+static int exynos9610_ufs_pre_pwr_change(struct exynos_ufs *ufs,
+					  struct ufs_pa_layer_attr *pwr)
+{
+	struct ufs_hba *hba = ufs->hba;
+
+	ufshcd_dme_set(hba, UIC_ARG_MIB(DL_FC0PROTTIMEOUTVAL), 8064);
+	ufshcd_dme_set(hba, UIC_ARG_MIB(DL_TC0REPLAYTIMEOUTVAL), 28224);
+	ufshcd_dme_set(hba, UIC_ARG_MIB(DL_AFC0REQTIMEOUTVAL), 20160);
+	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_PWRMODEUSERDATA0), 12000);
+	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_PWRMODEUSERDATA1), 32000);
+	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_PWRMODEUSERDATA2), 16000);
+
+	unipro_writel(ufs, 8064, UNIPRO_DME_POWERMODE_REQ_LOCALL2TIMER0);
+	unipro_writel(ufs, 28224, UNIPRO_DME_POWERMODE_REQ_LOCALL2TIMER1);
+	unipro_writel(ufs, 20160, UNIPRO_DME_POWERMODE_REQ_LOCALL2TIMER2);
+	unipro_writel(ufs, 12000, UNIPRO_DME_POWERMODE_REQ_REMOTEL2TIMER0);
+	unipro_writel(ufs, 32000, UNIPRO_DME_POWERMODE_REQ_REMOTEL2TIMER1);
+	unipro_writel(ufs, 16000, UNIPRO_DME_POWERMODE_REQ_REMOTEL2TIMER2);
+
+	return 0;
+}
+
 static inline u32 get_mclk_period_unipro_18(struct exynos_ufs *ufs)
 {
 	return (16 * 1000 * 1000000UL / ufs->mclk_rate);
@@ -2275,6 +2360,35 @@ static const struct exynos_ufs_drv_data fsd_ufs_drvs = {
 	.suspend                = fsd_ufs_suspend,
 };
 
+/*
+ * uic_attr is shared with FSD (&fsd_uic_attr): the two fields
+ * exynos9610_ufs_pre_link() actually reads (pa_dbg_clk_period_off,
+ * pa_dbg_opt_suite1_off/_val = 0x2e820183) are identical to FSD's
+ * downstream-confirmed values, and EXYNOS_UFS_OPT_SKIP_CONFIG_PHY_ATTR
+ * means none of uic_attr's other fields (tx_trailingclks, timing caps,
+ * etc.) are ever read for either chip.
+ *
+ * quirks/opts are inherited from FSD as the closest overall match (same
+ * pre_link structure, same isolation register) rather than independently
+ * confirmed bit-by-bit for this chip -- flagging that distinction here.
+ */
+static const struct exynos_ufs_drv_data exynos9610_ufs_drvs = {
+	.uic_attr		= &fsd_uic_attr,
+	.quirks			= UFSHCD_QUIRK_PRDT_BYTE_GRAN |
+				  UFSHCI_QUIRK_BROKEN_REQ_LIST_CLR |
+				  UFSHCD_QUIRK_BROKEN_OCS_FATAL_ERROR |
+				  UFSHCD_QUIRK_SKIP_DEF_UNIPRO_TIMEOUT_SETTING |
+				  UFSHCI_QUIRK_SKIP_RESET_INTR_AGGR,
+	.opts			= EXYNOS_UFS_OPT_HAS_APB_CLK_CTRL |
+				  EXYNOS_UFS_OPT_BROKEN_AUTO_CLK_CTRL |
+				  EXYNOS_UFS_OPT_SKIP_CONFIG_PHY_ATTR |
+				  EXYNOS_UFS_OPT_BROKEN_RX_SEL_IDX,
+	.pre_link		= exynos9610_ufs_pre_link,
+	.post_link		= fsd_ufs_post_link,
+	.pre_pwr_change		= exynos9610_ufs_pre_pwr_change,
+	.suspend		= fsd_ufs_suspend,
+};
+
 static const struct exynos_ufs_drv_data gs101_ufs_drvs = {
 	.uic_attr		= &gs101_uic_attr,
 	.quirks			= UFSHCD_QUIRK_PRDT_BYTE_GRAN |
@@ -2322,6 +2436,8 @@ static const struct of_device_id exynos_ufs_of_match[] = {
 	  .data       = &exynosautov920_ufs_drvs },
 	{ .compatible = "tesla,fsd-ufs",
 	  .data       = &fsd_ufs_drvs },
+	{ .compatible = "samsung,exynos9610-ufs",
+	  .data       = &exynos9610_ufs_drvs },
 	{},
 };
 MODULE_DEVICE_TABLE(of, exynos_ufs_of_match);
