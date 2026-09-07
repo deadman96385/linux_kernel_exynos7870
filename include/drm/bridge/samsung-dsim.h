@@ -22,6 +22,7 @@ struct samsung_dsim;
 #define DSIM_STATE_INITIALIZED		BIT(1)
 #define DSIM_STATE_CMD_LPM		BIT(2)
 #define DSIM_STATE_VIDOUT_AVAILABLE	BIT(3)
+#define DSIM_STATE_LINK_STARTED		BIT(4)
 
 enum samsung_dsim_type {
 	DSIM_TYPE_EXYNOS3250,
@@ -36,7 +37,7 @@ enum samsung_dsim_type {
 };
 
 #define samsung_dsim_hw_is_exynos(hw) \
-	((hw) >= DSIM_TYPE_EXYNOS3250 && (hw) <= DSIM_TYPE_EXYNOS5433)
+	((hw) >= DSIM_TYPE_EXYNOS3250 && (hw) <= DSIM_TYPE_EXYNOS7870)
 
 struct samsung_dsim_transfer {
 	struct list_head list;
@@ -45,6 +46,8 @@ struct samsung_dsim_transfer {
 	struct mipi_dsi_packet packet;
 	u16 flags;
 	u16 tx_done;
+	bool tx_header_sent;
+	bool tx_header_done;
 
 	u8 *rx_payload;
 	u16 rx_len;
@@ -59,12 +62,23 @@ struct samsung_dsim_driver_data {
 	unsigned int has_clklane_stop:1;
 	unsigned int has_broken_fifoctrl_emptyhdr:1;
 	unsigned int has_sfrctrl:1;
+	unsigned int has_cmd_config:1;
+	unsigned int wait_for_tx_done:1;
+	unsigned int use_legacy_phy_timing:1;
+	unsigned int init_before_panel_reset:1;
+	unsigned int configure_phy_before_pll:1;
+	unsigned int defer_link_start:1;
+	unsigned int configure_mode_before_panel_reset:1;
 	struct clk_bulk_data *clk_data;
 	unsigned int num_clks;
 	unsigned int min_freq;
 	unsigned int max_freq;
 	unsigned int wait_for_hdr_fifo;
 	unsigned int wait_for_reset;
+	unsigned int tx_fifo_init_bit;
+	unsigned int sfr_header_fifo_empty_bit;
+	unsigned int rx_fifo_init_bit;
+	unsigned int rx_fifo_empty_bit;
 	unsigned int num_bits_resol;
 	unsigned int video_mode_bit;
 	unsigned int pll_stable_bit;
@@ -77,6 +91,8 @@ struct samsung_dsim_driver_data {
 	unsigned int pll_m_offset;
 	unsigned int pll_s_offset;
 	unsigned int main_vsa_offset;
+	unsigned int pll_ctrl1;
+	unsigned int pll_ctrl2;
 	const unsigned int *reg_values;
 	unsigned int pll_fin_min;
 	unsigned int pll_fin_max;

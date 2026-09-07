@@ -283,9 +283,19 @@ static int __set_phy_state(const struct exynos_mipi_phy_desc *data,
 
 	/* disable in PMU sysreg */
 	if (!on && data->coupled_phy_id >= 0 &&
-	    state->phys[data->coupled_phy_id].phy->power_count == 0)
-		regmap_update_bits(enable_map, data->enable_reg,
-				   data->enable_val, 0);
+	    state->phys[data->coupled_phy_id].phy->power_count == 0) {
+		const struct exynos_mipi_phy_desc *coupled;
+		unsigned int resetn;
+		int ret;
+
+		coupled = state->phys[data->coupled_phy_id].data;
+		/* simplefb can retain a firmware-owned, running DSIM PHY. */
+		ret = regmap_read(state->regmaps[coupled->resetn_map],
+				  coupled->resetn_reg, &resetn);
+		if (!ret && !(resetn & coupled->resetn_val))
+			regmap_update_bits(enable_map, data->enable_reg,
+					   data->enable_val, 0);
+	}
 	/* PHY reset */
 	if (on)
 		regmap_update_bits(resetn_map, data->resetn_reg,
