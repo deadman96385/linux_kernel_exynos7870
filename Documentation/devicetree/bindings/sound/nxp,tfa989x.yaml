@@ -14,10 +14,14 @@ allOf:
 
 properties:
   compatible:
-    enum:
-      - nxp,tfa9890
-      - nxp,tfa9895
-      - nxp,tfa9897
+    oneOf:
+      - enum:
+          - nxp,tfa9890
+          - nxp,tfa9895
+          - nxp,tfa9897
+      - items:
+          - const: samsung,j7y17lte-tfa9890
+          - const: nxp,tfa9890
 
   reg:
     maxItems: 1
