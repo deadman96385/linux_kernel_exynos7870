@@ -17,6 +17,7 @@
 #include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/regulator/consumer.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
 
@@ -148,6 +149,7 @@ struct mip4_ts {
 	struct i2c_client *client;
 	struct input_dev *input;
 	struct gpio_desc *gpio_ce;
+	struct regulator *vdd;
 
 	char phys[32];
 	char product_name[16];
@@ -244,32 +246,28 @@ static int mip4_get_fw_version(struct mip4_ts *ts)
  */
 static int mip4_query_device(struct mip4_ts *ts)
 {
-	union i2c_smbus_data dummy;
 	int error;
 	u8 cmd[2];
 	u8 buf[14];
 
 	/*
-	 * Make sure there is something at this address as we do not
-	 * consider subsequent failures as fatal.
+	 * Use a real MIP register transaction as the presence check.  Some
+	 * MMS438 firmware does not support an uncommanded SMBus byte read.
 	 */
-	if (i2c_smbus_xfer(ts->client->adapter, ts->client->addr,
-			   0, I2C_SMBUS_READ, 0, I2C_SMBUS_BYTE, &dummy) < 0) {
-		dev_err(&ts->client->dev, "nothing at this address\n");
-		return -ENXIO;
-	}
-
-	/* Product name */
+	dev_info(&ts->client->dev,
+		 "querying product name at address 0x%02x\n",
+		 ts->client->addr);
 	cmd[0] = MIP4_R0_INFO;
 	cmd[1] = MIP4_R1_INFO_PRODUCT_NAME;
 	error = mip4_i2c_xfer(ts, cmd, sizeof(cmd),
 			      ts->product_name, sizeof(ts->product_name));
-	if (error)
-		dev_warn(&ts->client->dev,
-			 "Failed to retrieve product name: %d\n", error);
-	else
-		dev_dbg(&ts->client->dev, "product name: %.*s\n",
-			(int)sizeof(ts->product_name), ts->product_name);
+	if (error) {
+		dev_err(&ts->client->dev,
+			"no response to product-name register: %d\n", error);
+		return error;
+	}
+	dev_info(&ts->client->dev, "product name: %.*s\n",
+		 (int)sizeof(ts->product_name), ts->product_name);
 
 	/* Product ID */
 	cmd[0] = MIP4_R0_INFO;
@@ -306,7 +304,7 @@ static int mip4_query_device(struct mip4_ts *ts)
 		dev_warn(&ts->client->dev,
 			"Failed to retrieve FW version: %d\n", error);
 	else
-		dev_dbg(&ts->client->dev, "F/W Version: %04X %04X %04X %04X\n",
+		dev_info(&ts->client->dev, "F/W Version: %04X %04X %04X %04X\n",
 			 ts->fw_version.boot, ts->fw_version.core,
 			 ts->fw_version.app, ts->fw_version.param);
 
@@ -360,25 +358,87 @@ static int mip4_query_device(struct mip4_ts *ts)
 				 "Unknown event format %d\n", ts->event_format);
 	}
 
+	dev_info(&ts->client->dev, "query complete: %ux%u, format %u, size %u\n",
+		 ts->max_x, ts->max_y, ts->event_format, ts->event_size);
+
 	return 0;
+}
+
+static void mip4_set_input_resolution(struct mip4_ts *ts,
+				      bool set_single_touch)
+{
+	u8 ppm_x = ts->ppm_x;
+	u8 ppm_y = ts->ppm_y;
+
+	/*
+	 * libinput rejects a direct device if only one position axis has a
+	 * physical resolution.  Some MMS438 firmware reports just one of the
+	 * optional PPM values, while Samsung's downstream driver leaves both
+	 * unset.  Preserve valid pairs, but never publish an incomplete pair.
+	 */
+	if (!ppm_x || !ppm_y) {
+		if (ppm_x || ppm_y)
+			dev_warn(&ts->client->dev,
+				 "incomplete X/Y resolution %u/%u; leaving both unset\n",
+				 ppm_x, ppm_y);
+
+		ppm_x = 0;
+		ppm_y = 0;
+	}
+
+	input_abs_set_res(ts->input, ABS_MT_POSITION_X, ppm_x);
+	input_abs_set_res(ts->input, ABS_MT_POSITION_Y, ppm_y);
+
+	if (set_single_touch) {
+		input_abs_set_res(ts->input, ABS_X, ppm_x);
+		input_abs_set_res(ts->input, ABS_Y, ppm_y);
+	}
 }
 
 static int mip4_power_on(struct mip4_ts *ts)
 {
+	int error;
+
+	dev_info(&ts->client->dev, "powering controller on\n");
+
+	if (ts->vdd) {
+		error = regulator_enable(ts->vdd);
+		if (error)
+			return dev_err_probe(&ts->client->dev, error,
+					     "Failed to enable VDD regulator\n");
+	}
+
 	if (ts->gpio_ce) {
 		gpiod_set_value_cansleep(ts->gpio_ce, 1);
 
 		/* Booting delay : 200~300ms */
 		usleep_range(200 * 1000, 300 * 1000);
+	} else if (ts->vdd) {
+		/* Regulator-only MMS438 designs need at least 50ms. */
+		usleep_range(50 * 1000, 60 * 1000);
 	}
+
+	dev_info(&ts->client->dev, "controller power-on delay complete\n");
 
 	return 0;
 }
 
 static void mip4_power_off(struct mip4_ts *ts)
 {
+	int error;
+
 	if (ts->gpio_ce)
 		gpiod_set_value_cansleep(ts->gpio_ce, 0);
+
+	if (ts->vdd) {
+		error = regulator_disable(ts->vdd);
+		if (error)
+			dev_warn(&ts->client->dev,
+				 "Failed to disable VDD regulator: %d\n", error);
+	}
+
+	if (ts->vdd && !ts->gpio_ce)
+		usleep_range(10 * 1000, 11 * 1000);
 }
 
 /*
@@ -1141,10 +1201,7 @@ exit_bl:
 	input_set_abs_params(ts->input, ABS_MT_POSITION_Y, 0, ts->max_y, 0, 0);
 	input_set_abs_params(ts->input, ABS_X, 0, ts->max_x, 0, 0);
 	input_set_abs_params(ts->input, ABS_Y, 0, ts->max_y, 0, 0);
-	input_abs_set_res(ts->input, ABS_MT_POSITION_X, ts->ppm_x);
-	input_abs_set_res(ts->input, ABS_MT_POSITION_Y, ts->ppm_y);
-	input_abs_set_res(ts->input, ABS_X, ts->ppm_x);
-	input_abs_set_res(ts->input, ABS_Y, ts->ppm_y);
+	mip4_set_input_resolution(ts, true);
 
 	return error ? error : 0;
 }
@@ -1398,6 +1455,8 @@ static int mip4_probe(struct i2c_client *client)
 	struct input_dev *input;
 	int error;
 
+	dev_info(&client->dev, "MIP4 probe start, IRQ %d\n", client->irq);
+
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
 		dev_err(&client->dev, "Not supported I2C adapter\n");
 		return -ENXIO;
@@ -1417,6 +1476,19 @@ static int mip4_probe(struct i2c_client *client)
 	snprintf(ts->phys, sizeof(ts->phys),
 		 "%s/input0", dev_name(&client->dev));
 
+	ts->vdd = devm_regulator_get_optional(&client->dev, "vdd");
+	if (IS_ERR(ts->vdd)) {
+		error = PTR_ERR(ts->vdd);
+		if (error == -ENODEV)
+			ts->vdd = NULL;
+		else
+			return dev_err_probe(&client->dev, error,
+					     "Failed to get VDD regulator\n");
+	}
+	dev_info(&client->dev, "VDD supply %s\n",
+		 ts->vdd ? "present" : "not described");
+
+
 	ts->gpio_ce = devm_gpiod_get_optional(&client->dev,
 					      "ce", GPIOD_OUT_LOW);
 	if (IS_ERR(ts->gpio_ce))
@@ -1425,6 +1497,7 @@ static int mip4_probe(struct i2c_client *client)
 	error = mip4_power_on(ts);
 	if (error)
 		return error;
+	dev_info(&client->dev, "starting protocol query\n");
 	error = mip4_query_device(ts);
 	mip4_power_off(ts);
 	if (error)
@@ -1455,8 +1528,7 @@ static int mip4_probe(struct i2c_client *client)
 			     MIP4_TOUCH_MAJOR_MIN, MIP4_TOUCH_MAJOR_MAX, 0, 0);
 	input_set_abs_params(input, ABS_MT_TOUCH_MINOR,
 			     MIP4_TOUCH_MINOR_MIN, MIP4_TOUCH_MINOR_MAX, 0, 0);
-	input_abs_set_res(ts->input, ABS_MT_POSITION_X, ts->ppm_x);
-	input_abs_set_res(ts->input, ABS_MT_POSITION_Y, ts->ppm_y);
+	mip4_set_input_resolution(ts, false);
 
 	error = input_mt_init_slots(input, MIP4_MAX_FINGERS, INPUT_MT_DIRECT);
 	if (error)
@@ -1474,6 +1546,7 @@ static int mip4_probe(struct i2c_client *client)
 			client->irq, error);
 		return error;
 	}
+	dev_info(&client->dev, "threaded IRQ registered\n");
 
 	error = input_register_device(input);
 	if (error) {
@@ -1481,6 +1554,9 @@ static int mip4_probe(struct i2c_client *client)
 			"Failed to register input device: %d\n", error);
 		return error;
 	}
+
+	dev_info(&client->dev,
+		 "MELFAS MIP4 touchscreen registered successfully\n");
 
 	return 0;
 }
