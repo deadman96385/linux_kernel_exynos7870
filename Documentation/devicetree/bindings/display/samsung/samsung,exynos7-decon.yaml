@@ -89,6 +89,13 @@ properties:
       A phandle to a node describing a reserved framebuffer memory region.
       For example, the splash memory region set up by the bootloader.
 
+  samsung,hardware-te-trigger:
+    type: boolean
+    description:
+      Route the panel tearing-effect signal directly to the DECON hardware
+      trigger input. This is used by command-mode panels whose TE pin is
+      muxed to the display controller instead of exposed as a GPIO interrupt.
+
   port:
     $ref: /schemas/graph.yaml#/properties/port
     description:

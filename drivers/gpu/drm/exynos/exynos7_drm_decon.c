@@ -42,6 +42,7 @@ struct decon_data {
 	unsigned int vidw_buf_start_base;
 	unsigned int shadowcon_win_protect_shift;
 	unsigned int wincon_burstlen_shift;
+	bool has_win_channel_map;
 };
 
 static const struct decon_data exynos7_decon_data = {
@@ -54,6 +55,7 @@ static const struct decon_data exynos7870_decon_data = {
 	.vidw_buf_start_base = 0x880,
 	.shadowcon_win_protect_shift = 8,
 	.wincon_burstlen_shift = 10,
+	.has_win_channel_map = true,
 };
 
 struct decon_context {
@@ -70,8 +72,14 @@ struct decon_context {
 	void __iomem			*regs;
 	unsigned long			irq_flags;
 	bool				i80_if;
+	bool				hw_te_trigger;
+	bool				hw_te_frame_armed;
+	bool				hw_te_first_frame_done;
 	wait_queue_head_t		wait_vsync_queue;
 	atomic_t			wait_vsync_event;
+	atomic_t			win_updated;
+	atomic_t			te_pending;
+	atomic_t			triggering;
 
 	const struct decon_data *data;
 	struct drm_encoder *encoder;
@@ -277,6 +285,12 @@ static int decon_enable_vblank(struct exynos_drm_crtc *crtc)
 			val |= VIDINTCON0_INT_FRAME;
 			val &= ~VIDINTCON0_FRAMESEL0_MASK;
 			val |= VIDINTCON0_FRAMESEL0_VSYNC;
+		} else {
+			writel(VIDINTCON1_INT_I80, ctx->regs + VIDINTCON1);
+			val |= VIDINTCON0_INT_FIFO |
+			       VIDINTCON0_INT_I80_EN |
+			       VIDINTCON0_INT_FRAME |
+			       VIDINTCON0_FRAMESEL0_VSYNC;
 		}
 
 		writel(val, ctx->regs + VIDINTCON0);
@@ -296,6 +310,8 @@ static void decon_disable_vblank(struct exynos_drm_crtc *crtc)
 		val &= ~VIDINTCON0_INT_ENABLE;
 		if (!ctx->i80_if)
 			val &= ~VIDINTCON0_INT_FRAME;
+		else
+			val &= ~VIDINTCON0_INT_I80_EN;
 
 		writel(val, ctx->regs + VIDINTCON0);
 	}
@@ -390,11 +406,21 @@ static void decon_win_set_colkey(struct decon_context *ctx, unsigned int win)
 static void decon_atomic_begin(struct exynos_drm_crtc *crtc)
 {
 	struct decon_context *ctx = crtc->ctx;
+	u32 val;
 	int i;
+
+	if (ctx->hw_te_trigger) {
+		val = readl(ctx->regs + TRIGCON);
+		val &= ~TRIGCON_HWTRIGMASK_DISPIF0;
+		writel(val, ctx->regs + TRIGCON);
+	}
 
 	for (i = 0; i < WINDOWS_NR; i++)
 		decon_shadow_protect_win(ctx, i, true);
 }
+
+static void decon_trigger(struct decon_context *ctx);
+static void decon_te_handler(struct exynos_drm_crtc *crtc);
 
 static void decon_update_plane(struct exynos_drm_crtc *crtc,
 			       struct exynos_drm_plane *plane)
@@ -411,6 +437,7 @@ static void decon_update_plane(struct exynos_drm_crtc *crtc,
 	unsigned int cpp = fb->format->cpp[0];
 	unsigned int pitch = fb->pitches[0];
 	unsigned int vidw_addr0_base = ctx->data->vidw_buf_start_base;
+	u32 channel;
 
 	/*
 	 * SHADOWCON/PRTCON register is used for enabling timing.
@@ -421,6 +448,15 @@ static void decon_update_plane(struct exynos_drm_crtc *crtc,
 	 * wouldn't be updated at vsync also but updated once unprotect window
 	 * is set.
 	 */
+	if (ctx->data->has_win_channel_map) {
+		channel = readl(ctx->regs + WINCHMAP0);
+		channel &= ~WINCHMAP_MASK(win);
+		channel |= WINCHMAP_DMA(win + 1, win);
+		writel(channel, ctx->regs + WINCHMAP0);
+	}
+
+	/* A DMA-backed plane must override any firmware color map. */
+	writel(0, ctx->regs + WINxMAP(win));
 
 	/* buffer start address */
 	val = (unsigned long)exynos_drm_fb_dma_addr(fb, 0);
@@ -490,6 +526,9 @@ static void decon_update_plane(struct exynos_drm_crtc *crtc,
 	val = readl(ctx->regs + DECON_UPDATE);
 	val |= DECON_UPDATE_STANDALONE_F;
 	writel(val, ctx->regs + DECON_UPDATE);
+
+	if (ctx->i80_if)
+		atomic_set(&ctx->win_updated, 1);
 }
 
 static void decon_disable_plane(struct exynos_drm_crtc *crtc,
@@ -510,16 +549,96 @@ static void decon_disable_plane(struct exynos_drm_crtc *crtc,
 	val = readl(ctx->regs + DECON_UPDATE);
 	val |= DECON_UPDATE_STANDALONE_F;
 	writel(val, ctx->regs + DECON_UPDATE);
+
+	if (ctx->i80_if)
+		atomic_set(&ctx->win_updated, 1);
 }
 
 static void decon_atomic_flush(struct exynos_drm_crtc *crtc)
 {
 	struct decon_context *ctx = crtc->ctx;
+	bool te_pending;
+	u32 val;
 	int i;
 
 	for (i = 0; i < WINDOWS_NR; i++)
 		decon_shadow_protect_win(ctx, i, false);
+
+	te_pending = ctx->i80_if && !ctx->hw_te_trigger &&
+		     atomic_xchg(&ctx->te_pending, 0);
+
+	/* Arm the event and I80 interrupt before a pending TE starts DMA. */
 	exynos_crtc_handle_event(crtc);
+
+	if (ctx->hw_te_trigger) {
+		atomic_set(&ctx->te_pending, 0);
+		val = readl(ctx->regs + TRIGCON);
+		val |= TRIGCON_HWTRIGMASK_DISPIF0;
+		writel(val, ctx->regs + TRIGCON);
+		WRITE_ONCE(ctx->hw_te_frame_armed, true);
+		dev_dbg(ctx->dev,
+			"Samsung DECON hardware TE armed: trig=%08x update=%08x win=%08x channel=%08x map=%08x\n",
+			readl(ctx->regs + TRIGCON),
+			readl(ctx->regs + DECON_UPDATE),
+			readl(ctx->regs + WINCON(0)),
+			readl(ctx->regs + WINCHMAP0),
+			readl(ctx->regs + WINxMAP(0)));
+	} else if (te_pending) {
+		dev_info(ctx->dev, "Samsung DECON consuming pending TE\n");
+		decon_te_handler(crtc);
+	}
+}
+
+static void decon_setup_command_bootstrap(struct decon_context *ctx)
+{
+	struct drm_display_mode *mode = &ctx->crtc->base.state->adjusted_mode;
+	u32 val;
+
+	if (!ctx->hw_te_trigger || !mode->hdisplay || !mode->vdisplay)
+		return;
+
+	decon_shadow_protect_win(ctx, 0, true);
+
+	if (ctx->data->has_win_channel_map) {
+		val = readl(ctx->regs + WINCHMAP0);
+		val &= ~WINCHMAP_MASK(0);
+		val |= WINCHMAP_DMA(1, 0);
+		writel(val, ctx->regs + WINCHMAP0);
+	}
+
+	writel(mode->hdisplay, ctx->regs + VIDW_WHOLE_X(0));
+	writel(mode->vdisplay, ctx->regs + VIDW_WHOLE_Y(0));
+	writel(0, ctx->regs + VIDW_OFFSET_X(0));
+	writel(0, ctx->regs + VIDW_OFFSET_Y(0));
+	writel(VIDOSDxA_TOPLEFT_X(0) | VIDOSDxA_TOPLEFT_Y(0),
+	       ctx->regs + VIDOSD_A(0));
+	writel(VIDOSDxB_BOTRIGHT_X(mode->hdisplay - 1) |
+	       VIDOSDxB_BOTRIGHT_Y(mode->vdisplay - 1),
+	       ctx->regs + VIDOSD_B(0));
+	writel(VIDOSDxC_ALPHA0_R_F(0) | VIDOSDxC_ALPHA0_G_F(0) |
+	       VIDOSDxC_ALPHA0_B_F(0), ctx->regs + VIDOSD_C(0));
+	writel(VIDOSDxD_ALPHA1_R_F(0xff) | VIDOSDxD_ALPHA1_G_F(0xff) |
+	       VIDOSDxD_ALPHA1_B_F(0xff), ctx->regs + VIDOSD_D(0));
+	writel(WINxMAP_MAP | WINxMAP_MAP_COLOUR(0), ctx->regs + WINxMAP(0));
+	writel(WINCONx_ENWIN, ctx->regs + WINCON(0));
+
+	decon_shadow_protect_win(ctx, 0, false);
+
+	val = readl(ctx->regs + DECON_UPDATE);
+	val |= DECON_UPDATE_STANDALONE_F;
+	writel(val, ctx->regs + DECON_UPDATE);
+
+	val = readl(ctx->regs + TRIGCON);
+	val |= TRIGCON_HWTRIGMASK_DISPIF0;
+	writel(val, ctx->regs + TRIGCON);
+
+	dev_info(ctx->dev,
+		 "Samsung DECON black bootstrap: trig=%08x update=%08x win=%08x channel=%08x map=%08x\n",
+		 readl(ctx->regs + TRIGCON),
+		 readl(ctx->regs + DECON_UPDATE),
+		 readl(ctx->regs + WINCON(0)),
+		 readl(ctx->regs + WINCHMAP0),
+		 readl(ctx->regs + WINxMAP(0)));
 }
 
 static void decon_init(struct decon_context *ctx)
@@ -531,12 +650,26 @@ static void decon_init(struct decon_context *ctx)
 	val = VIDOUTCON0_DISP_IF_0_ON;
 	if (!ctx->i80_if)
 		val |= VIDOUTCON0_RGBIF;
+	else
+		val |= VIDOUTCON0_I80IF;
 	writel(val, ctx->regs + VIDOUTCON0);
 
 	writel(VCLKCON0_CLKVALUP | VCLKCON0_VCLKFREE, ctx->regs + VCLKCON0);
 
-	if (!ctx->i80_if)
+	if (!ctx->i80_if) {
 		writel(VIDCON1_VCLK_HOLD, ctx->regs + VIDCON1(0));
+	} else {
+		writel(VIDCON1_VCLK_RUN_VDEN_DISABLE,
+		       ctx->regs + VIDCON1(0));
+		if (ctx->hw_te_trigger)
+			writel(TRIGCON_HWTRIGEN_I80_RGB |
+			       TRIGCON_HWTRIG_AUTO_MASK |
+			       TRIGCON_TRIG_SAVE_DISABLE_SYNCMGR,
+			       ctx->regs + TRIGCON);
+		else
+			writel(TRIGCON_SWTRIGEN_I80_RGB,
+			       ctx->regs + TRIGCON);
+	}
 }
 
 static void decon_atomic_enable(struct exynos_drm_crtc *crtc)
@@ -557,6 +690,7 @@ static void decon_atomic_enable(struct exynos_drm_crtc *crtc)
 		decon_enable_vblank(ctx->crtc);
 
 	decon_commit(ctx->crtc);
+	decon_setup_command_bootstrap(ctx);
 }
 
 static void decon_atomic_disable(struct exynos_drm_crtc *crtc)
@@ -575,6 +709,67 @@ static void decon_atomic_disable(struct exynos_drm_crtc *crtc)
 	pm_runtime_put_sync(ctx->dev);
 }
 
+static void decon_trigger(struct decon_context *ctx)
+{
+	u32 val;
+
+	if (atomic_read(&ctx->triggering))
+		return;
+
+	atomic_set(&ctx->triggering, 1);
+
+	val = readl(ctx->regs + TRIGCON);
+	dev_info(ctx->dev,
+		 "Samsung DECON trigger: trig=%08x vid=%08x out=%08x vclk=%08x scheme=%08x update=%08x win=%08x channel=%08x map=%08x int=%08x/%08x\n",
+		 val, readl(ctx->regs + VIDCON0),
+		 readl(ctx->regs + VIDOUTCON0),
+		 readl(ctx->regs + VCLKCON0),
+		 readl(ctx->regs + VIDCON1(0)),
+		 readl(ctx->regs + DECON_UPDATE),
+		 readl(ctx->regs + WINCON(0)),
+		 readl(ctx->regs + WINCHMAP0),
+		 readl(ctx->regs + WINxMAP(0)),
+		 readl(ctx->regs + VIDINTCON0),
+		 readl(ctx->regs + VIDINTCON1));
+	val |= TRIGCON_SWTRIGCMD_I80_RGB;
+	writel(val, ctx->regs + TRIGCON);
+	dev_info(ctx->dev, "Samsung DECON trigger result: trig=%08x update=%08x\n",
+		 readl(ctx->regs + TRIGCON),
+		 readl(ctx->regs + DECON_UPDATE));
+
+	if (!test_bit(0, &ctx->irq_flags))
+		atomic_set(&ctx->triggering, 0);
+}
+
+static void decon_te_handler(struct exynos_drm_crtc *crtc)
+{
+	struct decon_context *ctx = crtc->ctx;
+
+	if (!ctx->drm_dev)
+		return;
+	if (ctx->hw_te_trigger)
+		return;
+
+	dev_info_once(ctx->dev,
+		      "Samsung DECON first TE: updated=%d triggering=%d irq=%lx\n",
+		      atomic_read(&ctx->win_updated),
+		      atomic_read(&ctx->triggering), ctx->irq_flags);
+
+	atomic_set(&ctx->te_pending, 1);
+	if (atomic_add_unless(&ctx->win_updated, -1, 0)) {
+		atomic_set(&ctx->te_pending, 0);
+		decon_trigger(ctx);
+	}
+
+	if (atomic_read(&ctx->wait_vsync_event)) {
+		atomic_set(&ctx->wait_vsync_event, 0);
+		wake_up(&ctx->wait_vsync_queue);
+	}
+
+	if (test_bit(0, &ctx->irq_flags))
+		drm_crtc_handle_vblank(&ctx->crtc->base);
+}
+
 static const struct exynos_drm_crtc_ops decon_crtc_ops = {
 	.atomic_enable = decon_atomic_enable,
 	.atomic_disable = decon_atomic_disable,
@@ -584,19 +779,25 @@ static const struct exynos_drm_crtc_ops decon_crtc_ops = {
 	.update_plane = decon_update_plane,
 	.disable_plane = decon_disable_plane,
 	.atomic_flush = decon_atomic_flush,
+	.te_handler = decon_te_handler,
 };
 
 
 static irqreturn_t decon_irq_handler(int irq, void *dev_id)
 {
 	struct decon_context *ctx = (struct decon_context *)dev_id;
-	u32 val, clear_bit;
+	u32 val, clear_bits;
 
 	val = readl(ctx->regs + VIDINTCON1);
 
-	clear_bit = ctx->i80_if ? VIDINTCON1_INT_I80 : VIDINTCON1_INT_FRAME;
-	if (val & clear_bit)
-		writel(clear_bit, ctx->regs + VIDINTCON1);
+	if (ctx->i80_if)
+		clear_bits = val & (VIDINTCON1_INT_I80 |
+				    VIDINTCON1_INT_FRAME |
+				    VIDINTCON1_INT_FIFO);
+	else
+		clear_bits = val & VIDINTCON1_INT_FRAME;
+	if (clear_bits)
+		writel(clear_bits, ctx->regs + VIDINTCON1);
 
 	/* check the crtc is detached already from encoder */
 	if (!ctx->drm_dev)
@@ -606,7 +807,28 @@ static irqreturn_t decon_irq_handler(int irq, void *dev_id)
 	if (!drm_dev_has_vblank(ctx->drm_dev))
 		goto out;
 
-	if (!ctx->i80_if) {
+	if (ctx->i80_if) {
+		if (val & VIDINTCON1_INT_I80) {
+			atomic_set(&ctx->triggering, 0);
+			if (ctx->hw_te_trigger) {
+				if (READ_ONCE(ctx->hw_te_frame_armed)) {
+					WRITE_ONCE(ctx->hw_te_frame_armed, false);
+					if (!ctx->hw_te_first_frame_done) {
+						ctx->hw_te_first_frame_done = true;
+						dev_info(ctx->dev,
+							 "Samsung DECON first hardware frame: status=%08x trig=%08x update=%08x\n",
+							 val, readl(ctx->regs + TRIGCON),
+							 readl(ctx->regs + DECON_UPDATE));
+					}
+				}
+				drm_crtc_handle_vblank(&ctx->crtc->base);
+				if (atomic_read(&ctx->wait_vsync_event)) {
+					atomic_set(&ctx->wait_vsync_event, 0);
+					wake_up(&ctx->wait_vsync_queue);
+				}
+			}
+		}
+	} else {
 		drm_crtc_handle_vblank(&ctx->crtc->base);
 
 		/* set wait vsync event to zero and wake up queue. */
@@ -699,6 +921,9 @@ static int decon_probe(struct platform_device *pdev)
 	if (i80_if_timings)
 		ctx->i80_if = true;
 	of_node_put(i80_if_timings);
+	ctx->hw_te_trigger = ctx->i80_if &&
+		of_property_read_bool(dev->of_node,
+				      "samsung,hardware-te-trigger");
 
 	ctx->regs = of_iomap(dev->of_node, 0);
 	if (!ctx->regs)
@@ -744,6 +969,9 @@ static int decon_probe(struct platform_device *pdev)
 
 	init_waitqueue_head(&ctx->wait_vsync_queue);
 	atomic_set(&ctx->wait_vsync_event, 0);
+	atomic_set(&ctx->win_updated, 0);
+	atomic_set(&ctx->te_pending, 0);
+	atomic_set(&ctx->triggering, 0);
 
 	platform_set_drvdata(pdev, ctx);
 
