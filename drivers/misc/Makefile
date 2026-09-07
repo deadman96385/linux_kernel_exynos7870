@@ -71,3 +71,8 @@ obj-y				+= keba/
 obj-y				+= amd-sbi/
 obj-$(CONFIG_MISC_RP1)		+= rp1/
 obj-$(CONFIG_INTEL_SSEI)	+= issei/
+
+obj-$(CONFIG_J7Y17LTE_CAMERA_PROBE) += j7y17lte-camera-probe.o
+
+obj-$(CONFIG_EXYNOS7870_CAMERA_FE) += exynos7870-camera-fe.o
+obj-$(CONFIG_EXYNOS7870_ISP) += exynos7870-isp.o

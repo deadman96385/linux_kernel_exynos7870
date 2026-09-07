@@ -1,0 +1,223 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * J7Y17LTE board foundation, reviewed against downstream commit
+ * 117a2f271e0f2db2d8743d4a4ec77a8a9876cf82.
+ * Experimental board qualification, initially no streaming.
+ */
+
+/ {
+	vdd_cam_io_1p8: regulator-camera-io {
+		compatible = "regulator-fixed";
+		regulator-name = "VDD_CAM_IO_1P8";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		gpio = <&gpd4 3 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	vdd_cam_a2p8: regulator-camera-rear-analog {
+		compatible = "regulator-fixed";
+		regulator-name = "VDD_CAM_SENSOR_A2P8";
+		regulator-min-microvolt = <2800000>;
+		regulator-max-microvolt = <2800000>;
+		gpio = <&gpd3 5 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	vdd_cam_core_1p2: regulator-camera-rear-core {
+		compatible = "regulator-fixed";
+		regulator-name = "VDD_CAM_1P2";
+		regulator-min-microvolt = <1200000>;
+		regulator-max-microvolt = <1200000>;
+		gpio = <&gpf4 1 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	vdd_cam_af_2p8: regulator-camera-autofocus {
+		compatible = "regulator-fixed";
+		regulator-name = "VDD_CAM_AF_2P8";
+		regulator-min-microvolt = <2800000>;
+		regulator-max-microvolt = <2800000>;
+		gpio = <&gpd1 1 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	vdd_vtcam_a2p8: regulator-camera-front-analog {
+		compatible = "regulator-fixed";
+		regulator-name = "VDD_VTCAM_A2P8";
+		regulator-min-microvolt = <2800000>;
+		regulator-max-microvolt = <2800000>;
+		gpio = <&gpd1 2 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	vdd_vtcam_core_1p05: regulator-camera-front-core {
+		compatible = "regulator-fixed";
+		regulator-name = "VDD_VTCAM_1P05";
+		regulator-min-microvolt = <1050000>;
+		regulator-max-microvolt = <1050000>;
+		gpio = <&gpc0 2 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+};
+
+/* Physical controller addresses, not downstream numeric aliases. */
+&hsi2c1 { /* 0x138a0000: rear IMX258 at 0x1a */
+	clock-frequency = <400000>;
+	status = "okay";
+};
+
+&hsi2c2 { /* 0x138b0000: DW9807 at 0x0c, rear EEPROM at 0x58 */
+	clock-frequency = <400000>;
+	status = "okay";
+};
+
+&hsi2c3 { /* 0x138c0000: front S5K3M3 at 0x10 */
+	clock-frequency = <400000>;
+	status = "okay";
+};
+
+&hsi2c6 { /* 0x13960000: front EEPROM at 0x51 */
+	clock-frequency = <400000>;
+	status = "okay";
+};
+
+&hsi2c1 {
+	rear_camera: camera@1a {
+		compatible = "samsung,j7y17lte-imx258-probe";
+		reg = <0x1a>;
+		reset-gpios = <&gpd4 2 GPIO_ACTIVE_LOW>;
+		analog-supply = <&vdd_cam_a2p8>;
+		core-supply = <&vdd_cam_core_1p2>;
+		af-supply = <&vdd_cam_af_2p8>;
+		focus-i2c = <&hsi2c2>;
+		io-supply = <&vdd_cam_io_1p8>;
+		clocks = <&cmu_mif CLK_GOUT_MIF_CMU_ISP_SENSOR0>;
+		assigned-clocks = <&cmu_mif CLK_MOUT_MIF_CMU_ISP_SENSOR0>,
+				  <&cmu_mif CLK_DOUT_MIF_CMU_ISP_SENSOR0>;
+		assigned-clock-parents = <&oscclk>, <0>;
+		assigned-clock-rates = <0>, <26000000>;
+		pinctrl-names = "default", "active";
+		pinctrl-0 = <&fimc_is_mclk0_in>;
+		pinctrl-1 = <&fimc_is_mclk0_fn>;
+	};
+};
+
+&hsi2c3 {
+	camera@10 {
+		compatible = "samsung,j7y17lte-3m3-probe";
+		reg = <0x10>;
+		reset-gpios = <&gpa1 5 GPIO_ACTIVE_LOW>;
+		analog-supply = <&vdd_vtcam_a2p8>;
+		core-supply = <&vdd_vtcam_core_1p05>;
+		io-supply = <&vdd_cam_io_1p8>;
+		clocks = <&cmu_mif CLK_GOUT_MIF_CMU_ISP_SENSOR1>;
+		assigned-clocks = <&cmu_mif CLK_MOUT_MIF_CMU_ISP_SENSOR1>,
+				  <&cmu_mif CLK_DOUT_MIF_CMU_ISP_SENSOR1>;
+		assigned-clock-parents = <&oscclk>, <0>;
+		assigned-clock-rates = <0>, <26000000>;
+		pinctrl-names = "default", "active";
+		pinctrl-0 = <&fimc_is_mclk1_in>;
+		pinctrl-1 = <&fimc_is_mclk1_fn>;
+	};
+};
+
+/* One shared ISP/CAM/VRA domain with managed CMU save/restore. */
+&{/soc@0} {
+	pd_isp: power-domain@10484040 {
+		compatible = "samsung,exynos7870-isp-pd";
+		reg = <0x10484040 0x20>;
+		#power-domain-cells = <0>;
+		label = "ISP";
+		samsung,pmu = <&pmu_system_controller>;
+		clocks = <&cmu_mif CLK_GOUT_MIF_CMU_ISP_CAM>,
+			 <&cmu_mif CLK_GOUT_MIF_CMU_ISP_ISP>,
+			 <&cmu_mif CLK_GOUT_MIF_CMU_ISP_VRA>;
+		clock-names = "cam", "isp", "vra";
+	};
+
+	/* The two CSIS writers share this single translation unit. */
+	sysmmu_camera: iommu@14470000 {
+		compatible = "samsung,exynos-sysmmu";
+		reg = <0x14470000 0x1000>;
+		interrupts = <GIC_SPI 128 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <0>;
+		power-domains = <&pd_isp>;
+		clocks = <&cmu_isp CLK_GOUT_ISP_ISPD>,
+			 <&cmu_isp CLK_GOUT_ISP_CAM>,
+			 <&cmu_isp CLK_GOUT_ISP_ISPD_PPMU>,
+			 <&cmu_isp CLK_GOUT_ISP_APB>;
+		clock-names = "sysmmu", "master", "ppmu", "pclk";
+	};
+
+
+	sysmmu_isp1: iommu@14490000 {
+		compatible = "samsung,exynos-sysmmu";
+		reg = <0x14490000 0x1000>;
+		interrupts = <GIC_SPI 131 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <0>;
+		power-domains = <&pd_isp>;
+		clocks = <&cmu_isp CLK_GOUT_ISP_ISPD>,
+			 <&cmu_isp CLK_GOUT_ISP_MUX_ISP>,
+			 <&cmu_isp CLK_GOUT_ISP_ISPD_PPMU>,
+			 <&cmu_isp CLK_GOUT_ISP_APB>;
+		clock-names = "sysmmu", "master", "ppmu", "pclk";
+	};
+
+	sysmmu_isp2: iommu@144a0000 {
+		compatible = "samsung,exynos-sysmmu";
+		reg = <0x144a0000 0x1000>;
+		interrupts = <GIC_SPI 134 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <0>;
+		power-domains = <&pd_isp>;
+		clocks = <&cmu_isp CLK_GOUT_ISP_ISPD>,
+			 <&cmu_isp CLK_GOUT_ISP_MUX_ISP>,
+			 <&cmu_isp CLK_GOUT_ISP_ISPD_PPMU>,
+			 <&cmu_isp CLK_GOUT_ISP_APB>;
+		clock-names = "sysmmu", "master", "ppmu", "pclk";
+	};
+
+	/* Vendor processing clients share both translation units in one domain. */
+	isp_processing: isp@14400000 {
+		compatible = "samsung,exynos7870-isp";
+		reg = <0x14400000 0x10000>, <0x14480000 0x10000>;
+		reg-names = "isp", "isp-b";
+		iommus = <&sysmmu_isp1>, <&sysmmu_isp2>;
+		power-domains = <&pd_isp>;
+		clocks = <&cmu_isp CLK_GOUT_ISP_ISPD_PPMU>,
+			 <&cmu_isp CLK_GOUT_ISP_ISPD>,
+			 <&cmu_isp CLK_GOUT_ISP_MUX_ISP>,
+			 <&cmu_isp CLK_GOUT_ISP_CAM>,
+			 <&cmu_isp CLK_GOUT_ISP_CAM_HALF>,
+			 <&cmu_isp CLK_GOUT_ISP_APB>;
+		clock-names = "ispd-ppmu", "ispd", "isp", "cam", "cam-half", "apb";
+	};
+
+	camera_fe: camera@14420000 {
+		compatible = "samsung,exynos7870-camera-fe";
+		reg = <0x14420000 0x10000>, <0x14460000 0x10000>;
+		reg-names = "csis0", "csis1";
+		iommus = <&sysmmu_camera>;
+		interrupts = <GIC_SPI 144 IRQ_TYPE_LEVEL_HIGH>;
+		phys = <&mipi_phy 0>;
+		phy-names = "csis0";
+		samsung,rear-sensor = <&rear_camera>;
+		power-domains = <&pd_isp>;
+		clocks = <&cmu_isp CLK_GOUT_ISP_ISPD_PPMU>,
+			 <&cmu_isp CLK_GOUT_ISP_ISPD>,
+			 <&cmu_isp CLK_GOUT_ISP_CAM>,
+			 <&cmu_isp CLK_GOUT_ISP_CAM_HALF>,
+			 <&cmu_isp CLK_GOUT_ISP_APB>,
+			 <&cmu_isp CLK_GOUT_ISP_MUX_RXBYTECLKHS0_SENSOR0_USER>;
+		clock-names = "ispd-ppmu", "ispd", "cam", "cam-half", "apb", "rxbyte0";
+	};
+};
+
+&cmu_isp {
+	power-domains = <&pd_isp>;
+};
+
+/* Native DECON is disabled; simplefb retains the bootloader display. */
+&sysmmu_decon {
+	status = "disabled";
+};

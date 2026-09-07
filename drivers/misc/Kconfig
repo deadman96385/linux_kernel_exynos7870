@@ -5,6 +5,37 @@
 
 menu "Misc devices"
 
+config EXYNOS7870_ISP
+	tristate "Exynos7870 native ISP processing qualification"
+	depends on EXYNOS7870_CAMERA_FE
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_VMALLOC
+	help
+	  Separate processing DMA owner with runtime PM and 32-bit IOMMU
+	  allocation qualification. Frame submission is not enabled yet.
+
+config EXYNOS7870_CAMERA_FE
+	tristate "Exynos7870 shared camera front-end qualification"
+	depends on ARCH_EXYNOS && OF && PM && COMMON_CLK && SYSFS
+	depends on J7Y17LTE_CAMERA_PROBE && EXYNOS_IOMMU && PHY_EXYNOS_MIPI_VIDEO
+	depends on VIDEO_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	select VIDEOBUF2_V4L2
+	help
+	  Initial managed power and controller version checks for the two CSIS
+	  receivers. This device will own the shared sensor IOMMU/DMA path.
+	  Includes bounded VC0 DMA and rear test-pattern qualification.
+
+
+config J7Y17LTE_CAMERA_PROBE
+	tristate "J7Y17LTE camera board qualification"
+	depends on I2C && OF && GPIOLIB && REGULATOR && COMMON_CLK && PINCTRL && SYSFS
+	help
+	  Temporary power and ID-only qualification interface for the J7Y17LTE
+	  IMX258 and S5K3M3. No streaming or mode programming. Uses experimental
+	  board-specific compatibles to avoid binding production sensor nodes.
+
+
 config SENSORS_LIS3LV02D
 	tristate
 	depends on INPUT
