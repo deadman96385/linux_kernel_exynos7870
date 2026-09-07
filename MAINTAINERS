@@ -24260,6 +24260,9 @@ L:	linux-sound@vger.kernel.org
 S:	Maintained
 B:	mailto:linux-samsung-soc@vger.kernel.org
 F:	Documentation/devicetree/bindings/sound/samsung*
+F:	include/dt-bindings/sound/samsung,s1402x.h
+F:	sound/soc/codecs/cod3026x*
+F:	sound/soc/codecs/s1402x*
 F:	sound/soc/samsung/
 
 SAMSUNG EXYNOS2200 SoC SUPPORT
@@ -24303,6 +24306,7 @@ M:	Tudor Ambarus <tudor.ambarus@linaro.org>
 L:	linux-samsung-soc@vger.kernel.org
 S:	Supported
 F:	Documentation/devicetree/bindings/mailbox/google,gs101-mbox.yaml
+F:	Documentation/devicetree/bindings/mailbox/samsung,exynos7870-mbox.yaml
 F:	drivers/mailbox/exynos-mailbox.c
 F:	include/linux/mailbox/exynos-message.h
 
@@ -24345,11 +24349,13 @@ L:	linux-samsung-soc@vger.kernel.org
 S:	Maintained
 B:	mailto:linux-samsung-soc@vger.kernel.org
 F:	Documentation/devicetree/bindings/clock/samsung,s2mps11.yaml
+F:	Documentation/devicetree/bindings/extcon/samsung,s2*.yaml
 F:	Documentation/devicetree/bindings/mfd/samsung,s2*.yaml
 F:	Documentation/devicetree/bindings/mfd/samsung,s5m*.yaml
 F:	Documentation/devicetree/bindings/regulator/samsung,s2m*.yaml
 F:	Documentation/devicetree/bindings/regulator/samsung,s5m*.yaml
 F:	drivers/clk/clk-s2mps11.c
+F:	drivers/extcon/extcon-s2m.c
 F:	drivers/mfd/sec*.[ch]
 F:	drivers/regulator/s2*.c
 F:	drivers/regulator/s5m*.c
