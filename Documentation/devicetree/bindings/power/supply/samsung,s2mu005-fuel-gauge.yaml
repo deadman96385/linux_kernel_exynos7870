@@ -23,6 +23,14 @@ properties:
   interrupts:
     maxItems: 1
 
+  io-channels:
+    items:
+      - description: battery thermistor ADC channel
+
+  io-channel-names:
+    items:
+      - const: battery-temperature
+
 required:
   - compatible
   - reg

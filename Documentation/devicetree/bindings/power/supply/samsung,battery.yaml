@@ -33,6 +33,8 @@ properties:
         description: 3.8V 1500 mAh battery used in Samsung GT-I9070
       - const: samsung,eb585157lu
         description: 3.8V 2000 mAh battery used in Samsung GT-I8530
+      - const: samsung,eb-bj730abe
+        description: 3.85V 3600 mAh battery used in Samsung SM-J730
 
 required:
   - compatible
