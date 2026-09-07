@@ -7,8 +7,10 @@
  */
 
 #include <linux/clk-provider.h>
+#include <linux/iopoll.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 
 #include <dt-bindings/clock/samsung,exynos7870-cmu.h>
 
@@ -769,6 +771,7 @@ static const struct samsung_cmu_info mif_cmu_info __initconst = {
 #define CLK_CON_GAT_DISPAUD_BUS					0x0810
 #define CLK_CON_GAT_DISPAUD_BUS_DISP				0x0810
 #define CLK_CON_GAT_DISPAUD_BUS_PPMU				0x0810
+#define CLK_CON_GAT_DISPAUD_APB					0x0814
 #define CLK_CON_GAT_DISPAUD_APB_AUD				0x0814
 #define CLK_CON_GAT_DISPAUD_APB_AUD_AMP				0x0814
 #define CLK_CON_GAT_DISPAUD_APB_DISP				0x0814
@@ -815,6 +818,7 @@ static const unsigned long dispaud_clk_regs[] __initconst = {
 	CLK_CON_GAT_DISPAUD_BUS,
 	CLK_CON_GAT_DISPAUD_BUS_DISP,
 	CLK_CON_GAT_DISPAUD_BUS_PPMU,
+	CLK_CON_GAT_DISPAUD_APB,
 	CLK_CON_GAT_DISPAUD_APB_AUD,
 	CLK_CON_GAT_DISPAUD_APB_AUD_AMP,
 	CLK_CON_GAT_DISPAUD_APB_DISP,
@@ -839,10 +843,15 @@ static const struct samsung_fixed_rate_clock dispaud_fixed_clks[] __initconst = 
 	FRATE(0, "frat_dispaud_mipiphy_txbyteclkhs", NULL, 0, 188000000),
 };
 
+static const struct samsung_pll_rate_table dispaud_aud_pll_rates[] __initconst = {
+	PLL_36XX_RATE(26 * MHZ, 98304003U, 91, 3, 3, -16898),
+	{ },
+};
+
 static const struct samsung_pll_clock dispaud_pll_clks[] __initconst = {
-	PLL(pll_1417x, CLK_FOUT_DISPAUD_AUD_PLL, "fout_dispaud_aud_pll",
+	PLL(pll_1431x, CLK_FOUT_DISPAUD_AUD_PLL, "fout_dispaud_aud_pll",
 	    "oscclk", PLL_LOCKTIME_DISPAUD_AUD_PLL, PLL_CON0_DISPAUD_AUD_PLL,
-	    NULL),
+	    dispaud_aud_pll_rates),
 	PLL(pll_1417x, CLK_FOUT_DISPAUD_PLL, "fout_dispaud_pll", "oscclk",
 	    PLL_LOCKTIME_DISPAUD_PLL, PLL_CON0_DISPAUD_PLL, NULL),
 };
@@ -900,6 +909,9 @@ static const struct samsung_gate_clock dispaud_gate_clks[] __initconst = {
 	GATE(CLK_GOUT_DISPAUD_BUS_PPMU, "gout_dispaud_bus_ppmu",
 	     "gout_dispaud_mux_bus_user", CLK_CON_GAT_DISPAUD_BUS_PPMU, 3,
 	     CLK_IS_CRITICAL | CLK_SET_RATE_PARENT, 0),
+	GATE(CLK_GOUT_DISPAUD_APB, "gout_dispaud_apb",
+	     "dout_dispaud_apb", CLK_CON_GAT_DISPAUD_APB, 0,
+	     CLK_SET_RATE_PARENT, 0),
 	GATE(CLK_GOUT_DISPAUD_APB_AUD, "gout_dispaud_apb_aud",
 	     "dout_dispaud_apb", CLK_CON_GAT_DISPAUD_APB_AUD, 2,
 	     CLK_SET_RATE_PARENT, 0),
@@ -1010,6 +1022,7 @@ static const struct samsung_cmu_info dispaud_cmu_info __initconst = {
 	.clk_regs		= dispaud_clk_regs,
 	.nr_clk_regs		= ARRAY_SIZE(dispaud_clk_regs),
 	.nr_clk_ids		= DISPAUD_NR_CLK,
+	.clk_name		= "bus",
 };
 
 /*
@@ -1253,6 +1266,7 @@ static const struct samsung_cmu_info g3d_cmu_info __initconst = {
  * Register offsets for CMU_ISP (0x144d0000)
  */
 #define PLL_LOCKTIME_ISP_PLL					0x0000
+#define PLL_CON1_ISP_PLL					0x0104
 #define PLL_CON0_ISP_PLL					0x0100
 #define CLK_CON_GAT_ISP_MUX_PLL					0x0200
 #define CLK_CON_GAT_ISP_MUX_PLL_CON				0x0200
@@ -1276,6 +1290,8 @@ static const struct samsung_cmu_info g3d_cmu_info __initconst = {
 #define CLK_CON_GAT_ISP_MUX_RXBYTECLKHS0_SENSOR1_USER_CON	0x0234
 #define CLK_CON_DIV_ISP_APB					0x0400
 #define CLK_CON_DIV_ISP_CAM_HALF				0x0404
+#define CLK_CON_GAT_ISP_APB					0x0814
+#define CLK_CON_GAT_ISP_ISP					0x0824
 #define CLK_CON_GAT_ISP_VRA					0x0810
 #define CLK_CON_GAT_ISP_ISPD					0x0818
 #define CLK_CON_GAT_ISP_ISPD_PPMU				0x0818
@@ -1284,6 +1300,7 @@ static const struct samsung_cmu_info g3d_cmu_info __initconst = {
 
 static const unsigned long isp_clk_regs[] __initconst = {
 	PLL_LOCKTIME_ISP_PLL,
+	PLL_CON1_ISP_PLL,
 	PLL_CON0_ISP_PLL,
 	CLK_CON_GAT_ISP_MUX_PLL,
 	CLK_CON_GAT_ISP_MUX_PLL_CON,
@@ -1307,6 +1324,8 @@ static const unsigned long isp_clk_regs[] __initconst = {
 	CLK_CON_GAT_ISP_MUX_RXBYTECLKHS0_SENSOR1_USER_CON,
 	CLK_CON_DIV_ISP_APB,
 	CLK_CON_DIV_ISP_CAM_HALF,
+	CLK_CON_GAT_ISP_APB,
+	CLK_CON_GAT_ISP_ISP,
 	CLK_CON_GAT_ISP_VRA,
 	CLK_CON_GAT_ISP_ISPD,
 	CLK_CON_GAT_ISP_ISPD_PPMU,
@@ -1329,11 +1348,11 @@ PNAME(mout_isp_cam_user_p)	= { "oscclk", "gout_mif_cmu_isp_cam" };
 PNAME(mout_isp_user_p)		= { "oscclk", "gout_mif_cmu_isp_isp" };
 PNAME(mout_isp_vra_user_p)	= { "oscclk", "gout_mif_cmu_isp_vra" };
 PNAME(mout_isp_cam_p)		= { "gout_isp_mux_cam_user",
-				    "gout_isp_mux_pll_con" };
-PNAME(mout_isp_isp_p)		= { "gout_isp_mux_user", "gout_isp_mux_pll_con" };
+				    "gout_isp_mux_pll" };
+PNAME(mout_isp_isp_p)		= { "gout_isp_mux_user", "gout_isp_mux_pll" };
 PNAME(mout_isp_ispd_p)		= { "gout_isp_mux_vra", "gout_isp_mux_cam" };
 PNAME(mout_isp_vra_p)		= { "gout_isp_mux_vra_user",
-				    "gout_isp_mux_pll_con" };
+				    "gout_isp_mux_pll" };
 
 static const struct samsung_mux_clock isp_mux_clks[] __initconst = {
 	MUX(CLK_MOUT_ISP_CAM_USER, "mout_isp_cam_user", mout_isp_cam_user_p,
@@ -1364,63 +1383,114 @@ static const struct samsung_gate_clock isp_gate_clks[] __initconst = {
 	     CLK_CON_GAT_ISP_CAM, 0, CLK_SET_RATE_PARENT, 0),
 	GATE(CLK_GOUT_ISP_CAM_HALF, "gout_isp_cam_half", "dout_isp_cam_half",
 	     CLK_CON_GAT_ISP_CAM_HALF, 0, CLK_SET_RATE_PARENT, 0),
-	GATE(CLK_GOUT_ISP_ISPD, "gout_isp_ispd", "gout_isp_mux_ispd",
-	     CLK_CON_GAT_ISP_ISPD, 0, CLK_IS_CRITICAL | CLK_SET_RATE_PARENT, 0),
-	GATE(CLK_GOUT_ISP_ISPD_PPMU, "gout_isp_ispd_ppmu", "gout_isp_mux_ispd",
-	     CLK_CON_GAT_ISP_ISPD_PPMU, 1, CLK_IS_CRITICAL |
-	     CLK_SET_RATE_PARENT, 0),
 	GATE(CLK_GOUT_ISP_VRA, "gout_isp_vra", "gout_isp_mux_vra",
 	     CLK_CON_GAT_ISP_VRA, 0, CLK_SET_RATE_PARENT, 0),
-	GATE(CLK_GOUT_ISP_MUX_CAM_USER, "gout_isp_mux_cam_user",
-	     "mout_isp_cam_user", CLK_CON_GAT_ISP_MUX_CAM_USER, 21,
-	     CLK_IS_CRITICAL | CLK_SET_RATE_PARENT, 0),
-	GATE(CLK_GOUT_ISP_MUX_USER, "gout_isp_mux_user", "mout_isp_user",
-	     CLK_CON_GAT_ISP_MUX_USER, 21, CLK_IS_CRITICAL |
-	     CLK_SET_RATE_PARENT, 0),
-	GATE(CLK_GOUT_ISP_MUX_VRA_USER, "gout_isp_mux_vra_user",
-	     "mout_isp_vra_user", CLK_CON_GAT_ISP_MUX_VRA_USER, 21,
-	     CLK_IS_CRITICAL | CLK_SET_RATE_PARENT, 0),
 	GATE(CLK_GOUT_ISP_MUX_RXBYTECLKHS0_SENSOR1_USER,
 	     "gout_isp_mux_rxbyteclkhs0_sensor1_user",
 	     "gout_isp_mux_rxbyteclkhs0_sensor1_user_con",
-	     CLK_CON_GAT_ISP_MUX_RXBYTECLKHS0_SENSOR1_USER, 21, CLK_IS_CRITICAL
-	     | CLK_SET_RATE_PARENT, 0),
+	     CLK_CON_GAT_ISP_MUX_RXBYTECLKHS0_SENSOR1_USER, 21, CLK_SET_RATE_PARENT, 0),
 	GATE(CLK_GOUT_ISP_MUX_RXBYTECLKHS0_SENSOR1_USER_CON,
 	     "gout_isp_mux_rxbyteclkhs0_sensor1_user_con",
 	     "frat_isp_rxbyteclkhs0_sensor1",
 	     CLK_CON_GAT_ISP_MUX_RXBYTECLKHS0_SENSOR1_USER_CON, 12,
-	     CLK_IS_CRITICAL | CLK_SET_RATE_PARENT, 0),
+	     CLK_SET_RATE_PARENT, 0),
 	GATE(CLK_GOUT_ISP_MUX_RXBYTECLKHS0_SENSOR0_USER,
 	     "gout_isp_mux_rxbyteclkhs0_sensor0_user",
 	     "gout_isp_mux_rxbyteclkhs0_sensor0_user_con",
-	     CLK_CON_GAT_ISP_MUX_RXBYTECLKHS0_SENSOR0_USER, 21, CLK_IS_CRITICAL
-	     | CLK_SET_RATE_PARENT, 0),
+	     CLK_CON_GAT_ISP_MUX_RXBYTECLKHS0_SENSOR0_USER, 21, CLK_SET_RATE_PARENT, 0),
 	GATE(CLK_GOUT_ISP_MUX_RXBYTECLKHS0_SENSOR0_USER_CON,
 	     "gout_isp_mux_rxbyteclkhs0_sensor0_user_con",
 	     "frat_isp_rxbyteclkhs0_sensor0",
 	     CLK_CON_GAT_ISP_MUX_RXBYTECLKHS0_SENSOR0_USER_CON, 12,
-	     CLK_IS_CRITICAL | CLK_SET_RATE_PARENT, 0),
-	GATE(CLK_GOUT_ISP_MUX_CAM, "gout_isp_mux_cam", "mout_isp_cam",
-	     CLK_CON_GAT_ISP_MUX_CAM, 21, CLK_IS_CRITICAL | CLK_SET_RATE_PARENT,
-	     0),
-	GATE(CLK_GOUT_ISP_MUX_ISP, "gout_isp_mux_isp", "mout_isp_isp",
-	     CLK_CON_GAT_ISP_MUX_ISP, 21, CLK_IS_CRITICAL | CLK_SET_RATE_PARENT,
-	     0),
-	GATE(CLK_GOUT_ISP_MUX_ISPD, "gout_isp_mux_ispd", "mout_isp_ispd",
-	     CLK_CON_GAT_ISP_MUX_ISPD, 21, CLK_IS_CRITICAL |
-	     CLK_SET_RATE_PARENT, 0),
-	GATE(CLK_GOUT_ISP_MUX_VRA, "gout_isp_mux_vra", "mout_isp_vra",
-	     CLK_CON_GAT_ISP_MUX_VRA, 21, CLK_IS_CRITICAL | CLK_SET_RATE_PARENT,
-	     0),
-	GATE(CLK_GOUT_ISP_MUX_PLL, "gout_isp_mux_pll", "gout_isp_mux_pll_con",
-	     CLK_CON_GAT_ISP_MUX_PLL, 21, CLK_IS_CRITICAL | CLK_SET_RATE_PARENT,
-	     0),
-	GATE(CLK_GOUT_ISP_MUX_PLL_CON, "gout_isp_mux_pll_con", "fout_isp_pll",
-	     CLK_CON_GAT_ISP_MUX_PLL_CON, 12, CLK_IS_CRITICAL |
 	     CLK_SET_RATE_PARENT, 0),
 };
 
+/*
+ * The shared register fabric must stay clocked until CMU state is saved.
+ * Its gates are owned by the CMU lifecycle, not by individual consumers.
+ * These pass-through clocks retain CCF topology and runtime-PM accounting
+ * without cutting register access while another gate is being released.
+ * The entire ISP domain may still power off when its consumers are idle.
+ */
+static const struct samsung_fixed_factor_clock isp_fabric_clks[] __initconst = {
+	FFACTOR(CLK_GOUT_ISP_APB, "gout_isp_apb", "dout_isp_apb", 1, 1, CLK_SET_RATE_PARENT),
+	FFACTOR(CLK_GOUT_ISP_ISPD, "gout_isp_ispd", "gout_isp_mux_ispd", 1, 1, CLK_SET_RATE_PARENT),
+	FFACTOR(CLK_GOUT_ISP_ISPD_PPMU, "gout_isp_ispd_ppmu", "gout_isp_mux_ispd", 1, 1, CLK_SET_RATE_PARENT),
+	FFACTOR(CLK_GOUT_ISP_MUX_CAM_USER, "gout_isp_mux_cam_user", "mout_isp_cam_user", 1, 1, CLK_SET_RATE_PARENT),
+	FFACTOR(CLK_GOUT_ISP_MUX_USER, "gout_isp_mux_user", "mout_isp_user", 1, 1, CLK_SET_RATE_PARENT),
+	FFACTOR(CLK_GOUT_ISP_MUX_VRA_USER, "gout_isp_mux_vra_user", "mout_isp_vra_user", 1, 1, CLK_SET_RATE_PARENT),
+	FFACTOR(CLK_GOUT_ISP_MUX_CAM, "gout_isp_mux_cam", "mout_isp_cam", 1, 1, CLK_SET_RATE_PARENT),
+	FFACTOR(CLK_GOUT_ISP_MUX_ISP, "gout_isp_mux_isp", "mout_isp_isp", 1, 1, CLK_SET_RATE_PARENT),
+	FFACTOR(CLK_GOUT_ISP_MUX_ISPD, "gout_isp_mux_ispd", "mout_isp_ispd", 1, 1, CLK_SET_RATE_PARENT),
+	FFACTOR(CLK_GOUT_ISP_MUX_VRA, "gout_isp_mux_vra", "mout_isp_vra", 1, 1, CLK_SET_RATE_PARENT),
+	FFACTOR(CLK_GOUT_ISP_MUX_PLL, "gout_isp_mux_pll", "gout_isp_mux_pll_con", 1, 1, CLK_SET_RATE_PARENT),
+	FFACTOR(CLK_GOUT_ISP_MUX_PLL_CON, "gout_isp_mux_pll_con", "fout_isp_pll", 1, 1, CLK_SET_RATE_PARENT),
+};
+
+/* S5E7870-pmu.c isp_prev(): saved running state must precede these writes. */
+static void exynos7870_isp_suspend_prepare(void __iomem *base)
+{
+	static const u32 gates[] = { 0x810, 0x814, 0x818, 0x81c, 0x824 };
+	unsigned int i;
+	u32 value;
+
+	for (i = 0; i < ARRAY_SIZE(gates); i++)
+		writel(readl(base + gates[i]) | BIT(0), base + gates[i]);
+	for (i = 0x230; i <= 0x234; i += 4) {
+		value = readl(base + i);
+		writel((value & ~BIT(12)) | BIT(27), base + i);
+	}
+	pr_info("exynos7870 ISP: CMU shutdown prepared\n");
+	/* Flush the shutdown writes before genpd requests power removal. */
+	readl(base + 0x234);
+}
+
+static int exynos7870_isp_resume_restore(void __iomem *base,
+				       const struct samsung_clk_reg_dump *saved,
+				       unsigned int count)
+{
+	unsigned int i;
+	u32 value;
+	int ret;
+
+	pr_info("exynos7870 ISP: CMU restore begin\n");
+	/* Array order: lock time, CON1, CON0, then muxes/dividers/gates. */
+	for (i = 0; i < count; i++) {
+		value = saved[i].value;
+		switch (saved[i].offset) {
+		case 0x200:
+			value |= BIT(12) | BIT(21);
+			break;
+		case 0x210: case 0x214: case 0x218:
+		case 0x220: case 0x224: case 0x228: case 0x22c:
+			value |= BIT(21);
+			break;
+		case 0x814:
+			value |= BIT(0);
+			break;
+		case 0x818:
+			value |= BIT(0) | BIT(1);
+			break;
+		}
+		writel(value, base + saved[i].offset);
+		if (saved[i].offset != PLL_CON0_ISP_PLL ||
+		    !(saved[i].value & BIT(31)))
+			continue;
+		ret = readl_poll_timeout(base + PLL_CON0_ISP_PLL, value,
+					 value & BIT(29), 10, 20000);
+		if (ret)
+			return ret;
+	}
+	pr_info("exynos7870 ISP: CMU restore complete\n");
+	return 0;
+}
+
 static const struct samsung_cmu_info isp_cmu_info __initconst = {
+	.clk_name		= "cam",
+	.fixed_factor_clks = isp_fabric_clks,
+	.nr_fixed_factor_clks = ARRAY_SIZE(isp_fabric_clks),
+	.suspend_prepare	= exynos7870_isp_suspend_prepare,
+	.resume_restore	= exynos7870_isp_resume_restore,
 	.fixed_clks	= isp_fixed_clks,
 	.nr_fixed_clks	= ARRAY_SIZE(isp_fixed_clks),
 	.pll_clks		= isp_pll_clks,
@@ -1671,7 +1741,7 @@ static const struct samsung_gate_clock peri_gate_clks[] __initconst = {
 	     CLK_SET_RATE_PARENT, 0),
 	GATE(CLK_GOUT_PERI_I2C6_PCLK, "gout_peri_i2c6_pclk",
 	     "gout_peri_busp1_peric0_hclk", CLK_CON_GAT_PERI_I2C6_PCLK, 19,
-	     CLK_SET_RATE_PARENT, 0),
+	     CLK_IS_CRITICAL | CLK_SET_RATE_PARENT, 0),
 	GATE(CLK_GOUT_PERI_I2C7_PCLK, "gout_peri_i2c7_pclk",
 	     "gout_peri_busp1_peric0_hclk", CLK_CON_GAT_PERI_I2C7_PCLK, 24,
 	     CLK_SET_RATE_PARENT, 0),
@@ -1775,16 +1845,208 @@ static const struct samsung_cmu_info peri_cmu_info __initconst = {
 	.nr_clk_ids		= PERI_NR_CLK,
 };
 
+/*
+ * CPUCL0/CPUCL1 PLL rate table.
+ *
+ * Both clusters share the same 11 discrete frequency steps. The steps
+ * themselves were read back from live hardware (SM-J730G, cluster0,
+ * /sys/devices/system/cpu/cpufreq/mp-cpufreq/cluster0_freq_table under the
+ * stock LineageOS/TWRP kernel) -- the vendor driver loads this table from a
+ * binary ECT blob at boot and does not carry it in source form. The M/P/S
+ * divider triplets below are derived (Fout = M * 26MHz / (P * 2^S)) to
+ * reproduce each measured frequency exactly; they are not themselves a
+ * vendor-verified encoding, only their resulting output frequency is.
+ */
+static const struct samsung_pll_rate_table cpucl0_pll_rates[] __initconst = {
+	PLL_35XX_RATE(26 * MHZ, 1586000000U, 183, 3, 0),
+	PLL_35XX_RATE(26 * MHZ, 1482000000U, 171, 3, 0),
+	PLL_35XX_RATE(26 * MHZ, 1352000000U, 156, 3, 0),
+	PLL_35XX_RATE(26 * MHZ, 1248000000U, 144, 3, 0),
+	PLL_35XX_RATE(26 * MHZ, 1144000000U, 132, 3, 0),
+	PLL_35XX_RATE(26 * MHZ, 1014000000U, 117, 3, 0),
+	PLL_35XX_RATE(26 * MHZ,  902000000U, 902, 13, 1),
+	PLL_35XX_RATE(26 * MHZ,  839000000U, 839, 13, 1),
+	PLL_35XX_RATE(26 * MHZ,  757000000U, 757, 13, 1),
+	PLL_35XX_RATE(26 * MHZ,  676000000U,  78, 3, 0),
+	PLL_35XX_RATE(26 * MHZ,  546000000U,  63, 3, 0),
+};
+
+/*
+ * DIV_CLK_CPUCLx_1/_2 stay at divide-by-1 for every level; only the PLL
+ * itself is retuned per step.
+ */
+static const struct exynos_cpuclk_cfg_data cpucl0_cluster_clk_d[] __initconst = {
+	{ 1586000, 0, 0 },
+	{ 1482000, 0, 0 },
+	{ 1352000, 0, 0 },
+	{ 1248000, 0, 0 },
+	{ 1144000, 0, 0 },
+	{ 1014000, 0, 0 },
+	{  902000, 0, 0 },
+	{  839000, 0, 0 },
+	{  757000, 0, 0 },
+	{  676000, 0, 0 },
+	{  546000, 0, 0 },
+	{ 0 },
+};
+
+/*
+ * Register offsets for CMU_CPUCL0 (0x10900000) and CMU_CPUCL1 (0x10800000)
+ *
+ * Both blocks share an identical register layout; only the physical base
+ * address (set via each device node's "reg" property) differs.
+ *
+ * Frequency scaling happens entirely through the PLL's own M/P/S dividers;
+ * DIV_CLK_CPUCLx_1/_2 stay at their steady-state value (0, i.e. divide-by-1)
+ * for every operating point. The mout_cpuclx_switch_user "user" mux always
+ * selects OSCCLK -- the higher-speed CMU_MIF-sourced switch path is not
+ * wired up, so frequency transitions briefly run the cluster from OSCCLK
+ * while the PLL relocks. The debug/trace sub-clocks (ACLK/PCLK/ATCLK/
+ * PCLKDBG/CNTCLK/RUN_MONITOR/HPM) are intentionally left unmanaged at their
+ * hardware reset values; they are not required for cpufreq to function.
+ */
+#define PLL_LOCKTIME_CPUCL0_PLL			0x0000
+#define PLL_CON0_CPUCL0_PLL				0x0100
+#define CLK_CON_MUX_CPUCL0_PLL				0x0200
+#define CLK_CON_MUX_CLKCMU_CPUCL0_SWITCH_USER		0x0204
+#define CLK_CON_MUX_CLK_CPUCL0				0x0208
+#define CLK_CON_DIV_CLK_CPUCL0_1			0x0400
+#define CLK_CON_DIV_CLK_CPUCL0_2			0x0404
+
+static const unsigned long cpucl0_clk_regs[] __initconst = {
+	PLL_LOCKTIME_CPUCL0_PLL,
+	PLL_CON0_CPUCL0_PLL,
+	CLK_CON_MUX_CPUCL0_PLL,
+	CLK_CON_MUX_CLKCMU_CPUCL0_SWITCH_USER,
+	CLK_CON_MUX_CLK_CPUCL0,
+	CLK_CON_DIV_CLK_CPUCL0_1,
+	CLK_CON_DIV_CLK_CPUCL0_2,
+};
+
+static const struct samsung_pll_clock cpucl0_pll_clks[] __initconst = {
+	PLL(pll_1417x, CLK_FOUT_CPUCL0_PLL, "fout_cpucl0_pll", "oscclk",
+	    PLL_LOCKTIME_CPUCL0_PLL, PLL_CON0_CPUCL0_PLL, cpucl0_pll_rates),
+};
+
+/* List of parent clocks for muxes in CMU_CPUCL0 */
+PNAME(mout_cpucl0_pll_p)		= { "oscclk", "fout_cpucl0_pll" };
+/* second parent intentionally unwired; see block comment above */
+PNAME(mout_cpucl0_switch_user_p)	= { "oscclk", "oscclk" };
+
+static const struct samsung_mux_clock cpucl0_mux_clks[] __initconst = {
+	MUX_F(CLK_MOUT_CPUCL0_PLL, "mout_cpucl0_pll", mout_cpucl0_pll_p,
+	      CLK_CON_MUX_CPUCL0_PLL, 12, 1, CLK_SET_RATE_PARENT, 0),
+	MUX(CLK_MOUT_CPUCL0_SWITCH_USER, "mout_cpucl0_switch_user",
+	    mout_cpucl0_switch_user_p, CLK_CON_MUX_CLKCMU_CPUCL0_SWITCH_USER,
+	    12, 1),
+};
+
+static const struct samsung_cpu_clock cpucl0_cpu_clks[] __initconst = {
+	CPU_CLK(CLK_CLUSTER0_SCLK, "cluster0_clk", CLK_MOUT_CPUCL0_PLL,
+		CLK_MOUT_CPUCL0_SWITCH_USER, 0, 0x0, CPUCLK_LAYOUT_E7870,
+		cpucl0_cluster_clk_d),
+};
+
+static const struct samsung_cmu_info cpucl0_cmu_info __initconst = {
+	.pll_clks		= cpucl0_pll_clks,
+	.nr_pll_clks		= ARRAY_SIZE(cpucl0_pll_clks),
+	.mux_clks		= cpucl0_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(cpucl0_mux_clks),
+	.cpu_clks		= cpucl0_cpu_clks,
+	.nr_cpu_clks		= ARRAY_SIZE(cpucl0_cpu_clks),
+	.nr_clk_ids		= CPUCL0_NR_CLK,
+	.clk_regs		= cpucl0_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(cpucl0_clk_regs),
+};
+
+#define PLL_LOCKTIME_CPUCL1_PLL			0x0000
+#define PLL_CON0_CPUCL1_PLL				0x0100
+#define CLK_CON_MUX_CPUCL1_PLL				0x0200
+#define CLK_CON_MUX_CLKCMU_CPUCL1_SWITCH_USER		0x0204
+#define CLK_CON_MUX_CLK_CPUCL1				0x0208
+#define CLK_CON_DIV_CLK_CPUCL1_1			0x0400
+#define CLK_CON_DIV_CLK_CPUCL1_2			0x0404
+
+static const unsigned long cpucl1_clk_regs[] __initconst = {
+	PLL_LOCKTIME_CPUCL1_PLL,
+	PLL_CON0_CPUCL1_PLL,
+	CLK_CON_MUX_CPUCL1_PLL,
+	CLK_CON_MUX_CLKCMU_CPUCL1_SWITCH_USER,
+	CLK_CON_MUX_CLK_CPUCL1,
+	CLK_CON_DIV_CLK_CPUCL1_1,
+	CLK_CON_DIV_CLK_CPUCL1_2,
+};
+
+static const struct samsung_pll_clock cpucl1_pll_clks[] __initconst = {
+	PLL(pll_1417x, CLK_FOUT_CPUCL1_PLL, "fout_cpucl1_pll", "oscclk",
+	    PLL_LOCKTIME_CPUCL1_PLL, PLL_CON0_CPUCL1_PLL, cpucl0_pll_rates),
+};
+
+/* List of parent clocks for muxes in CMU_CPUCL1 */
+PNAME(mout_cpucl1_pll_p)		= { "oscclk", "fout_cpucl1_pll" };
+/* second parent intentionally unwired; see block comment above */
+PNAME(mout_cpucl1_switch_user_p)	= { "oscclk", "oscclk" };
+
+static const struct samsung_mux_clock cpucl1_mux_clks[] __initconst = {
+	MUX_F(CLK_MOUT_CPUCL1_PLL, "mout_cpucl1_pll", mout_cpucl1_pll_p,
+	      CLK_CON_MUX_CPUCL1_PLL, 12, 1, CLK_SET_RATE_PARENT, 0),
+	MUX(CLK_MOUT_CPUCL1_SWITCH_USER, "mout_cpucl1_switch_user",
+	    mout_cpucl1_switch_user_p, CLK_CON_MUX_CLKCMU_CPUCL1_SWITCH_USER,
+	    12, 1),
+};
+
+static const struct samsung_cpu_clock cpucl1_cpu_clks[] __initconst = {
+	CPU_CLK(CLK_CLUSTER1_SCLK, "cluster1_clk", CLK_MOUT_CPUCL1_PLL,
+		CLK_MOUT_CPUCL1_SWITCH_USER, 0, 0x0, CPUCLK_LAYOUT_E7870,
+		cpucl0_cluster_clk_d),
+};
+
+static const struct samsung_cmu_info cpucl1_cmu_info __initconst = {
+	.pll_clks		= cpucl1_pll_clks,
+	.nr_pll_clks		= ARRAY_SIZE(cpucl1_pll_clks),
+	.mux_clks		= cpucl1_mux_clks,
+	.nr_mux_clks		= ARRAY_SIZE(cpucl1_mux_clks),
+	.cpu_clks		= cpucl1_cpu_clks,
+	.nr_cpu_clks		= ARRAY_SIZE(cpucl1_cpu_clks),
+	.nr_clk_ids		= CPUCL1_NR_CLK,
+	.clk_regs		= cpucl1_clk_regs,
+	.nr_clk_regs		= ARRAY_SIZE(cpucl1_clk_regs),
+};
+
 static int __init exynos7870_cmu_probe(struct platform_device *pdev)
 {
 	const struct samsung_cmu_info *info;
 	struct device *dev = &pdev->dev;
 
 	info = of_device_get_match_data(dev);
+	if (info == &dispaud_cmu_info || info == &isp_cmu_info)
+		return exynos_arm64_register_cmu_pm(pdev, true);
+
 	exynos_arm64_register_cmu(dev, dev->of_node, info);
 
 	return 0;
 }
+
+static int exynos7870_cmu_suspend(struct device *dev)
+{
+	if (!dev_get_drvdata(dev))
+		return 0;
+
+	return exynos_arm64_cmu_suspend(dev);
+}
+
+static int exynos7870_cmu_resume(struct device *dev)
+{
+	if (!dev_get_drvdata(dev))
+		return 0;
+
+	return exynos_arm64_cmu_resume(dev);
+}
+
+static const struct dev_pm_ops exynos7870_cmu_pm_ops = {
+	SET_RUNTIME_PM_OPS(exynos7870_cmu_suspend, exynos7870_cmu_resume, NULL)
+	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+};
 
 static const struct of_device_id exynos7870_cmu_of_match[] = {
 	{
@@ -1809,6 +2071,12 @@ static const struct of_device_id exynos7870_cmu_of_match[] = {
 		.compatible = "samsung,exynos7870-cmu-peri",
 		.data = &peri_cmu_info,
 	}, {
+		.compatible = "samsung,exynos7870-cmu-cpucl0",
+		.data = &cpucl0_cmu_info,
+	}, {
+		.compatible = "samsung,exynos7870-cmu-cpucl1",
+		.data = &cpucl1_cmu_info,
+	}, {
 	},
 };
 
@@ -1817,6 +2085,7 @@ static struct platform_driver exynos7870_cmu_driver __refdata = {
 		.name = "exynos7870-cmu",
 		.of_match_table = exynos7870_cmu_of_match,
 		.suppress_bind_attrs = true,
+		.pm = &exynos7870_cmu_pm_ops,
 	},
 	.probe = exynos7870_cmu_probe,
 };

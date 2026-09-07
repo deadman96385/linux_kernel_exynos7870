@@ -42,11 +42,26 @@
 #define GATE_OFF_START		0x2000
 #define GATE_OFF_END		0x2fff
 
+/*
+ * Legacy Q-Channel HWACG control register bit (pre-2019 CMUCAL generation,
+ * e.g. Exynos9810/Exynos9610). Unlike GATE_ENABLE_HWACG above, this lives in
+ * its own per-IP register (QCH_CON_*) at a different offset than the plain
+ * gate register for the same IP, packed together with clock-request/expire/
+ * force-PM sub-fields this driver does not touch. Bit 0 (enable) is confirmed
+ * identical across Exynos8890/9810/9610 downstream sources; the remaining
+ * sub-field layout differs between those generations and is out of scope
+ * here, so @qch_regs is only ever populated with the bit-0-compatible ones.
+ */
+#define QCH_LEGACY_ENABLE	BIT(0)
+
 struct exynos_arm64_cmu_data {
 	struct samsung_clk_reg_dump *clk_save;
 	unsigned int nr_clk_save;
 	const struct samsung_clk_reg_dump *clk_suspend;
 	unsigned int nr_clk_suspend;
+	void (*suspend_prepare)(void __iomem *base);
+	int (*resume_restore)(void __iomem *base,
+			      const struct samsung_clk_reg_dump *saved, unsigned int count);
 	struct samsung_clk_reg_dump *clk_sysreg_save;
 	unsigned int nr_clk_sysreg;
 
@@ -130,6 +145,21 @@ static void __init exynos_arm64_init_clocks(struct device_node *np,
 		}
 	}
 
+	/*
+	 * Disable legacy Q-Channel HWACG on SoCs that supply @qch_regs (see
+	 * QCH_LEGACY_ENABLE). These live outside the GATE_OFF_START/END
+	 * range above, so they're walked separately rather than folded into
+	 * the loop above.
+	 */
+	for (i = 0; i < cmu->nr_qch_regs; ++i) {
+		void __iomem *reg = reg_base + cmu->qch_regs[i];
+		u32 val;
+
+		val = readl(reg);
+		val &= ~QCH_LEGACY_ENABLE;
+		writel(val, reg);
+	}
+
 	iounmap(reg_base);
 }
 
@@ -197,6 +227,8 @@ static int __init exynos_arm64_cmu_prepare_pm(struct device *dev,
 
 	data->clk_suspend = cmu->suspend_regs;
 	data->nr_clk_suspend = cmu->nr_suspend_regs;
+	data->suspend_prepare = cmu->suspend_prepare;
+	data->resume_restore = cmu->resume_restore;
 
 	data->nr_pclks = of_clk_get_parent_count(dev->of_node);
 	if (!data->nr_pclks)
@@ -334,7 +366,7 @@ int __init exynos_arm64_register_cmu_pm(struct platform_device *pdev,
 int exynos_arm64_cmu_suspend(struct device *dev)
 {
 	struct exynos_arm64_cmu_data *data = dev_get_drvdata(dev);
-	int i;
+	int i, ret;
 
 	samsung_clk_save(data->ctx->reg_base, NULL, data->clk_save,
 			 data->nr_clk_save);
@@ -342,12 +374,20 @@ int exynos_arm64_cmu_suspend(struct device *dev)
 	samsung_clk_save(NULL, data->ctx->sysreg, data->clk_sysreg_save,
 			 data->nr_clk_sysreg);
 
-	for (i = 0; i < data->nr_pclks; i++)
-		clk_prepare_enable(data->pclks[i]);
+	for (i = 0; i < data->nr_pclks; i++) {
+		ret = clk_prepare_enable(data->pclks[i]);
+		if (ret) {
+			while (i--)
+				clk_disable_unprepare(data->pclks[i]);
+			return ret;
+		}
+	}
 
 	/* For suspend some registers have to be set to certain values */
 	samsung_clk_restore(data->ctx->reg_base, NULL, data->clk_suspend,
 			    data->nr_clk_suspend);
+	if (data->suspend_prepare)
+		data->suspend_prepare(data->ctx->reg_base);
 
 	for (i = 0; i < data->nr_pclks; i++)
 		clk_disable_unprepare(data->pclks[i]);
@@ -360,23 +400,33 @@ int exynos_arm64_cmu_suspend(struct device *dev)
 int exynos_arm64_cmu_resume(struct device *dev)
 {
 	struct exynos_arm64_cmu_data *data = dev_get_drvdata(dev);
-	int i;
+	int i, ret;
 
-	clk_prepare_enable(data->clk);
+	ret = clk_prepare_enable(data->clk);
+	if (ret)
+		return ret;
+	for (i = 0; i < data->nr_pclks; i++) {
+		ret = clk_prepare_enable(data->pclks[i]);
+		if (ret)
+			goto disable_parents;
+	}
 
-	for (i = 0; i < data->nr_pclks; i++)
-		clk_prepare_enable(data->pclks[i]);
-
-	samsung_clk_restore(data->ctx->reg_base, NULL, data->clk_save,
-			    data->nr_clk_save);
-
+	if (data->resume_restore)
+		ret = data->resume_restore(data->ctx->reg_base, data->clk_save,
+					   data->nr_clk_save);
+	else
+		samsung_clk_restore(data->ctx->reg_base, NULL, data->clk_save,
+				    data->nr_clk_save);
+	if (ret)
+		goto disable_parents;
 	if (data->ctx->sysreg)
 		samsung_clk_restore(NULL, data->ctx->sysreg,
-				    data->clk_sysreg_save,
-				    data->nr_clk_sysreg);
+				    data->clk_sysreg_save, data->nr_clk_sysreg);
 
-	for (i = 0; i < data->nr_pclks; i++)
+disable_parents:
+	while (i--)
 		clk_disable_unprepare(data->pclks[i]);
-
-	return 0;
+	if (ret)
+		clk_disable_unprepare(data->clk);
+	return ret;
 }

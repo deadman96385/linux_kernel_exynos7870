@@ -351,9 +351,15 @@ struct samsung_clock_reg_cache {
  * @nr_clk_regs: count of clock registers in @clk_regs
  * @suspend_regs: list of clock registers to set before suspend
  * @nr_suspend_regs: count of clock registers in @suspend_regs
+ * @suspend_prepare: optional masked shutdown writes after saving running state
+ * @resume_restore: optional ordered register restore with hardware acknowledgement
  * @clk_name: name of the parent clock needed for CMU register access
  * @sysreg_clk_regs: list of sysreg clock registers
  * @nr_sysreg_clk_regs: count of clock registers in @sysreg_clk_regs
+ * @qch_regs: list of legacy Q-Channel HWACG control registers (separate
+ *            per-IP registers, distinct from @clk_regs gates; used by
+ *            pre-2019 CMUCAL-generation SoCs such as Exynos9810/Exynos9610)
+ * @nr_qch_regs: count of clock registers in @qch_regs
  * @manual_plls: Enable manual control for PLL clocks
  * @auto_clock_gate: enable auto clock mode for all components in CMU
  * @gate_dbg_offset: gate debug reg offset. Used by all gates in auto clk mode
@@ -383,10 +389,16 @@ struct samsung_cmu_info {
 
 	const struct samsung_clk_reg_dump *suspend_regs;
 	unsigned int nr_suspend_regs;
+	void (*suspend_prepare)(void __iomem *base);
+	int (*resume_restore)(void __iomem *base,
+			      const struct samsung_clk_reg_dump *saved, unsigned int count);
 	const char *clk_name;
 
 	const unsigned long *sysreg_clk_regs;
 	unsigned int nr_sysreg_clk_regs;
+
+	const unsigned long *qch_regs;
+	unsigned int nr_qch_regs;
 
 	/* ARM64 Exynos CMUs */
 	bool manual_plls;
