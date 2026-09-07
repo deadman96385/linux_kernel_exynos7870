@@ -113,6 +113,15 @@
 #define HSI2C_AUTO_MODE				(1u << 31)
 #define HSI2C_10BIT_ADDR_MODE			(1u << 30)
 #define HSI2C_HS_MODE				(1u << 29)
+#define HSI2C_FILTER_EN_SCL			BIT(28)
+#define HSI2C_FILTER_EN_SDA			BIT(27)
+#define HSI2C_FTL_CYCLE_SCL_MASK		(0x7 << 16)
+#define HSI2C_FTL_CYCLE_SDA_MASK		(0x7 << 13)
+#define HSI2C_FTL_CYCLE_SCL(x)			((x) << 16)
+#define HSI2C_FTL_CYCLE_SDA(x)			((x) << 13)
+
+/* I2C_TIMING_S2 Register bits */
+#define HSI2C_TIMING_S2_SCL_L_EXT(x)		((x) << 16)
 
 /* I2C_AUTO_CONF Register bits */
 #define HSI2C_READ_WRITE			(1u << 16)
@@ -171,6 +180,11 @@ enum i2c_type_exynos {
 	I2C_TYPE_EXYNOS8895,
 };
 
+enum exynos_hsi2c_timing_type {
+	HSI2C_TIMING_DEFAULT,
+	HSI2C_TIMING_EXYNOS7870,
+};
+
 struct exynos5_i2c {
 	struct i2c_adapter	adap;
 
@@ -211,6 +225,7 @@ struct exynos5_i2c {
  * struct exynos_hsi2c_variant - platform specific HSI2C driver data
  * @fifo_depth: the fifo depth supported by the HSI2C module
  * @hw: the hardware variant of Exynos I2C controller
+ * @timing: the timing register layout and calculation variant
  *
  * Specifies platform specific configuration of HSI2C module.
  * Note: A structure for driver specific platform data is used for future
@@ -219,6 +234,7 @@ struct exynos5_i2c {
 struct exynos_hsi2c_variant {
 	unsigned int		fifo_depth;
 	enum i2c_type_exynos	hw;
+	enum exynos_hsi2c_timing_type timing;
 };
 
 static const struct exynos_hsi2c_variant exynos5250_hsi2c_data = {
@@ -234,6 +250,12 @@ static const struct exynos_hsi2c_variant exynos5260_hsi2c_data = {
 static const struct exynos_hsi2c_variant exynos7_hsi2c_data = {
 	.fifo_depth	= 16,
 	.hw		= I2C_TYPE_EXYNOS7,
+};
+
+static const struct exynos_hsi2c_variant exynos7870_hsi2c_data = {
+	.fifo_depth	= 16,
+	.hw		= I2C_TYPE_EXYNOS7,
+	.timing		= HSI2C_TIMING_EXYNOS7870,
 };
 
 static const struct exynos_hsi2c_variant exynosautov9_hsi2c_data = {
@@ -256,6 +278,9 @@ static const struct of_device_id exynos5_i2c_match[] = {
 	}, {
 		.compatible = "samsung,exynos5260-hsi2c",
 		.data = &exynos5260_hsi2c_data
+	}, {
+		.compatible = "samsung,exynos7870-hsi2c",
+		.data = &exynos7870_hsi2c_data
 	}, {
 		.compatible = "samsung,exynos7-hsi2c",
 		.data = &exynos7_hsi2c_data
@@ -287,6 +312,9 @@ static void exynos5_i2c_clr_pend_irq(struct exynos5_i2c *i2c)
  */
 static int exynos5_i2c_set_timing(struct exynos5_i2c *i2c, bool hs_timings)
 {
+	bool exynos7870_hs_timing =
+		i2c->variant->timing == HSI2C_TIMING_EXYNOS7870 &&
+		i2c->op_clock >= I2C_MAX_FAST_MODE_PLUS_FREQ;
 	u32 i2c_timing_s1;
 	u32 i2c_timing_s2;
 	u32 i2c_timing_s3;
@@ -298,10 +326,13 @@ static int exynos5_i2c_set_timing(struct exynos5_i2c *i2c, bool hs_timings)
 	unsigned int t_sr_release;
 	unsigned int t_ftl_cycle;
 	unsigned int clkin = clk_get_rate(i2c->clk);
-	unsigned int op_clk = hs_timings ? i2c->op_clock :
-		(i2c->op_clock >= I2C_MAX_FAST_MODE_PLUS_FREQ) ? I2C_MAX_STANDARD_MODE_FREQ :
-		i2c->op_clock;
+	unsigned int op_clk = i2c->op_clock;
 	int div, clk_cycle, temp;
+
+	if (!hs_timings && i2c->op_clock >= I2C_MAX_FAST_MODE_PLUS_FREQ)
+		/* The Exynos7870 sends the HS master code in fast mode. */
+		op_clk = exynos7870_hs_timing ? I2C_MAX_FAST_MODE_FREQ :
+			 I2C_MAX_STANDARD_MODE_FREQ;
 
 	/*
 	 * In case of HSI2C controllers in ExynosAutoV9:
@@ -340,7 +371,7 @@ static int exynos5_i2c_set_timing(struct exynos5_i2c *i2c, bool hs_timings)
 	 * clk_cycle := TSCLK_L + TSCLK_H
 	 * temp := (CLK_DIV + 1) * (clk_cycle + 2)
 	 *
-	 * In case of HSI2C controllers in Exynos8895
+	 * In case of HSI2C controllers in Exynos7870 and Exynos8895
 	 * FPCLK / FI2C =
 	 * (CLK_DIV + 1) * (TSCLK_L + TSCLK_H + 2) +
 	 * 2 * ((FLT_CYCLE + 3) - (FLT_CYCLE + 3) % (CLK_DIV + 1))
@@ -369,7 +400,7 @@ static int exynos5_i2c_set_timing(struct exynos5_i2c *i2c, bool hs_timings)
 	 *
 	 */
 	t_ftl_cycle = (readl(i2c->regs + HSI2C_CONF) >> 16) & 0x7;
-	if (i2c->variant->hw == I2C_TYPE_EXYNOS8895)
+	if (i2c->variant->hw == I2C_TYPE_EXYNOS8895 || exynos7870_hs_timing)
 		temp = clkin / op_clk - (t_ftl_cycle + 3) * 2;
 	else if (i2c->variant->hw == I2C_TYPE_EXYNOS7)
 		temp = clkin / op_clk - 8 - t_ftl_cycle;
@@ -377,7 +408,7 @@ static int exynos5_i2c_set_timing(struct exynos5_i2c *i2c, bool hs_timings)
 		temp = clkin / op_clk - 8 - (t_ftl_cycle * 2);
 	div = temp / 512;
 
-	if (i2c->variant->hw == I2C_TYPE_EXYNOS8895)
+	if (i2c->variant->hw == I2C_TYPE_EXYNOS8895 || exynos7870_hs_timing)
 		clk_cycle = (temp + ((t_ftl_cycle + 3) % (div + 1)) * 2) /
 			    (div + 1) - 2;
 	else
@@ -391,16 +422,27 @@ static int exynos5_i2c_set_timing(struct exynos5_i2c *i2c, bool hs_timings)
 	/*
 	 * Scale clk_cycle to get t_scl_l using the proption factors for individual I2C modes.
 	 */
-	if (op_clk <= I2C_MAX_STANDARD_MODE_FREQ)
+	if (exynos7870_hs_timing && hs_timings) {
+		/*
+		 * Exynos7870 uses a much longer low period in high-speed mode.
+		 * This is also required to reproduce the 2.5 MHz timing values
+		 * used by the vendor kernel with the 65 MHz input clock.
+		 */
+		t_scl_h = ((clk_cycle + 10) / 3 > 5) ?
+			((clk_cycle + 10) / 3) - 5 : 1;
+		t_scl_l = clk_cycle - t_scl_h;
+	} else if (op_clk <= I2C_MAX_STANDARD_MODE_FREQ) {
 		t_scl_l = clk_cycle * 535 / 1000;
-	else if (op_clk <= I2C_MAX_FAST_MODE_FREQ)
+	} else if (op_clk <= I2C_MAX_FAST_MODE_FREQ) {
 		t_scl_l = clk_cycle * 64 / 100;
-	else
+	} else {
 		t_scl_l = clk_cycle * 62 / 100;
+	}
 
 	if (t_scl_l > 0xFF)
 		t_scl_l = 0xFF;
-	t_scl_h = clk_cycle - t_scl_l;
+	if (!exynos7870_hs_timing || !hs_timings)
+		t_scl_h = clk_cycle - t_scl_l;
 	t_start_su = t_scl_l;
 	t_start_hd = t_scl_l;
 	t_stop_su = t_scl_l;
@@ -409,7 +451,11 @@ static int exynos5_i2c_set_timing(struct exynos5_i2c *i2c, bool hs_timings)
 	t_sr_release = clk_cycle;
 
 	i2c_timing_s1 = t_start_su << 24 | t_start_hd << 16 | t_stop_su << 8;
+	if (exynos7870_hs_timing && hs_timings)
+		i2c_timing_s1 |= t_scl_l;
 	i2c_timing_s2 = t_data_su << 24 | t_scl_l << 8 | t_scl_h << 0;
+	if (exynos7870_hs_timing)
+		i2c_timing_s2 |= HSI2C_TIMING_S2_SCL_L_EXT(0xf);
 	i2c_timing_s3 = div << 16 | t_sr_release << 0;
 	i2c_timing_sla = t_data_hd << 0;
 
@@ -437,8 +483,22 @@ static int exynos5_i2c_set_timing(struct exynos5_i2c *i2c, bool hs_timings)
 
 static int exynos5_hsi2c_clock_setup(struct exynos5_i2c *i2c)
 {
+	u32 i2c_conf;
+	int ret;
+
+	if (i2c->variant->timing == HSI2C_TIMING_EXYNOS7870 &&
+	    i2c->op_clock >= I2C_MAX_FAST_MODE_PLUS_FREQ) {
+		/* The timing equation below includes both three-cycle filters. */
+		i2c_conf = readl(i2c->regs + HSI2C_CONF);
+		i2c_conf &= ~(HSI2C_FTL_CYCLE_SCL_MASK |
+			      HSI2C_FTL_CYCLE_SDA_MASK);
+		i2c_conf |= HSI2C_FILTER_EN_SCL | HSI2C_FILTER_EN_SDA |
+			    HSI2C_FTL_CYCLE_SCL(3) | HSI2C_FTL_CYCLE_SDA(3);
+		writel(i2c_conf, i2c->regs + HSI2C_CONF);
+	}
+
 	/* always set Fast Speed timings */
-	int ret = exynos5_i2c_set_timing(i2c, false);
+	ret = exynos5_i2c_set_timing(i2c, false);
 
 	if (ret < 0 || i2c->op_clock < I2C_MAX_FAST_MODE_PLUS_FREQ)
 		return ret;
